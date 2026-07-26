@@ -813,7 +813,7 @@ function StatisticsTab({ deployment, location }) {
       h('div', { style: { overflowX: 'auto' } },
         h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
           h('thead', null, h('tr', null,
-            ['Night', 'Total detections', 'Bat detections', 'Richness', 'Dominant species', 'z-score'].map((c) => h('th', {
+            ['Night', 'Total detections', 'Bat detections', 'Richness', 'Dominant species', 'Modified z (MAD)'].map((c) => h('th', {
               key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
             }, c))
           )),
@@ -826,7 +826,7 @@ function StatisticsTab({ deployment, location }) {
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, n.batDetections),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, n.richness),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, n.dominantSpecies || '-'),
-            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, n.zScore != null ? fmtNum(n.zScore, 2) : '-')
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, n.modifiedZScore != null ? fmtNum(n.modifiedZScore, 2) : '-')
           )))
         )
       )

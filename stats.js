@@ -228,8 +228,19 @@ window.BatID = window.BatID || {};
   // Stage 5 (Level 1A): nightly variation within a single deployment - a richer per-night view than
   // Activity's plain nightly counts (above), pairing each night's activity total with its own
   // richness and dominant species, and flagging nights whose total activity is a statistical
-  // outlier against the rest of the deployment (|z-score| >= 2) - useful for catching a single
-  // anomalous night (storm, detector fault, unusually warm night) before it skews a headline mean.
+  // outlier against the rest of the deployment.
+  //
+  // Outlier detection uses the median/MAD-based modified z-score (Iglewicz & Hoaglin 1993:
+  // 0.6745 * (x - median) / MAD, flagged at |M| > 3.5) rather than mean/SD - deliberately, not the
+  // more familiar choice. A single extreme night pulls the mean and SD toward itself, which masks
+  // exactly the outlier it should be flagging, and that masking gets worse the fewer nights there
+  // are. Bat surveys are usually short (3 nights minimum by convention, 5 typical for a consultancy
+  // deployment) - too few for mean/SD to stay stable once an outlier is folded in. The median and
+  // MAD barely move when one value is extreme, so this stays sensitive even at n=4-5.
+  //
+  // MAD can come out exactly 0 (more than half the nights had identical activity) - a plain
+  // division would blow up, so that case is handled directly instead: with every "normal" night
+  // literally equal to the median, any night that differs at all is unambiguously the outlier.
   function computeNightlyStats(dataset) {
     const activityRows = dataset.filter((d) => d.category === 'bat' || d.category === 'unidentified');
     const batRows = dataset.filter((d) => d.category === 'bat');
@@ -252,17 +263,22 @@ window.BatID = window.BatID || {};
     });
 
     const totals = perNight.map((n) => n.totalDetections);
-    const avg = mean(totals);
-    const sd = stdDev(totals, avg);
+    const nightlyMedian = median(totals);
+    const mad = median(totals.map((v) => Math.abs(v - nightlyMedian)));
     for (const n of perNight) {
-      n.zScore = sd ? (n.totalDetections - avg) / sd : null;
-      n.isOutlier = n.zScore != null && Math.abs(n.zScore) >= 2;
+      if (mad > 0) {
+        n.modifiedZScore = (0.6745 * (n.totalDetections - nightlyMedian)) / mad;
+        n.isOutlier = Math.abs(n.modifiedZScore) > 3.5;
+      } else {
+        n.modifiedZScore = n.totalDetections === nightlyMedian ? 0 : null;
+        n.isOutlier = n.totalDetections !== nightlyMedian;
+      }
     }
 
     return {
       perNight,
-      nightlyMean: avg,
-      nightlySd: sd,
+      nightlyMedian,
+      mad,
       outlierNights: perNight.filter((n) => n.isOutlier),
     };
   }
