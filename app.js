@@ -290,6 +290,32 @@ function Workspace({ project, onChange, onBackToProjects, onExport }) {
     });
   }
 
+  // For a species BTO's classifier missed entirely within a call/part (never gave it a candidate
+  // row at all, as opposed to flagging it with low probability) - adds a brand new Detection Event
+  // for the same original WAV/part rather than overwriting the existing one's Final ID, and flags
+  // it addedManually so it can be counted and (eventually) factored into the Statistics error
+  // estimate as a known gap in BTO's automated coverage.
+  function addManualDetectionEvent(deploymentId, sourceEvent, label) {
+    updateProject((p) => {
+      const found = M.findDeployment(p, deploymentId);
+      if (!found) return;
+      const ev = M.createDetectionEvent({
+        originalWav: sourceEvent.originalWav,
+        partNumber: sourceEvent.partNumber,
+        candidateSpecies: [],
+        sourceBtoImportId: sourceEvent.sourceBtoImportId,
+        actualDate: sourceEvent.actualDate,
+        surveyDate: sourceEvent.surveyDate,
+        time: sourceEvent.time,
+        latitude: sourceEvent.latitude,
+        longitude: sourceEvent.longitude,
+      });
+      ev.addedManually = true;
+      ev.manualReview = { ...ev.manualReview, reviewed: true, finalId: label, reviewedAt: new Date().toISOString() };
+      found.deployment.detectionEvents = [...(found.deployment.detectionEvents || []), ev];
+    });
+  }
+
   function importBtoFile(deploymentId, csvText, fileName) {
     let result = null;
     let error = null;
@@ -352,6 +378,7 @@ function Workspace({ project, onChange, onBackToProjects, onExport }) {
       onDelete: () => setModal({ kind: 'deleteDeployment', locationId: selectedLocation.id, deploymentId: selectedDeployment.id }),
       onImportBto: (csvText, fileName) => importBtoFile(selectedDeployment.id, csvText, fileName),
       onPatchEvent: (eventId, patch) => patchDetectionEvent(selectedDeployment.id, eventId, patch),
+      onAddManualEvent: (sourceEvent, label) => addManualDetectionEvent(selectedDeployment.id, sourceEvent, label),
       customLabels: project.customLabels || [],
       onAddCustomLabel: addCustomLabel,
     });
@@ -471,7 +498,7 @@ function LocationOverview({ location, onPatch, onDelete, onAddDeployment }) {
   );
 }
 
-function DeploymentPanel({ location, deployment, activeTab, setActiveTab, onPatch, onDelete, onImportBto, onPatchEvent, customLabels, onAddCustomLabel }) {
+function DeploymentPanel({ location, deployment, activeTab, setActiveTab, onPatch, onDelete, onImportBto, onPatchEvent, onAddManualEvent, customLabels, onAddCustomLabel }) {
   const [wavFileMap, setWavFileMap] = useState(new Map());
   let tabContent;
   if (activeTab === 'overview') {
@@ -481,7 +508,7 @@ function DeploymentPanel({ location, deployment, activeTab, setActiveTab, onPatc
   } else if (activeTab === 'qa') {
     tabContent = h(QaTab, { deployment, onPatch, wavFileMap, setWavFileMap, onGoToReview: () => setActiveTab('review') });
   } else if (activeTab === 'review') {
-    tabContent = h(ReviewTab, { deployment, onPatchEvent, wavFileMap, setWavFileMap, customLabels, onAddCustomLabel });
+    tabContent = h(ReviewTab, { deployment, onPatchEvent, onAddManualEvent, wavFileMap, setWavFileMap, customLabels, onAddCustomLabel });
   } else {
     tabContent = h(ComingSoonTab, { tab: DEPLOYMENT_TABS.find((t) => t.id === activeTab) });
   }
@@ -677,7 +704,8 @@ function DeploymentOverviewTab({ deployment, onPatch, wavFileMap }) {
     h('div', { className: 'section-title' }, 'Detection Events'),
     h('div', { className: 'stat-grid' },
       h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Total'), h('div', { className: 'stat-box-value' }, String((deployment.detectionEvents || []).length))),
-      h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'BTO imports'), h('div', { className: 'stat-box-value' }, String((deployment.btoImports || []).length)))
+      h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'BTO imports'), h('div', { className: 'stat-box-value' }, String((deployment.btoImports || []).length))),
+      h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Manually added'), h('div', { className: 'stat-box-value' }, String(events.filter((e) => e.addedManually).length)))
     ),
     (deployment.detectionEvents || []).length === 0 && h('div', { className: 'card-sub', style: { marginTop: 10 } }, 'Import a BTO CSV on the Detections tab to get started.')
   );
@@ -857,6 +885,31 @@ function CustomLabelInput({ onSubmit }) {
     }),
     h('datalist', { id: 'all-species-names' }, ALL_SPECIES_NAMES.map((n) => h('option', { key: n, value: n }))),
     h('button', { className: 'btn btn-secondary btn-small', disabled: !value.trim(), onClick: submit }, 'Set label')
+  );
+}
+
+// For a species BTO's classifier never gave a candidate row at all (as opposed to a low-probability
+// one) - adds a brand new Detection Event alongside the current one, rather than overwriting its
+// Final ID. Shares the existing species datalist (#all-species-names) rendered by CustomLabelInput.
+function AddMissedSpeciesInput({ onAdd }) {
+  const [value, setValue] = useState('');
+  function submit() {
+    const v = value.trim();
+    if (!v) return;
+    onAdd(v);
+    setValue('');
+  }
+  return h('div', { style: { display: 'flex', gap: 8, marginTop: 8 } },
+    h('input', {
+      value, list: 'all-species-names', placeholder: 'Species BTO missed entirely...',
+      style: {
+        flex: 1, maxWidth: 260, background: 'var(--bg-card)', border: '1px solid var(--border)',
+        borderRadius: 8, color: 'var(--text)', padding: '7px 10px', fontSize: 13, fontFamily: 'var(--font-body)',
+      },
+      onChange: (e) => setValue(e.target.value),
+      onKeyDown: (e) => { if (e.key === 'Enter') submit(); },
+    }),
+    h('button', { className: 'btn btn-secondary btn-small', disabled: !value.trim(), onClick: submit }, '+ Add as new detection')
   );
 }
 
@@ -1046,7 +1099,7 @@ function timeToPixel(t, view, width) {
   return range > 0 ? ((t - view.t0) / range) * width : 0;
 }
 
-function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box, onBoxChange, guidelines, partMarkers, measurement }) {
+function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box, onBoxChange, guidelines, partMarkers, measurement, onSelectPart }) {
   const specCanvasRef = useRef(null);
   const oscCanvasRef = useRef(null);
   const dragRef = useRef(null);
@@ -1203,14 +1256,20 @@ function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box
         (partMarkers || []).map((m) => {
           const x = timeToPixel(m.offsetSec, view, SONOGRAM_WIDTH);
           if (x < 0 || x > SONOGRAM_WIDTH) return null;
-          const color = m.isCurrent ? 'var(--teal)' : 'rgba(255,255,255,0.4)';
-          return h('div', { key: m.partNumber, style: { position: 'absolute', left: x, top: 0, height: SPEC_HEIGHT, borderLeft: `1px ${m.isCurrent ? 'solid' : 'dashed'} ${color}`, pointerEvents: 'none' } },
+          const color = m.addedManually ? 'var(--accent)' : m.isCurrent ? 'var(--teal)' : 'rgba(255,255,255,0.4)';
+          const text = `${m.addedManually ? '+ added: ' : `part ${m.partNumber}: `}${m.label}`;
+          const clickable = !m.isCurrent && !!onSelectPart;
+          return h('div', { key: m.eventId, style: { position: 'absolute', left: x, top: 0, height: SPEC_HEIGHT, borderLeft: `1px ${m.isCurrent ? 'solid' : 'dashed'} ${color}`, pointerEvents: 'none' } },
             h('span', {
+              title: text, // full label on hover - the visible text truncates when a part's own window is too narrow to fit it
+              onClick: clickable ? () => onSelectPart(m.eventId) : undefined,
               style: {
-                position: 'absolute', left: 3, top: 2, fontSize: 9, color, fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap',
-                background: m.isCurrent ? 'rgba(79,184,168,0.15)' : 'transparent', padding: '1px 3px', borderRadius: 3,
+                position: 'absolute', left: 3, top: 2 + m.stackIndex * 12, fontSize: 9, color, fontFamily: 'var(--font-mono)',
+                whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 130,
+                background: m.isCurrent ? 'rgba(79,184,168,0.15)' : 'rgba(10,12,14,0.65)', padding: '1px 3px', borderRadius: 3,
+                pointerEvents: 'auto', cursor: clickable ? 'pointer' : 'default', textDecoration: clickable ? 'underline' : 'none', textDecorationStyle: 'dotted',
               },
-            }, `part ${m.partNumber}: ${m.label}`));
+            }, text));
         }),
         dragRect && h('div', {
           style: {
@@ -1413,7 +1472,7 @@ const QA_REASON_LABELS = {
   'not-selected': 'Not in queue',
 };
 
-function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, customLabels, onAddCustomLabel }) {
+function ReviewTab({ deployment, onPatchEvent, onAddManualEvent, wavFileMap, setWavFileMap, customLabels, onAddCustomLabel }) {
   const allEvents = deployment.detectionEvents || [];
   const profile = deployment.qaProfile || DEFAULT_QA_PROFILE;
   const [sortMode, setSortMode] = useState('primaryId'); // 'primaryId' | 'chronological'
@@ -1433,19 +1492,45 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, custom
   }, [list.length, unreviewedOnly, queueOnly]);
 
   const currentIndex = list.findIndex((e) => e.id === currentId);
-  const currentEvent = currentIndex >= 0 ? list[currentIndex] : null;
+  // Falls back to allEvents when currentId points at something outside the filtered list (e.g.
+  // jumping to a sibling part via a sonogram marker while "QA queue only"/"Unreviewed only" would
+  // otherwise have excluded it) - currentIndex stays -1 in that case, so Prev/Next below correctly
+  // treat it as "not positioned in this list" rather than silently showing nothing.
+  const currentEvent = currentIndex >= 0 ? list[currentIndex] : (allEvents.find((e) => e.id === currentId) || null);
 
   // BTO often splits one physical recording into several parts (e.g. a call bout that changes
   // species partway through) - all sharing the same original WAV. Since the sonogram always shows
   // the whole file, mark where each sibling part actually sits so it's clear which segment is
   // which, instead of silently displaying several species' calls with no indication of the split.
+  // Markers are clickable so a species BTO missed in part 2/3 can be added without first having to
+  // satisfy whatever QA filters are currently active for this list.
   const partMarkers = useMemo(() => {
     if (!currentEvent) return [];
-    return allEvents
+    const siblings = allEvents
       .filter((e) => e.originalWav === currentEvent.originalWav)
-      .map((e) => ({ partNumber: e.partNumber, offsetSec: estimateOffsetSec(e), label: primaryIdLabel(e), isCurrent: e.id === currentEvent.id }))
-      .filter((m) => m.offsetSec != null);
+      .map((e) => ({
+        eventId: e.id, partNumber: e.partNumber, offsetSec: estimateOffsetSec(e),
+        // Resolved Final ID, not the raw BTO guess - a manually-added event has no BTO candidate
+        // at all, so primaryIdLabel would always show "No ID" for it even once labelled.
+        label: M.resolveFinalId(e).finalId, isCurrent: e.id === currentEvent.id, addedManually: !!e.addedManually,
+      }))
+      .filter((m) => m.offsetSec != null)
+      .sort((a, b) => a.offsetSec - b.offsetSec);
+    // Stack labels that land at (almost) the same offset - typically a manually-added event
+    // sharing its source event's time - so they don't render on top of each other illegibly.
+    let stackIndex = 0, lastOffset = null;
+    for (const m of siblings) {
+      stackIndex = lastOffset != null && Math.abs(m.offsetSec - lastOffset) < 0.05 ? stackIndex + 1 : 0;
+      m.stackIndex = stackIndex;
+      lastOffset = m.offsetSec;
+    }
+    return siblings;
   }, [currentEvent, allEvents]);
+
+  const deploymentAddedCount = useMemo(() => allEvents.filter((e) => e.addedManually).length, [allEvents]);
+  const fileAddedCount = currentEvent
+    ? allEvents.filter((e) => e.addedManually && e.originalWav === currentEvent.originalWav).length
+    : 0;
 
   const wavCacheRef = useRef(new Map());
   const [decodedWav, setDecodedWav] = useState(null);
@@ -1457,8 +1542,12 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, custom
     const file = wavFileMap.get(currentEvent.originalWav);
     if (!file) { setDecodedWav(null); setWavStatus('missing'); return; }
     const cache = wavCacheRef.current;
-    if (cache.has(currentEvent.originalWav)) {
-      setDecodedWav(cache.get(currentEvent.originalWav));
+    // Keyed by name+size+lastModified, not just name - loading a *different* file that happens to
+    // share a name (e.g. re-picking a corrected WAV folder mid-session) must not silently reuse a
+    // stale decode cached under the old file of the same name.
+    const cacheKey = `${currentEvent.originalWav}::${file.size}::${file.lastModified}`;
+    if (cache.has(cacheKey)) {
+      setDecodedWav(cache.get(cacheKey));
       setWavStatus('ready');
       return;
     }
@@ -1469,7 +1558,7 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, custom
       .then((buf) => {
         if (cancelled) return;
         const parsed = Wav.parseWav(buf); // throws on bad/unsupported WAV data - caught below
-        cache.set(currentEvent.originalWav, parsed);
+        cache.set(cacheKey, parsed);
         setDecodedWav(parsed);
         setWavStatus('ready');
       })
@@ -1568,8 +1657,9 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, custom
       ),
       list.length > 0 && h(React.Fragment, null,
         h('button', { className: 'btn btn-secondary btn-small', onClick: () => goTo(currentIndex - 1), disabled: currentIndex <= 0 }, '← Prev'),
-        h('span', { className: 'card-sub', style: { fontFamily: 'var(--font-mono)' } }, `${currentIndex + 1} / ${list.length}`),
-        h('button', { className: 'btn btn-secondary btn-small', onClick: () => goTo(currentIndex + 1), disabled: currentIndex >= list.length - 1 }, 'Next →')
+        h('span', { className: 'card-sub', style: { fontFamily: 'var(--font-mono)' }, title: currentIndex < 0 ? "Viewing a call outside the current filters (e.g. a sibling part) - Prev/Next are disabled until you pick one from this list." : undefined },
+          currentIndex >= 0 ? `${currentIndex + 1} / ${list.length}` : `- / ${list.length}`),
+        h('button', { className: 'btn btn-secondary btn-small', onClick: () => goTo(currentIndex + 1), disabled: currentIndex < 0 || currentIndex >= list.length - 1 }, 'Next →')
       )
     )
   );
@@ -1638,7 +1728,7 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, custom
               },
             })
           ),
-          h(Sonogram, { spec, samples: decodedWav.samples, sampleRate: decodedWav.sampleRate, floorDb, rangeDb, saturation, box, onBoxChange: setBox, guidelines, partMarkers, measurement }),
+          h(Sonogram, { spec, samples: decodedWav.samples, sampleRate: decodedWav.sampleRate, floorDb, rangeDb, saturation, box, onBoxChange: setBox, guidelines, partMarkers, measurement, onSelectPart: (eventId) => setCurrentId(eventId) }),
           h('div', { className: 'card-sub', style: { marginTop: 6 } }, 'Drag to box a call and measure it - scroll to zoom the time axis.'),
           spec.truncated && h('div', { className: 'card-sub', style: { marginTop: 4, color: 'var(--accent)' } },
             `This recording is longer than ${Dsp.MAX_ANALYSIS_DURATION_SEC || 30}s - showing the first ${Math.round(spec.durationSec)}s only.`),
@@ -1689,7 +1779,13 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, custom
                     .map((c) => `${c.englishName || c.species} (${c.probability != null ? (c.probability * 100).toFixed(0) + '%' : '?'})`).join(', '))
               )
             : h('div', { className: 'card-sub' }, 'No ID (BTO could not classify this segment)'),
-          currentEvent.manualReview.reviewed && h('div', { style: { marginTop: 8, color: 'var(--teal)', fontSize: 13 } }, `New ID: ${currentEvent.manualReview.finalId} (reviewed)`)
+          currentEvent.manualReview.reviewed && h('div', { style: { marginTop: 8, color: 'var(--teal)', fontSize: 13 } }, `New ID: ${currentEvent.manualReview.finalId} (reviewed)`),
+          h('div', { style: { marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--border)' } },
+            h('div', { className: 'card-sub', style: { marginBottom: 4 } }, 'See a species here BTO missed entirely (not just low-probability)? Add it as its own detection, without changing this call\'s own ID:'),
+            h(AddMissedSpeciesInput, { onAdd: (label) => onAddManualEvent(currentEvent, label) }),
+            fileAddedCount > 0 && h('div', { className: 'card-sub', style: { marginTop: 6, color: 'var(--accent)' } },
+              `${fileAddedCount} manually added in this file - ${deploymentAddedCount} total in this deployment.`)
+          )
         ),
 
         speciesResults.length > 0 && h('div', { className: 'card', style: { marginTop: 14, padding: 0, overflow: 'hidden' } },
@@ -1788,7 +1884,10 @@ function EventsTable({ list, currentId, onSelect }) {
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, ev.originalWav),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, ev.partNumber),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, ev.time),
-            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, ev.primaryBtoId ? (ev.primaryBtoId.englishName || ev.primaryBtoId.species) : 'No ID'),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } },
+              ev.addedManually
+                ? h('span', { style: { color: 'var(--accent)' }, title: 'Added manually - BTO never gave this call a candidate row at all' }, '+ manually added')
+                : (ev.primaryBtoId ? (ev.primaryBtoId.englishName || ev.primaryBtoId.species) : 'No ID')),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, ev.primaryBtoId && ev.primaryBtoId.probability != null ? ev.primaryBtoId.probability.toFixed(2) : ''),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', color: 'var(--teal)' } }, ev.manualReview.finalId || ''),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, ev.manualReview.reviewed ? '✓' : '')

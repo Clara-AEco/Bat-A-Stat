@@ -113,6 +113,11 @@ window.BatID = window.BatID || {};
       time,
       latitude,
       longitude,
+      // True for a species the analyst spotted in the sonogram that BTO's classifier missed
+      // entirely (no candidate row at all) - a distinct Detection Event added alongside the
+      // BTO-derived one for the same call/part, tracked separately so it can be counted and later
+      // factored into the Statistics error estimate as a known gap in BTO's automated coverage.
+      addedManually: false,
       manualReview: {
         reviewed: false,
         finalId: null,
