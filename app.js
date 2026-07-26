@@ -18,6 +18,31 @@ const DEPLOYMENT_TABS = [
   { id: 'reports', label: 'Reports', phase: 8 },
 ];
 
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  componentDidCatch(error, info) {
+    console.error('Bat-A-Stat: caught render error', error, info);
+  }
+  render() {
+    if (this.state.error) {
+      return h('div', { className: 'content' },
+        h('div', { className: 'empty-state' },
+          h('div', { className: 'empty-title' }, 'This section hit an error'),
+          h('div', { className: 'empty-text' }, String(this.state.error && this.state.error.message || this.state.error)),
+          h('button', { className: 'btn btn-primary', style: { marginTop: 16 }, onClick: () => this.setState({ error: null }) }, 'Try again')
+        )
+      );
+    }
+    return this.props.children;
+  }
+}
+
 function Modal({ title, onClose, children }) {
   return h('div', { className: 'modal-overlay', onMouseDown: (e) => { if (e.target === e.currentTarget) onClose(); } },
     h('div', { className: 'modal' },
@@ -377,7 +402,7 @@ function DeploymentPanel({ location, deployment, activeTab, setActiveTab, onPatc
         onClick: () => setActiveTab(t.id),
       }, t.label))
     ),
-    tabContent
+    h(ErrorBoundary, { key: activeTab }, tabContent)
   );
 }
 
@@ -490,6 +515,14 @@ function DeploymentOverviewTab({ deployment, onPatch }) {
   function patchEffort(patch) {
     onPatch({ surveyEffort: { ...effort, ...patch } });
   }
+
+  const events = deployment.detectionEvents || [];
+  const distinctSurveyDates = useMemo(
+    () => new Set(events.map((e) => e.surveyDate).filter(Boolean)),
+    [events]
+  );
+  const suggestedNights = distinctSurveyDates.size;
+
   return h('div', { className: 'content' },
     h('div', { className: 'section-title' }, 'Details'),
     h(Field, { label: 'Name' }, h('input', { value: deployment.name, onChange: (e) => onPatch({ name: e.target.value }) })),
@@ -502,6 +535,10 @@ function DeploymentOverviewTab({ deployment, onPatch }) {
     h(Field, { label: 'Notes' }, h('textarea', { rows: 3, value: deployment.notes, onChange: (e) => onPatch({ notes: e.target.value }) })),
 
     h('div', { className: 'section-title' }, 'Survey effort'),
+    suggestedNights > 0 && suggestedNights !== effort.nights && h('div', { className: 'card', style: { marginBottom: 12, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 } },
+      h('div', { className: 'card-sub' }, `BTO data suggests ${suggestedNights} night${suggestedNights === 1 ? '' : 's'} (${distinctSurveyDates.size} distinct survey date${distinctSurveyDates.size === 1 ? '' : 's'} across ${events.length} detection events). This is a suggestion only - always editable below.`),
+      h('button', { className: 'btn btn-secondary btn-small', style: { flexShrink: 0 }, onClick: () => patchEffort({ nights: suggestedNights }) }, `Use ${suggestedNights}`)
+    ),
     h('div', { className: 'field-row' },
       h(Field, { label: 'Nights' }, h('input', { type: 'number', value: effort.nights ?? '', onChange: (e) => patchEffort({ nights: e.target.value === '' ? null : Number(e.target.value) }) })),
       h(Field, { label: 'Valid recording hours' }, h('input', { type: 'number', value: effort.validRecordingHours ?? '', onChange: (e) => patchEffort({ validRecordingHours: e.target.value === '' ? null : Number(e.target.value) }) })),
@@ -520,6 +557,35 @@ function DeploymentOverviewTab({ deployment, onPatch }) {
 }
 
 // ---------------- Manual review (sonogram, measurement, shape, decision tree, QA) ----------------
+
+// De-duplicated species display names (species-data.js has separate rows per call-type
+// variant, e.g. "Noctule (qCF)" / "Noctule (FM/qCF)" - strip that suffix for labelling).
+const ALL_SPECIES_NAMES = Array.from(new Set(
+  SpeciesData.SPECIES.map((sp) => sp.name.replace(/\s*\([^)]*\)\s*$/, '').trim())
+)).sort();
+
+function CustomLabelInput({ onSubmit }) {
+  const [value, setValue] = useState('');
+  function submit() {
+    const v = value.trim();
+    if (!v) return;
+    onSubmit(v);
+    setValue('');
+  }
+  return h('div', { style: { display: 'flex', gap: 8, marginTop: 10 } },
+    h('input', {
+      value, list: 'all-species-names', placeholder: 'Other species BTO missed...',
+      style: {
+        flex: 1, maxWidth: 260, background: 'var(--bg-card)', border: '1px solid var(--border)',
+        borderRadius: 8, color: 'var(--text)', padding: '7px 10px', fontSize: 13, fontFamily: 'var(--font-body)',
+      },
+      onChange: (e) => setValue(e.target.value),
+      onKeyDown: (e) => { if (e.key === 'Enter') submit(); },
+    }),
+    h('datalist', { id: 'all-species-names' }, ALL_SPECIES_NAMES.map((n) => h('option', { key: n, value: n }))),
+    h('button', { className: 'btn btn-secondary btn-small', disabled: !value.trim(), onClick: submit }, 'Set label')
+  );
+}
 
 function computeSpeciesCounts(events) {
   const counts = {};
@@ -664,22 +730,31 @@ function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box
 
 function WavFolderPicker({ wavFileMap, setWavFileMap }) {
   const inputRef = useRef(null);
+  const [error, setError] = useState(null);
   function handleChange(e) {
-    const files = e.target.files;
-    const map = new Map();
-    for (let i = 0; i < files.length; i++) {
-      const f = files[i];
-      if (/\.wav$/i.test(f.name)) map.set(f.name, f);
+    try {
+      const files = e.target.files || [];
+      const map = new Map();
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        if (f && /\.wav$/i.test(f.name)) map.set(f.name, f);
+      }
+      setWavFileMap(map);
+      setError(null);
+    } catch (err) {
+      setError('Could not read that folder: ' + (err && err.message ? err.message : err));
     }
-    setWavFileMap(map);
   }
-  return h('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
-    h('button', { className: 'btn btn-secondary btn-small', onClick: () => inputRef.current.click() },
-      wavFileMap.size ? `WAV folder loaded (${wavFileMap.size} files) - change` : '+ Load WAV folder'),
-    h('input', {
-      ref: (el) => { if (el) { el.webkitdirectory = true; el.directory = true; } },
-      type: 'file', multiple: true, style: { display: 'none' }, onChange: handleChange,
-    })
+  return h('div', null,
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
+      h('button', { className: 'btn btn-secondary btn-small', onClick: () => inputRef.current.click() },
+        wavFileMap.size ? `WAV folder loaded (${wavFileMap.size} files) - change` : '+ Load WAV folder'),
+      h('input', {
+        ref: (el) => { if (el) { el.webkitdirectory = true; el.directory = true; } },
+        type: 'file', multiple: true, style: { display: 'none' }, onChange: handleChange,
+      })
+    ),
+    error && h('div', { className: 'card-sub', style: { color: 'var(--danger)', marginTop: 6 } }, error)
   );
 }
 
@@ -700,6 +775,7 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
   const wavCacheRef = useRef(new Map());
   const [decodedWav, setDecodedWav] = useState(null);
   const [wavStatus, setWavStatus] = useState('none'); // none | loading | ready | error | missing
+  const [wavErrorMsg, setWavErrorMsg] = useState(null);
 
   useEffect(() => {
     if (!currentEvent) { setDecodedWav(null); setWavStatus('none'); return; }
@@ -713,16 +789,23 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
     }
     setWavStatus('loading');
     setDecodedWav(null);
-    file.arrayBuffer().then((buf) => {
-      try {
-        const parsed = Wav.parseWav(buf);
+    let cancelled = false;
+    file.arrayBuffer()
+      .then((buf) => {
+        if (cancelled) return;
+        const parsed = Wav.parseWav(buf); // throws on bad/unsupported WAV data - caught below
         cache.set(currentEvent.originalWav, parsed);
         setDecodedWav(parsed);
         setWavStatus('ready');
-      } catch (e) {
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        // Reading can fail (not just parsing) - e.g. a OneDrive "online-only" placeholder file
+        // that hasn't actually been downloaded yet, or a permissions/IO error.
+        setWavErrorMsg(e && e.message ? e.message : String(e));
         setWavStatus('error');
-      }
-    });
+      });
+    return () => { cancelled = true; };
   }, [currentEvent && currentEvent.id, wavFileMap]);
 
   const [fftSize, setFftSize] = useState(512);
@@ -802,7 +885,8 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
         ),
         wavStatus === 'missing' && h('div', { className: 'card', style: { marginBottom: 12, color: 'var(--text-muted)' } },
           `No matching WAV loaded for "${currentEvent.originalWav}". Load the WAV folder above to view its sonogram - you can still label from the BTO data alone.`),
-        wavStatus === 'error' && h('div', { className: 'card', style: { marginBottom: 12, color: 'var(--danger)' } }, 'Could not parse this WAV file.'),
+        wavStatus === 'error' && h('div', { className: 'card', style: { marginBottom: 12, color: 'var(--danger)' } },
+          `Could not read this WAV file: ${wavErrorMsg || 'unknown error'}. If it's stored in OneDrive with "Files On-Demand", it may need to be downloaded to your device first (right-click the file/folder → "Always keep on this device").`),
         wavStatus === 'loading' && h('div', { className: 'card-sub', style: { marginBottom: 12 } }, 'Loading audio...'),
         wavStatus === 'ready' && spec && h(React.Fragment, null,
           h('div', { style: { display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 10, fontSize: 12 } },
@@ -874,7 +958,8 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
           h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8 } },
             quickSpecies.map((label) => h('button', { key: label, className: 'btn btn-secondary btn-small', onClick: () => setFinalId(label) }, label)),
             h('button', { className: 'btn btn-danger btn-small', onClick: () => setFinalId('Noise / No ID') }, 'Noise / No ID')
-          )
+          ),
+          h(CustomLabelInput, { onSubmit: setFinalId })
         )
       ),
 
