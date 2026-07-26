@@ -751,17 +751,14 @@ function sortEventsChronologically(events) {
   });
 }
 
-function timeToPixel(t, durationSec, width) {
-  return durationSec > 0 ? (t / durationSec) * width : 0;
-}
 function freqToPixelY(f, sampleRate, height) {
   const nyquist = sampleRate / 2;
   return height * (1 - f / nyquist);
 }
 
-function BoxOverlay({ box, durationSec, sampleRate, width, specHeight }) {
-  const x0 = timeToPixel(box.t0, durationSec, width);
-  const x1 = timeToPixel(box.t1, durationSec, width);
+function BoxOverlay({ box, view, sampleRate, width, specHeight }) {
+  const x0 = timeToPixel(box.t0, view, width);
+  const x1 = timeToPixel(box.t1, view, width);
   const y0 = freqToPixelY(box.f1, sampleRate, specHeight);
   const y1 = freqToPixelY(box.f0, sampleRate, specHeight);
   return h('div', {
@@ -773,28 +770,55 @@ function BoxOverlay({ box, durationSec, sampleRate, width, specHeight }) {
 }
 
 const SONOGRAM_WIDTH = 860, SPEC_HEIGHT = 260, OSC_HEIGHT = 70;
+const AXIS_LEFT_WIDTH = 46, AXIS_BOTTOM_HEIGHT = 20;
+const MIN_ZOOM_WINDOW_SEC = 0.003;
 
-function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box, onBoxChange }) {
+// Picks a "nice" round tick spacing (1/2/5 x10^n) that gives roughly targetTicks divisions.
+function niceStep(range, targetTicks) {
+  if (!(range > 0)) return 1;
+  const raw = range / targetTicks;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / mag;
+  const step = norm < 1.5 ? 1 : norm < 3 ? 2 : norm < 7 ? 5 : 10;
+  return step * mag;
+}
+
+function timeToPixel(t, view, width) {
+  const range = view.t1 - view.t0;
+  return range > 0 ? ((t - view.t0) / range) * width : 0;
+}
+
+function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box, onBoxChange, guidelines }) {
   const specCanvasRef = useRef(null);
   const oscCanvasRef = useRef(null);
   const dragRef = useRef(null);
   const [dragRect, setDragRect] = useState(null);
+  const [hover, setHover] = useState(null);
+  const [view, setView] = useState({ t0: 0, t1: spec ? spec.durationSec : 0 });
+  const viewRef = useRef(view);
+  viewRef.current = view;
+
+  // A new call (or FFT-size change) means a fresh spec object - reset zoom to the full view.
+  useEffect(() => { if (spec) setView({ t0: 0, t1: spec.durationSec }); }, [spec]);
 
   useEffect(() => {
     const canvas = specCanvasRef.current;
     if (!canvas || !spec) return;
     canvas.width = SONOGRAM_WIDTH; canvas.height = SPEC_HEIGHT;
     const ctx = canvas.getContext('2d');
+    const frameFrom = Dsp.frameIndexForTime(spec, view.t0);
+    const frameTo = Math.max(frameFrom, Dsp.frameIndexForTime(spec, view.t1));
     const img = Dsp.renderSpectrogramImageData(spec, {
-      frameFrom: 0, frameTo: spec.numFrames - 1, binFrom: 0, binTo: spec.numBins - 1,
+      frameFrom, frameTo, binFrom: 0, binTo: spec.numBins - 1,
       floorDb, rangeDb, saturation,
     });
     const off = document.createElement('canvas');
     off.width = img.width; off.height = img.height;
     off.getContext('2d').putImageData(img, 0, 0);
     ctx.clearRect(0, 0, SONOGRAM_WIDTH, SPEC_HEIGHT);
+    ctx.imageSmoothingEnabled = false;
     ctx.drawImage(off, 0, 0, SONOGRAM_WIDTH, SPEC_HEIGHT);
-  }, [spec, floorDb, rangeDb, saturation]);
+  }, [spec, floorDb, rangeDb, saturation, view]);
 
   useEffect(() => {
     const canvas = oscCanvasRef.current;
@@ -803,10 +827,7 @@ function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box
     const ctx = canvas.getContext('2d');
     ctx.fillStyle = '#14171a';
     ctx.fillRect(0, 0, SONOGRAM_WIDTH, OSC_HEIGHT);
-    // Match whatever duration the spectrogram is actually showing (it may be truncated for a
-    // very long recording) so the two canvases stay aligned on the same time axis.
-    const duration = spec ? spec.durationSec : (samples.length / sampleRate);
-    const { mins, maxs } = Dsp.computeOscillogramColumns(samples, sampleRate, 0, duration, SONOGRAM_WIDTH);
+    const { mins, maxs } = Dsp.computeOscillogramColumns(samples, sampleRate, view.t0, view.t1, SONOGRAM_WIDTH);
     ctx.strokeStyle = '#4fb8a8';
     ctx.beginPath();
     for (let x = 0; x < SONOGRAM_WIDTH; x++) {
@@ -816,11 +837,38 @@ function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box
       ctx.lineTo(x + 0.5, yMax);
     }
     ctx.stroke();
-  }, [samples, sampleRate, spec]);
+  }, [samples, sampleRate, view]);
+
+  // Native (non-passive) wheel listener so preventDefault reliably stops the page scrolling
+  // while zooming the sonogram - React's synthetic onWheel can't guarantee that.
+  useEffect(() => {
+    const canvas = specCanvasRef.current;
+    if (!canvas || !spec) return;
+    function onWheel(e) {
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = SONOGRAM_WIDTH / rect.width;
+      const x = Math.max(0, Math.min(SONOGRAM_WIDTH, (e.clientX - rect.left) * scaleX));
+      const v = viewRef.current;
+      const range = v.t1 - v.t0;
+      const cursorTime = v.t0 + (x / SONOGRAM_WIDTH) * range;
+      const factor = e.deltaY < 0 ? 0.8 : 1.25;
+      const fullRange = spec.durationSec;
+      let newRange = Math.min(fullRange, Math.max(MIN_ZOOM_WINDOW_SEC, range * factor));
+      const ratio = range > 0 ? (cursorTime - v.t0) / range : 0.5;
+      let newT0 = cursorTime - ratio * newRange;
+      let newT1 = newT0 + newRange;
+      if (newT0 < 0) { newT1 -= newT0; newT0 = 0; }
+      if (newT1 > fullRange) { newT0 -= (newT1 - fullRange); newT1 = fullRange; }
+      setView({ t0: Math.max(0, newT0), t1: Math.min(fullRange, newT1) });
+    }
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    return () => canvas.removeEventListener('wheel', onWheel);
+  }, [spec]);
 
   function pixelToTime(x) {
-    const duration = spec ? spec.durationSec : (samples.length / sampleRate);
-    return Math.max(0, Math.min(duration, (x / SONOGRAM_WIDTH) * duration));
+    const range = view.t1 - view.t0;
+    return Math.max(0, view.t0 + (x / SONOGRAM_WIDTH) * range);
   }
   function pixelToFreq(y) {
     const nyquist = sampleRate / 2;
@@ -841,9 +889,9 @@ function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box
     setDragRect({ x0: p.x, y0: p.y, x1: p.x, y1: p.y });
   }
   function handleMouseMove(e) {
-    if (!dragRef.current) return;
     const p = localXY(e);
-    setDragRect({ x0: dragRef.current.x, y0: dragRef.current.y, x1: p.x, y1: p.y });
+    setHover({ x: p.x, y: p.y, timeMs: pixelToTime(p.x) * 1000, freqKHz: pixelToFreq(p.y) / 1000 });
+    if (dragRef.current) setDragRect({ x0: dragRef.current.x, y0: dragRef.current.y, x1: p.x, y1: p.y });
   }
   function handleMouseUp(e) {
     if (!dragRef.current) return;
@@ -858,21 +906,73 @@ function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box
     onBoxChange({ t0, t1, f0, f1 });
   }
 
-  return h('div', { style: { position: 'relative', width: SONOGRAM_WIDTH, maxWidth: '100%' } },
-    h('canvas', {
-      ref: specCanvasRef, style: { width: '100%', height: SPEC_HEIGHT, display: 'block', cursor: 'crosshair', borderRadius: '8px 8px 0 0', background: '#0a0c0e' },
-      onMouseDown: handleMouseDown, onMouseMove: handleMouseMove, onMouseUp: handleMouseUp,
-      onMouseLeave: () => { dragRef.current = null; setDragRect(null); },
-    }),
-    h('canvas', { ref: oscCanvasRef, style: { width: '100%', height: OSC_HEIGHT, display: 'block', borderRadius: '0 0 8px 8px' } }),
-    dragRect && h('div', {
-      style: {
-        position: 'absolute', left: (Math.min(dragRect.x0, dragRect.x1) / SONOGRAM_WIDTH) * 100 + '%',
-        top: Math.min(dragRect.y0, dragRect.y1), width: (Math.abs(dragRect.x1 - dragRect.x0) / SONOGRAM_WIDTH) * 100 + '%',
-        height: Math.abs(dragRect.y1 - dragRect.y0), border: '1px solid var(--accent)', background: 'rgba(232,131,58,0.15)', pointerEvents: 'none',
-      },
-    }),
-    box && spec && h(BoxOverlay, { box, durationSec: spec.durationSec, sampleRate, width: SONOGRAM_WIDTH, specHeight: SPEC_HEIGHT })
+  const nyquist = sampleRate / 2;
+  const freqStep = niceStep(nyquist / 1000, 6);
+  const freqTicks = [];
+  for (let v = 0; v <= nyquist / 1000 + 0.001; v += freqStep) freqTicks.push(Math.round(v));
+
+  const timeRangeMs = (view.t1 - view.t0) * 1000;
+  const timeStep = niceStep(timeRangeMs, 6);
+  const timeTicks = [];
+  const firstTimeTick = Math.ceil((view.t0 * 1000) / timeStep) * timeStep;
+  for (let v = firstTimeTick; v <= view.t1 * 1000 + 0.001; v += timeStep) timeTicks.push(Math.round(v));
+
+  const isZoomed = view.t1 - view.t0 < (spec ? spec.durationSec : 0) - 1e-6;
+
+  return h('div', { style: { display: 'flex', flexDirection: 'column', width: SONOGRAM_WIDTH + AXIS_LEFT_WIDTH, maxWidth: '100%' } },
+    h('div', { style: { display: 'flex' } },
+      // Frequency (kHz) axis, aligned to the spectrogram only.
+      h('div', { style: { width: AXIS_LEFT_WIDTH, position: 'relative', height: SPEC_HEIGHT, flexShrink: 0 } },
+        freqTicks.map((kHz) => h('div', {
+          key: kHz, style: { position: 'absolute', right: 6, top: freqToPixelY(kHz * 1000, sampleRate, SPEC_HEIGHT) - 6, fontSize: 10, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' },
+        }, kHz))
+      ),
+      h('div', { style: { position: 'relative', width: SONOGRAM_WIDTH, flexShrink: 0 } },
+        h('canvas', {
+          ref: specCanvasRef, style: { width: SONOGRAM_WIDTH, height: SPEC_HEIGHT, display: 'block', cursor: 'crosshair', borderRadius: '8px 8px 0 0', background: '#0a0c0e' },
+          onMouseDown: handleMouseDown, onMouseMove: handleMouseMove, onMouseUp: handleMouseUp,
+          onMouseLeave: () => { dragRef.current = null; setDragRect(null); setHover(null); },
+        }),
+        h('canvas', { ref: oscCanvasRef, style: { width: SONOGRAM_WIDTH, height: OSC_HEIGHT, display: 'block', borderRadius: '0 0 8px 8px' } }),
+        (guidelines || []).map((kHz) => {
+          const y = freqToPixelY(kHz * 1000, sampleRate, SPEC_HEIGHT);
+          if (y < 0 || y > SPEC_HEIGHT) return null;
+          return h('div', { key: kHz, style: { position: 'absolute', left: 0, top: y, width: SONOGRAM_WIDTH, borderTop: '1px dashed var(--accent)', pointerEvents: 'none' } },
+            h('span', { style: { position: 'absolute', right: 2, top: -14, fontSize: 9, color: 'var(--accent)', fontFamily: 'var(--font-mono)' } }, `${kHz}k`));
+        }),
+        dragRect && h('div', {
+          style: {
+            position: 'absolute', left: Math.min(dragRect.x0, dragRect.x1), top: Math.min(dragRect.y0, dragRect.y1),
+            width: Math.abs(dragRect.x1 - dragRect.x0), height: Math.abs(dragRect.y1 - dragRect.y0),
+            border: '1px solid var(--accent)', background: 'rgba(232,131,58,0.15)', pointerEvents: 'none',
+          },
+        }),
+        box && spec && h(BoxOverlay, { box, view, sampleRate, width: SONOGRAM_WIDTH, specHeight: SPEC_HEIGHT }),
+        hover && h(React.Fragment, null,
+          h('div', { style: { position: 'absolute', left: hover.x, top: 0, height: SPEC_HEIGHT, borderLeft: '1px dashed rgba(255,255,255,0.35)', pointerEvents: 'none' } }),
+          hover.y <= SPEC_HEIGHT && h('div', { style: { position: 'absolute', left: 0, top: hover.y, width: SONOGRAM_WIDTH, borderTop: '1px dashed rgba(255,255,255,0.35)', pointerEvents: 'none' } }),
+          h('div', {
+            style: {
+              position: 'absolute', left: Math.min(hover.x + 8, SONOGRAM_WIDTH - 110), top: Math.max(0, hover.y - 22),
+              background: 'rgba(10,12,14,0.9)', border: '1px solid var(--border)', borderRadius: 4, padding: '2px 6px',
+              fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text)', pointerEvents: 'none', whiteSpace: 'nowrap',
+            },
+          }, `${hover.freqKHz.toFixed(1)} kHz, ${hover.timeMs.toFixed(1)} ms`)
+        )
+      )
+    ),
+    h('div', { style: { display: 'flex' } },
+      h('div', { style: { width: AXIS_LEFT_WIDTH, flexShrink: 0 } }),
+      h('div', { style: { position: 'relative', width: SONOGRAM_WIDTH, height: AXIS_BOTTOM_HEIGHT, flexShrink: 0 } },
+        timeTicks.map((ms) => h('div', {
+          key: ms, style: { position: 'absolute', left: timeToPixel(ms / 1000, view, SONOGRAM_WIDTH) - 14, top: 2, fontSize: 10, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', width: 30, textAlign: 'center' },
+        }, ms))
+      )
+    ),
+    h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 2 } },
+      h('span', { className: 'card-sub' }, 'Scroll to zoom (time axis)'),
+      isZoomed && h('button', { className: 'btn btn-secondary btn-small', onClick: () => setView({ t0: 0, t1: spec.durationSec }) }, 'Reset zoom')
+    )
   );
 }
 
@@ -975,6 +1075,8 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
   const [floorDb, setFloorDb] = useState(-70);
   const [rangeDb, setRangeDb] = useState(50);
   const [saturation, setSaturation] = useState(0.85);
+  const [guidelines, setGuidelines] = useState([40, 53]); // kHz reference lines, e.g. pipistrelle spp. split
+  const [newGuideline, setNewGuideline] = useState('');
 
   const [box, setBox] = useState(null);
   const [shapeOverride, setShapeOverride] = useState(null);
@@ -1052,8 +1154,8 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
   return h('div', { className: 'content', style: { maxWidth: 'none' } },
     toolbar,
 
-    currentEvent && h('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(0, 2fr) minmax(260px, 1fr)', gap: 16 } },
-      // Left: sonogram + controls + quick labels
+    currentEvent && h('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(0, 2fr) minmax(240px, 1fr)', gap: 16 } },
+      // Left: sonogram + controls (the primary evidence)
       h('div', null,
         h('div', { className: 'card-sub', style: { marginBottom: 8 } },
           `${currentEvent.originalWav} · part ${currentEvent.partNumber} · ${currentEvent.surveyDate || '?'} ${currentEvent.time || ''}`
@@ -1075,8 +1177,28 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
             h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 140 } }, 'Saturation',
               h('input', { type: 'range', min: 0, max: 1, step: 0.05, value: saturation, onChange: (e) => setSaturation(Number(e.target.value)), style: { flex: 1 } }))
           ),
-          h(Sonogram, { spec, samples: decodedWav.samples, sampleRate: decodedWav.sampleRate, floorDb, rangeDb, saturation, box, onBoxChange: setBox }),
-          h('div', { className: 'card-sub', style: { marginTop: 6 } }, 'Drag on the sonogram to box a call and measure it.'),
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 10 } },
+            h('span', { style: { fontSize: 11, color: 'var(--text-faint)', textTransform: 'uppercase' } }, 'Guidelines (kHz):'),
+            guidelines.map((kHz) => h('span', {
+              key: kHz, className: 'pill', style: { display: 'inline-flex', alignItems: 'center', gap: 5, padding: '3px 8px' },
+            }, `${kHz}k`, h('button', {
+              onClick: () => setGuidelines(guidelines.filter((g) => g !== kHz)),
+              style: { background: 'none', border: 'none', color: 'inherit', cursor: 'pointer', padding: 0, fontSize: 13, lineHeight: 1 },
+            }, '×'))),
+            h('input', {
+              value: newGuideline, placeholder: 'e.g. 45', style: { width: 60, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)', padding: '3px 6px', fontSize: 12 },
+              onChange: (e) => setNewGuideline(e.target.value),
+              onKeyDown: (e) => {
+                if (e.key === 'Enter') {
+                  const v = Number(newGuideline);
+                  if (v > 0 && !guidelines.includes(v)) setGuidelines([...guidelines, v].sort((a, b) => a - b));
+                  setNewGuideline('');
+                }
+              },
+            })
+          ),
+          h(Sonogram, { spec, samples: decodedWav.samples, sampleRate: decodedWav.sampleRate, floorDb, rangeDb, saturation, box, onBoxChange: setBox, guidelines }),
+          h('div', { className: 'card-sub', style: { marginTop: 6 } }, 'Drag to box a call and measure it - scroll to zoom the time axis.'),
           spec.truncated && h('div', { className: 'card-sub', style: { marginTop: 4, color: 'var(--accent)' } },
             `This recording is longer than ${Dsp.MAX_ANALYSIS_DURATION_SEC || 30}s - showing the first ${Math.round(spec.durationSec)}s only.`)
         ),
@@ -1101,22 +1223,25 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
         ),
 
         speciesResults.length > 0 && h('div', { className: 'card', style: { marginTop: 14, padding: 0, overflow: 'hidden' } },
-          h('div', { style: { padding: '10px 14px', borderBottom: '1px solid var(--border)', fontWeight: 600, fontSize: 13 } }, 'Decision-tree candidates (top 6)'),
+          h('div', { style: { padding: '10px 14px', borderBottom: '1px solid var(--border)', fontWeight: 600, fontSize: 13 } }, 'Decision-tree candidates (top 6, weighted: shape & peak > duration > start/end)'),
           h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
             h('thead', null, h('tr', null,
-              ['Species', 'Score', 'Peak', 'Start', 'End', 'Dur.'].map((c) => h('th', { key: c, style: { textAlign: 'left', padding: '5px 10px', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' } }, c))
+              ['Species', 'Score', 'Shape', 'Peak', 'Duration', 'Start', 'End'].map((c) => h('th', { key: c, style: { textAlign: 'left', padding: '5px 10px', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' } }, c))
             )),
             h('tbody', null, speciesResults.slice(0, 6).map((res) => h('tr', { key: res.species.name },
               h('td', { style: { padding: '5px 10px', borderTop: '1px solid var(--border)' } }, res.species.name),
-              h('td', { style: { padding: '5px 10px', borderTop: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, `${res.passed}/${res.evaluated}`),
-              ...['peak', 'start', 'end', 'duration'].map((k) => h('td', {
+              h('td', { style: { padding: '5px 10px', borderTop: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, `${Math.round(res.score * 100)}%`),
+              ...['shape', 'peak', 'duration', 'start', 'end'].map((k) => h('td', {
                 key: k, style: { padding: '5px 10px', borderTop: '1px solid var(--border)', color: res.checks[k] === true ? 'var(--teal)' : res.checks[k] === false ? 'var(--danger)' : 'var(--text-faint)' },
               }, res.checks[k] === true ? '✓' : res.checks[k] === false ? '✗' : '-'))
             )))
           )
-        ),
+        )
+      ),
 
-        h('div', { className: 'card', style: { marginTop: 14 } },
+      // Right: identification panel, next to the sonogram - old ID, quick labels, custom label
+      h('div', null,
+        h('div', { className: 'card' },
           h('div', { style: { fontWeight: 600, fontSize: 13, marginBottom: 8 } }, 'Old ID (BTO)'),
           currentEvent.primaryBtoId
             ? h('div', null,
@@ -1138,11 +1263,13 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
           ),
           h(CustomLabelInput, { onSubmit: setFinalId })
         )
-      ),
+      )
+    ),
 
-      // Right: BTO attribute panel for the current event
-      h('div', { className: 'card' },
-        h('div', { style: { fontWeight: 600, marginBottom: 10 } }, 'Detection attributes'),
+    // Detection attributes - metadata, de-prioritized below the evidence/ID panels.
+    currentEvent && h('div', { className: 'card', style: { marginTop: 16 } },
+      h('div', { style: { fontWeight: 600, marginBottom: 10 } }, 'Detection attributes'),
+      h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '0 24px' } },
         h(AttrRow, { label: 'Original WAV', value: currentEvent.originalWav }),
         h(AttrRow, { label: 'Part', value: currentEvent.partNumber }),
         h(AttrRow, { label: 'Survey date', value: currentEvent.surveyDate }),

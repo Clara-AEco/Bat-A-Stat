@@ -69,9 +69,16 @@ window.BatID = window.BatID || {};
     return value >= range.min && value <= range.max;
   }
 
+  // Relative importance of each parameter in the ranking (Clara's call): peak frequency and
+  // call shape matter most, duration next, start/end frequency matter least (and are weighted
+  // equally with each other). These are weights, not pass/fail cutoffs - every check still
+  // shows its own tick/cross in the UI so the reasoning stays visible.
+  const CHECK_WEIGHTS = { shape: 4, peak: 4, duration: 2, start: 1, end: 1, ipi: 1 };
+
   // Scores every species against a measured call. `measured` = { peak, start, end, duration, ipi } (kHz/ms, any may be null).
-  // `shapeGroup` (optional) nudges the ranking without hard-excluding anything - matches the
-  // training material's own warning that automated classifiers shouldn't be trusted blindly.
+  // `shapeGroup` (optional) is scored as its own weighted check (see CHECK_WEIGHTS) rather than
+  // just a tie-breaker - matches the training material's own warning that automated classifiers
+  // shouldn't be trusted blindly, so this stays a ranked suggestion, never a hard filter.
   function scoreSpecies(measured, shapeGroup) {
     const results = SPECIES.map((sp) => {
       const checks = {
@@ -80,25 +87,22 @@ window.BatID = window.BatID || {};
         end: inRange(measured.end, sp.end),
         duration: inRange(measured.duration, sp.duration),
         ipi: inRange(measured.ipi, sp.ipi),
+        shape: shapeGroup ? sp.shapeGroup === shapeGroup : null,
       };
-      const evaluated = Object.values(checks).filter((v) => v !== null);
-      const passed = evaluated.filter((v) => v === true).length;
-      const shapeMatch = shapeGroup ? sp.shapeGroup === shapeGroup : null;
+      const evaluatedKeys = Object.keys(checks).filter((k) => checks[k] !== null);
+      const passed = evaluatedKeys.filter((k) => checks[k] === true).length;
+      const weightTotal = evaluatedKeys.reduce((sum, k) => sum + CHECK_WEIGHTS[k], 0);
+      const weightPassed = evaluatedKeys.filter((k) => checks[k] === true).reduce((sum, k) => sum + CHECK_WEIGHTS[k], 0);
       return {
         species: sp,
         checks,
         passed,
-        evaluated: evaluated.length,
-        score: evaluated.length ? passed / evaluated.length : 0,
-        shapeMatch,
+        evaluated: evaluatedKeys.length,
+        score: weightTotal ? weightPassed / weightTotal : 0,
+        shapeMatch: checks.shape,
       };
     });
     results.sort((a, b) => {
-      // Shape-group match breaks ties first (soft nudge, not a hard filter).
-      if (shapeGroup) {
-        if (a.shapeMatch && !b.shapeMatch) return -1;
-        if (!a.shapeMatch && b.shapeMatch) return 1;
-      }
       if (b.score !== a.score) return b.score - a.score;
       return b.passed - a.passed;
     });
