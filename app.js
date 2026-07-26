@@ -7,6 +7,8 @@ const Wav = window.BatID.Wav;
 const Dsp = window.BatID.Dsp;
 const SpeciesData = window.BatID.SpeciesData;
 const QaProfiles = window.BatID.QaProfiles;
+const Sun = window.BatID.Sun;
+const Stats = window.BatID.Stats;
 
 const DEPLOYMENT_TABS = [
   { id: 'overview', label: 'Overview', phase: 1 },
@@ -486,6 +488,18 @@ function LocationOverview({ location, onPatch, onDelete, onAddDeployment }) {
       h('div', { className: 'section-title' }, 'Details'),
       h(Field, { label: 'Name' }, h('input', { value: location.name, onChange: (e) => onPatch({ name: e.target.value }) })),
       h(Field, { label: 'Notes' }, h('textarea', { rows: 4, value: location.notes, onChange: (e) => onPatch({ notes: e.target.value }) })),
+      h('div', { className: 'field-row' },
+        h(Field, { label: 'Latitude' }, h('input', {
+          type: 'number', step: 'any', value: location.latitude ?? '', placeholder: 'e.g. 50.964',
+          onChange: (e) => onPatch({ latitude: e.target.value === '' ? null : Number(e.target.value) }),
+        })),
+        h(Field, { label: 'Longitude' }, h('input', {
+          type: 'number', step: 'any', value: location.longitude ?? '', placeholder: 'e.g. 0.094',
+          onChange: (e) => onPatch({ longitude: e.target.value === '' ? null : Number(e.target.value) }),
+        }))
+      ),
+      (location.latitude == null || location.longitude == null) && h('div', { className: 'card-sub', style: { marginTop: -8, marginBottom: 14 } },
+        "Sets this Location's coordinates for sunset-relative activity timing in Statistics/Figures - without these, timing falls back to raw clock time."),
       h('div', { className: 'section-title' }, 'Deployments'),
       (location.deployments || []).length === 0 && h('div', { className: 'card-sub' }, 'No deployments yet.'),
       h('div', { className: 'card-list' },
@@ -509,6 +523,8 @@ function DeploymentPanel({ location, deployment, activeTab, setActiveTab, onPatc
     tabContent = h(QaTab, { deployment, onPatch, wavFileMap, setWavFileMap, onGoToReview: () => setActiveTab('review') });
   } else if (activeTab === 'review') {
     tabContent = h(ReviewTab, { deployment, onPatchEvent, onAddManualEvent, wavFileMap, setWavFileMap, customLabels, onAddCustomLabel });
+  } else if (activeTab === 'stats') {
+    tabContent = h(StatisticsTab, { deployment, location });
   } else {
     tabContent = h(ComingSoonTab, { tab: DEPLOYMENT_TABS.find((t) => t.id === activeTab) });
   }
@@ -633,6 +649,108 @@ function ComingSoonTab({ tab }) {
       h('span', { className: 'pill pill-coming-soon', style: { marginBottom: 14 } }, `Phase ${tab.phase}`),
       h('div', { className: 'empty-title' }, `${tab.label} — coming soon`),
       h('div', { className: 'empty-text' }, `This tab is built in Phase ${tab.phase} of the Bat-A-Stat build. The Project/Location/Deployment structure you're setting up now will feed straight into it.`)
+    )
+  );
+}
+
+function fmtNum(v, digits) {
+  return v == null || isNaN(v) ? '-' : v.toFixed(digits == null ? 1 : digits);
+}
+function fmtHour(h) {
+  if (h == null) return '-';
+  const sign = h < 0 ? '-' : '';
+  const abs = Math.abs(h);
+  const hh = Math.floor(abs), mm = Math.round((abs - hh) * 60);
+  return `${sign}${hh}h${String(mm).padStart(2, '0')}m`;
+}
+function fmtDateTime(d) {
+  return d ? d.toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '-';
+}
+
+function StatisticsTab({ deployment, location }) {
+  const stats = useMemo(() => Stats.computeAllStats(deployment, location), [deployment, location]);
+  const { effort, activity, species, timing } = stats;
+
+  if (activity.totalDetections === 0) {
+    return h('div', { className: 'content' },
+      h('div', { className: 'empty-state' },
+        h('div', { className: 'empty-title' }, 'No detections to analyse yet'),
+        h('div', { className: 'empty-text' }, 'Import a BTO CSV on the Detections tab first.')
+      )
+    );
+  }
+
+  return h('div', { className: 'content' },
+    h('div', { className: 'section-title' }, 'Survey effort'),
+    h('div', { className: 'stat-grid' },
+      h(StatBox, { label: 'Nights (entered)', value: effort.nights ?? '-' }),
+      h(StatBox, { label: 'Nights in data', value: effort.nightsInData }),
+      h(StatBox, { label: 'Valid recording hours', value: effort.validRecordingHours ?? '-' }),
+      h(StatBox, { label: 'QA completion %', value: effort.qaCompletionPct != null ? effort.qaCompletionPct + '%' : '-' })
+    ),
+    effort.nights != null && effort.nights !== effort.nightsInData && h('div', { className: 'card-sub', style: { marginTop: 8 } },
+      `Note: ${effort.nightsInData} distinct survey night(s) appear in the data, vs ${effort.nights} entered on the Overview tab - detections-per-night below uses the entered figure.`),
+
+    h('div', { className: 'section-title' }, 'Activity'),
+    h('div', { className: 'stat-grid' },
+      h(StatBox, { label: 'Total detections', value: activity.totalDetections }),
+      h(StatBox, { label: 'Per night', value: fmtNum(activity.detectionsPerNight) }),
+      h(StatBox, { label: 'Per hour', value: fmtNum(activity.detectionsPerHour) }),
+      h(StatBox, { label: 'Nightly mean', value: fmtNum(activity.nightlyMean) }),
+      h(StatBox, { label: 'Nightly median', value: fmtNum(activity.nightlyMedian) }),
+      h(StatBox, { label: 'Nightly min/max', value: activity.nightlyMin != null ? `${activity.nightlyMin} / ${activity.nightlyMax}` : '-' }),
+      h(StatBox, { label: 'Nightly SD', value: fmtNum(activity.nightlySd) }),
+      h(StatBox, { label: 'Nightly CV', value: fmtNum(activity.nightlyCv, 2) })
+    ),
+
+    h('div', { className: 'section-title' }, 'Species'),
+    h('div', { className: 'stat-grid' },
+      h(StatBox, { label: 'Richness', value: species.richness }),
+      h(StatBox, { label: 'Dominant species', value: species.dominantSpecies ? species.dominantSpecies.species : '-' }),
+      h(StatBox, { label: 'Dominant %', value: species.dominantSpecies ? fmtNum(species.dominantSpecies.pct) + '%' : '-' })
+    ),
+    species.composition.length > 0 && h('div', { className: 'card', style: { marginTop: 12, padding: 0, overflow: 'hidden' } },
+      h('div', { style: { overflowX: 'auto' } },
+        h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
+          h('thead', null, h('tr', null,
+            ['Species', 'Count', '% of total', 'Active nights', 'Detection freq.'].map((c) => h('th', {
+              key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
+            }, c))
+          )),
+          h('tbody', null, species.composition.map((s) => h('tr', { key: s.species },
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, s.species),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.count),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(s.pct) + '%'),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.activeNights),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.detectionFrequencyPct != null ? fmtNum(s.detectionFrequencyPct) + '%' : '-')
+          )))
+        )
+      )
+    ),
+
+    h('div', { className: 'section-title' }, 'Timing'),
+    h('div', { className: 'card-sub', style: { marginBottom: 8 } },
+      timing.sunsetRelative
+        ? "Times below are hours relative to sunset (negative = before sunset) - uses this Location's coordinates."
+        : "Times below are raw clock time - set this Location's Latitude/Longitude (on its Details tab) to switch to sunset-relative timing."),
+    h('div', { className: 'stat-grid' },
+      h(StatBox, { label: 'First detection', value: fmtDateTime(timing.firstDetection) }),
+      h(StatBox, { label: 'Last detection', value: fmtDateTime(timing.lastDetection) }),
+      h(StatBox, { label: timing.sunsetRelative ? 'Median (rel. sunset)' : 'Median hour', value: timing.sunsetRelative ? fmtHour(timing.medianHour) : fmtNum(timing.medianHour) }),
+      h(StatBox, {
+        label: 'Peak 30-min window',
+        value: timing.peakHalfHour ? `${timing.sunsetRelative ? fmtHour(timing.peakHalfHour.startHour) : fmtNum(timing.peakHalfHour.startHour)} (${timing.peakHalfHour.count})` : '-',
+      }),
+      h(StatBox, {
+        label: 'Peak rolling hour',
+        value: timing.peakRollingHour ? `${timing.sunsetRelative ? fmtHour(timing.peakRollingHour.startHour) : fmtNum(timing.peakRollingHour.startHour)} (${timing.peakRollingHour.count})` : '-',
+      })
+    ),
+    Object.keys(timing.percentiles || {}).length > 0 && h('div', { style: { marginTop: 12 } },
+      h('div', { className: 'card-sub', style: { marginBottom: 6 } }, 'Cumulative activity percentiles:'),
+      h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '6px 18px', fontSize: 12, fontFamily: 'var(--font-mono)' } },
+        [10, 25, 50, 75, 90].map((p) => h('span', { key: p }, `${p}%: ${timing.sunsetRelative ? fmtHour(timing.percentiles[p]) : fmtNum(timing.percentiles[p])}`))
+      )
     )
   );
 }

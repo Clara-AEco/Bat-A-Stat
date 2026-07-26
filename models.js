@@ -29,12 +29,17 @@ window.BatID = window.BatID || {};
     };
   }
 
-  function createLocation({ name = '', notes = '' } = {}) {
+  function createLocation({ name = '', notes = '', latitude = null, longitude = null } = {}) {
     return {
       id: uid(),
       type: 'location',
       name,
       notes,
+      // Drives sunset/sunrise-relative timing statistics and figures (sun.js) - a Location is the
+      // right place for this (a persistent monitoring point), not per-Detection-Event GPS, which
+      // BTO only sometimes reports and can jitter or be missing entirely.
+      latitude,
+      longitude,
       deployments: [],
       createdAt: nowIso(),
       updatedAt: nowIso(),
