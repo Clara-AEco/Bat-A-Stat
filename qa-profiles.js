@@ -76,13 +76,21 @@ window.BatID = window.BatID || {};
     return reason === '100pct-species' ? 'pending-required-qa' : 'included';
   }
 
+  // A genus-level Final ID (e.g. "Myotis sp") - Clara's own practice when a sonogram is too
+  // degraded for a confident species call, most common on sub-50%-confidence Myotis/Barbastella
+  // primaries. This is measurement uncertainty forced by call/recording quality, not BTO getting
+  // the species wrong - so it must never be scored as an incorrect primary ID.
+  function isGenusLevelLabel(label) {
+    return /\bsp\.?$/i.test((label || '').trim());
+  }
+
   // Grades a reviewed event's BTO primary result against what manual review actually found.
   // knownBatSpeciesNames (optional): the app's own reference species list, used to tell "reviewer
-  // reassigned to a different real bat species" apart from a custom/non-bat/genus-level label -
-  // without it, anything not matching the primary just falls into the 'reassigned-other' bucket.
-  // Does NOT yet distinguish incorrect-identification-level / false-positive-non-bat / bat-
-  // present-unidentifiable from each other - that needs the reviewer to record which one
-  // explicitly (a structured taxonomy/outcome picker), not string-matching a free-text label.
+  // reassigned to a different real bat species" apart from a custom/non-bat label - without it,
+  // anything not matching the primary just falls into the 'reassigned-other' bucket.
+  // Does NOT yet distinguish false-positive-non-bat / bat-present-unidentifiable from each other -
+  // that needs the reviewer to record which one explicitly (a structured taxonomy/outcome picker),
+  // not string-matching a free-text label.
   function computeQaOutcome(event, knownBatSpeciesNames) {
     if (!event.manualReview || !event.manualReview.reviewed) {
       return { primaryIdCorrect: null, eventComplete: null, qaOutcome: 'unresolved' };
@@ -104,6 +112,9 @@ window.BatID = window.BatID || {};
         ? { primaryIdCorrect: true, eventComplete: false, qaOutcome: 'correct-but-incomplete' }
         : { primaryIdCorrect: true, eventComplete: true, qaOutcome: 'correct' };
     }
+    if (isGenusLevelLabel(finalId)) {
+      return { primaryIdCorrect: null, eventComplete: false, qaOutcome: 'incorrect-identification-level' };
+    }
     const isKnownBatSpecies = !knownBatSpeciesNames || knownBatSpeciesNames.includes(finalId);
     return isKnownBatSpecies
       ? { primaryIdCorrect: false, eventComplete: false, qaOutcome: 'incorrect-species' }
@@ -112,6 +123,6 @@ window.BatID = window.BatID || {};
 
   ns.QaProfiles = {
     stableHash01, effectiveThreshold, computeQaInclusion, computeQaSummary,
-    computeAnalysisStatus, computeQaOutcome,
+    computeAnalysisStatus, computeQaOutcome, isGenusLevelLabel,
   };
 })(window.BatID);

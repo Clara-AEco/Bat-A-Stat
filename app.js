@@ -14,7 +14,8 @@ const QA_OUTCOME_LABELS = {
   correct: 'Correct',
   'correct-but-incomplete': 'Correct but incomplete',
   'incorrect-species': 'Incorrect species',
-  'reassigned-other': 'Reassigned (genus/group/non-bat/unidentified)',
+  'incorrect-identification-level': 'Downgraded to genus (sonogram too degraded to call to species)',
+  'reassigned-other': 'Reassigned (group/non-bat/unidentified)',
   'false-positive-noise': 'False positive - noise',
   'no-bto-primary': 'No BTO primary to grade',
   unresolved: 'Unresolved',
@@ -693,8 +694,12 @@ function StatisticsTab({ deployment, location }) {
             h(StatBox, { label: 'Primary-ID reliability', value: fmtNum(reliability.primaryIdReliabilityPct) + '%' }),
             h(StatBox, { label: 'Complete-event reliability', value: fmtNum(reliability.completeEventReliabilityPct) + '%' }),
             h(StatBox, { label: 'Additional-species rate', value: fmtNum(reliability.additionalSpeciesRatePct) + '%' }),
+            h(StatBox, { label: 'Genus-level downgrade rate', value: fmtNum(reliability.genusLevelRatePct) + '%' }),
+            h(StatBox, { label: 'Primary-ID judged sample (n)', value: reliability.primaryIdJudgedSampleSize }),
             h(StatBox, { label: 'Reviewed sample (n)', value: reliability.reviewedSampleSize })
           ),
+          h('div', { className: 'card-sub', style: { marginTop: 6 } },
+            'Primary-ID reliability excludes calls downgraded to genus level (e.g. "Myotis sp") from its sample - a sonogram too degraded to confirm or refute species-level accuracy isn\'t evidence either way, so those are tracked separately as the genus-level downgrade rate instead of counting against BTO.'),
           h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '6px 16px', marginTop: 10, fontSize: 12, fontFamily: 'var(--font-mono)' } },
             Object.entries(reliability.byOutcome).map(([outcome, count]) => h('span', { key: outcome }, `${QA_OUTCOME_LABELS[outcome] || outcome}: ${count}`))
           )

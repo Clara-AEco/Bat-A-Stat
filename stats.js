@@ -276,7 +276,11 @@ window.BatID = window.BatID || {};
   //
   // A. Primary-ID reliability: was BTO's primary species kept as (one of) the resolved species?
   //    A "correct but incomplete" event (primary kept, but another species also added) still
-  //    counts as correct here - the primary identification itself wasn't wrong.
+  //    counts as correct here - the primary identification itself wasn't wrong. Events downgraded
+  //    to genus level ('incorrect-identification-level' - a sonogram too degraded to call to
+  //    species, Clara's own practice for most sub-50%-confidence Myotis/Barbastella primaries) are
+  //    EXCLUDED from this denominator entirely: BTO's species-level primary can't be judged right
+  //    or wrong when the reviewer never had enough signal to confirm or refute it.
   // B. Complete-event reliability: did the event need no change at all - no reassignment, no
   //    added species? Stricter than (A): a "correct but incomplete" event fails this one.
   // C. Additional-species rate: how often did manual review find a species BTO's primary result
@@ -284,20 +288,27 @@ window.BatID = window.BatID || {};
   function computeReliabilityStats(events, knownBatSpeciesNames) {
     const reviewed = (events || []).filter((ev) => ev.manualReview && ev.manualReview.reviewed && ev.primaryBtoId);
     const n = reviewed.length;
-    let primaryCorrect = 0, complete = 0, withAdditional = 0;
+    let primaryCorrect = 0, primaryJudged = 0, complete = 0, withAdditional = 0, genusLevel = 0;
     const byOutcome = {};
     for (const ev of reviewed) {
       const outcome = ns.QaProfiles.computeQaOutcome(ev, knownBatSpeciesNames);
       byOutcome[outcome.qaOutcome] = (byOutcome[outcome.qaOutcome] || 0) + 1;
-      if (outcome.primaryIdCorrect) primaryCorrect++;
+      if (outcome.qaOutcome === 'incorrect-identification-level') {
+        genusLevel++;
+      } else if (outcome.primaryIdCorrect != null) {
+        primaryJudged++;
+        if (outcome.primaryIdCorrect) primaryCorrect++;
+      }
       if (outcome.eventComplete) complete++;
       if ((ev.manualReview.additionalTaxa || []).length > 0) withAdditional++;
     }
     return {
       reviewedSampleSize: n,
-      primaryIdReliabilityPct: n > 0 ? (primaryCorrect / n) * 100 : null,
+      primaryIdJudgedSampleSize: primaryJudged,
+      primaryIdReliabilityPct: primaryJudged > 0 ? (primaryCorrect / primaryJudged) * 100 : null,
       completeEventReliabilityPct: n > 0 ? (complete / n) * 100 : null,
       additionalSpeciesRatePct: n > 0 ? (withAdditional / n) * 100 : null,
+      genusLevelRatePct: n > 0 ? (genusLevel / n) * 100 : null,
       byOutcome,
     };
   }
