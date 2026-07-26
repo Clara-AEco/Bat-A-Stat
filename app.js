@@ -675,6 +675,14 @@ function StatisticsTab({ deployment, location }) {
   const [expandedSpecies, setExpandedSpecies] = useState(() => new Set());
   const [speciesView, setSpeciesView] = useState('raw'); // 'raw' | 'qa-adjusted'
   const confusionBySpecies = useMemo(() => new Map((confusionBreakdown || []).map((c) => [c.species, c])), [confusionBreakdown]);
+  const [hourlyFilterType, setHourlyFilterType] = useState('all'); // 'all' | 'species' | 'group'
+  const [hourlyFilterValue, setHourlyFilterValue] = useState(null);
+  const speciesNames = useMemo(() => (species.composition || []).map((s) => s.species).sort(), [species]);
+  const groupNames = useMemo(() => Array.from(new Set(speciesNames.map((s) => SpeciesData.genusOf(s)).filter(Boolean))).sort(), [speciesNames]);
+  const hourly = useMemo(
+    () => Stats.computeHourlyActivity(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }),
+    [stats.dataset, location, hourlyFilterType, hourlyFilterValue]
+  );
 
   function toggleExpanded(sp) {
     setExpandedSpecies((prev) => {
@@ -833,6 +841,55 @@ function StatisticsTab({ deployment, location }) {
         )
       )
     ),
+
+    h('div', { className: 'section-title' }, 'Hourly activity pattern (within this deployment)'),
+    h('div', { className: 'card-sub', style: { marginBottom: 8 } },
+      hourly.sunsetRelative
+        ? "Bins are hours relative to sunset (negative = before sunset), one row per survey night, so nights can be compared directly - does the peak stay at the same time each night, or does it shift? Uses this Location's coordinates."
+        : "Bins are raw clock hours, one row per survey night - set this Location's Latitude/Longitude (on its Details tab) to switch to sunset-relative bins."),
+    h('div', { style: { display: 'flex', gap: 8, alignItems: 'center', marginBottom: 10, flexWrap: 'wrap' } },
+      h('select', {
+        value: hourlyFilterType,
+        onChange: (e) => { setHourlyFilterType(e.target.value); setHourlyFilterValue(null); },
+      },
+        h('option', { value: 'all' }, 'All bats'),
+        h('option', { value: 'species' }, 'Single species'),
+        h('option', { value: 'group' }, 'Genus (group of species)')
+      ),
+      hourlyFilterType === 'species' && h('select', { value: hourlyFilterValue || '', onChange: (e) => setHourlyFilterValue(e.target.value || null) },
+        h('option', { value: '' }, '- choose a species -'),
+        speciesNames.map((s) => h('option', { key: s, value: s }, s))
+      ),
+      hourlyFilterType === 'group' && h('select', { value: hourlyFilterValue || '', onChange: (e) => setHourlyFilterValue(e.target.value || null) },
+        h('option', { value: '' }, '- choose a genus -'),
+        groupNames.map((g) => h('option', { key: g, value: g }, g))
+      )
+    ),
+    hourly.rows.length === 0
+      ? h('div', { className: 'card-sub' }, 'No detections match this filter yet.')
+      : h('div', { className: 'card', style: { padding: 0, overflow: 'hidden' } },
+          h('div', { style: { overflowX: 'auto' } },
+            h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
+              h('thead', null, h('tr', null,
+                [h('th', { key: 'night', style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' } }, 'Night')]
+                  .concat(hourly.bins.map((b) => h('th', {
+                    key: b, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, fontFamily: 'var(--font-mono)' },
+                  }, hourly.sunsetRelative ? `${b >= 0 ? '+' : ''}${b}h` : `${String(((b % 24) + 24) % 24).padStart(2, '0')}:00`)))
+              )),
+              h('tbody', null,
+                hourly.rows.map((r) => h('tr', { key: r.surveyDate },
+                  [h('td', { key: 'night', style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, r.surveyDate)]
+                    .concat(r.counts.map((c, i) => h('td', { key: i, style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)', color: c === 0 ? 'var(--text-faint)' : 'inherit' } }, c)))
+                )).concat([
+                  h('tr', { key: '__mean', style: { fontWeight: 600, background: 'rgba(255,255,255,0.03)' } },
+                    [h('td', { key: 'night', style: { padding: '5px 10px' } }, 'Mean')]
+                      .concat(hourly.binMeans.map((m, i) => h('td', { key: i, style: { padding: '5px 10px', fontFamily: 'var(--font-mono)' } }, fmtNum(m, 1))))
+                  ),
+                ])
+              )
+            )
+          )
+        ),
 
     h('div', { className: 'section-title', style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
       h('span', null, 'Species'),
