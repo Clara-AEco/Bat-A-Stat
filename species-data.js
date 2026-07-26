@@ -109,5 +109,20 @@ window.BatID = window.BatID || {};
     return results;
   }
 
-  ns.SpeciesData = { SPECIES, SHAPE_LABELS, inRange, scoreSpecies };
+  // Genus for a display species name (e.g. "Whiskered Bat" -> "Myotis", "Myotis sp" -> "Myotis"),
+  // from the scientific name's first word - used to group reliability by genus (the fallback level
+  // between a single species and the whole deployment when a species has too few reviewed calls
+  // to report its own reliability estimate). Handles the "<Genus> sp"/"<Genus> sp." shorthand
+  // directly since the genus word is already right there in the label.
+  function genusOf(name) {
+    if (!name) return null;
+    const trimmed = name.trim();
+    const spMatch = /^([A-Za-z]+)\s+sp\.?$/i.exec(trimmed);
+    if (spMatch) return spMatch[1];
+    const normalized = trimmed.replace(/\s*\([^)]*\)\s*$/, '').trim().toLowerCase();
+    const match = SPECIES.find((sp) => sp.name.replace(/\s*\([^)]*\)\s*$/, '').trim().toLowerCase() === normalized);
+    return match ? match.sci.split(' ')[0] : null;
+  }
+
+  ns.SpeciesData = { SPECIES, SHAPE_LABELS, inRange, scoreSpecies, genusOf };
 })(window.BatID);

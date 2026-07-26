@@ -669,7 +669,7 @@ function fmtDateTime(d) {
 
 function StatisticsTab({ deployment, location }) {
   const stats = useMemo(() => Stats.computeAllStats(deployment, location, ALL_SPECIES_NAMES), [deployment, location]);
-  const { effort, activity, species, timing, reliability, totalDetectionEvents, totalSpeciesRecords } = stats;
+  const { effort, activity, species, timing, reliability, reliabilityByProbabilityBand, reliabilityBySpecies, totalDetectionEvents, totalSpeciesRecords } = stats;
 
   if (totalDetectionEvents === 0) {
     return h('div', { className: 'content' },
@@ -686,14 +686,14 @@ function StatisticsTab({ deployment, location }) {
 
     h('div', { className: 'section-title' }, 'QA reliability (observed, this deployment)'),
     h('div', { className: 'card-sub', style: { marginBottom: 8 } },
-      "Based on manually reviewed calls that had a BTO primary result to check against. Describes what was observed under this deployment's own recording conditions, not a general BTO accuracy figure - and does not yet include confidence intervals or a small-sample fallback (that's follow-on work)."),
+      "Based on manually reviewed calls that had a BTO primary result to check against. Describes what was observed under this deployment's own recording conditions, not a general BTO accuracy figure. Every percentage below carries its 95% confidence interval - treat the interval, not just the headline number, as the honest answer when the sample is small."),
     reliability.reviewedSampleSize === 0
       ? h('div', { className: 'card-sub' }, 'No reviewed calls with a BTO primary result yet - reliability will appear here once some QA has been done.')
       : h(React.Fragment, null,
           h('div', { className: 'stat-grid' },
-            h(StatBox, { label: 'Primary-ID reliability', value: fmtNum(reliability.primaryIdReliabilityPct) + '%' }),
-            h(StatBox, { label: 'Complete-event reliability', value: fmtNum(reliability.completeEventReliabilityPct) + '%' }),
-            h(StatBox, { label: 'Additional-species rate', value: fmtNum(reliability.additionalSpeciesRatePct) + '%' }),
+            h(StatBox, { label: 'Primary-ID reliability', value: fmtNum(reliability.primaryIdReliabilityPct) + '%', sub: fmtCi(reliability.primaryIdReliabilityCiLowerPct, reliability.primaryIdReliabilityCiUpperPct) }),
+            h(StatBox, { label: 'Complete-event reliability', value: fmtNum(reliability.completeEventReliabilityPct) + '%', sub: fmtCi(reliability.completeEventReliabilityCiLowerPct, reliability.completeEventReliabilityCiUpperPct) }),
+            h(StatBox, { label: 'Additional-species rate', value: fmtNum(reliability.additionalSpeciesRatePct) + '%', sub: fmtCi(reliability.additionalSpeciesRateCiLowerPct, reliability.additionalSpeciesRateCiUpperPct) }),
             h(StatBox, { label: 'Genus-level downgrade rate', value: fmtNum(reliability.genusLevelRatePct) + '%' }),
             h(StatBox, { label: 'Primary-ID judged sample (n)', value: reliability.primaryIdJudgedSampleSize }),
             h(StatBox, { label: 'Reviewed sample (n)', value: reliability.reviewedSampleSize })
@@ -702,7 +702,49 @@ function StatisticsTab({ deployment, location }) {
             'Primary-ID reliability excludes calls downgraded to genus level (e.g. "Myotis sp") from its sample - a sonogram too degraded to confirm or refute species-level accuracy isn\'t evidence either way, so those are tracked separately as the genus-level downgrade rate instead of counting against BTO.'),
           h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '6px 16px', marginTop: 10, fontSize: 12, fontFamily: 'var(--font-mono)' } },
             Object.entries(reliability.byOutcome).map(([outcome, count]) => h('span', { key: outcome }, `${QA_OUTCOME_LABELS[outcome] || outcome}: ${count}`))
-          )
+          ),
+
+          h('div', { className: 'card-sub', style: { marginTop: 20, marginBottom: 6, fontWeight: 600 } }, 'By BTO confidence band'),
+          h('div', { className: 'card', style: { padding: 0, overflow: 'hidden' } },
+            h('div', { style: { overflowX: 'auto' } },
+              h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
+                h('thead', null, h('tr', null,
+                  ['BTO probability', 'Primary-ID reliability', '95% CI', 'Judged (n)', 'Genus-level rate'].map((c) => h('th', {
+                    key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
+                  }, c))
+                )),
+                h('tbody', null, (reliabilityByProbabilityBand || []).filter((b) => b.reviewedSampleSize > 0).map((b) => h('tr', { key: b.label },
+                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, b.label),
+                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(b.primaryIdReliabilityPct) + '%'),
+                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtCi(b.primaryIdReliabilityCiLowerPct, b.primaryIdReliabilityCiUpperPct) || '-'),
+                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, b.insufficientSample ? `${b.primaryIdJudgedSampleSize} (small sample)` : b.primaryIdJudgedSampleSize),
+                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(b.genusLevelRatePct) + '%')
+                )))
+              )
+            )
+          ),
+
+          h('div', { className: 'card-sub', style: { marginTop: 20, marginBottom: 6, fontWeight: 600 } }, 'By species (BTO primary), with small-sample fallback'),
+          h('div', { className: 'card', style: { padding: 0, overflow: 'hidden' } },
+            h('div', { style: { overflowX: 'auto' } },
+              h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
+                h('thead', null, h('tr', null,
+                  ['Species', 'Reliability shown', '95% CI', 'Level', 'Reviewed (n)'].map((c) => h('th', {
+                    key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
+                  }, c))
+                )),
+                h('tbody', null, (reliabilityBySpecies || []).map((s) => h('tr', { key: s.species, title: s.fallbackNote || '' },
+                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, s.species),
+                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(s.primaryIdReliabilityPct) + '%'),
+                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtCi(s.primaryIdReliabilityCiLowerPct, s.primaryIdReliabilityCiUpperPct) || '-'),
+                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, s.fallbackLevel === 'species' ? 'Species' : s.fallbackLevel === 'genus' ? 'Genus (fallback)' : 'Deployment (fallback)'),
+                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.reviewedSampleSize)
+                )))
+              )
+            )
+          ),
+          h('div', { className: 'card-sub', style: { marginTop: 4 } },
+            'Species with fewer than 10 judged calls of their own borrow a coarser estimate (genus, then whole deployment) rather than showing an unstable species-specific number - hover a row for the reason.')
         ),
 
     h('div', { className: 'section-title' }, 'Survey effort'),
@@ -960,8 +1002,20 @@ function RecordingConditionsSection({ deployment, onPatch }) {
 
 // ---------------- QA (review-queue rules, drives Manual Review) ----------------
 
-function StatBox({ label, value }) {
-  return h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, label), h('div', { className: 'stat-box-value' }, String(value)));
+function StatBox({ label, value, sub }) {
+  return h('div', { className: 'stat-box' },
+    h('div', { className: 'stat-box-label' }, label),
+    h('div', { className: 'stat-box-value' }, String(value)),
+    sub ? h('div', { style: { fontSize: 11, color: 'var(--text-muted)', marginTop: 2 } }, sub) : null
+  );
+}
+
+// "68.3%" reads as far more precise than a small sample actually supports - pairing every
+// reliability percentage with its 95% Wilson interval keeps that visible at a glance rather than
+// needing a separate table. Renders nothing when there's no sample to compute an interval from.
+function fmtCi(lowerPct, upperPct) {
+  if (lowerPct == null || upperPct == null) return null;
+  return `95% CI ${fmtNum(lowerPct)}-${fmtNum(upperPct)}%`;
 }
 
 function QaTab({ deployment, onPatch, wavFileMap, setWavFileMap, onGoToReview }) {
