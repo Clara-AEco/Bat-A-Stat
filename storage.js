@@ -175,11 +175,23 @@ window.BatID = window.BatID || {};
     });
   }
 
-  async function writeProjectJsonToFolder(handle, project) {
-    const fileHandle = await handle.getFileHandle('project.json', { create: true });
-    const writable = await fileHandle.createWritable();
-    await writable.write(JSON.stringify(project, null, 2));
-    await writable.close();
+  async function writeProjectJsonToFolder(handle, project, attempt) {
+    attempt = attempt || 0;
+    try {
+      const fileHandle = await handle.getFileHandle('project.json', { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(JSON.stringify(project, null, 2));
+      await writable.close();
+    } catch (e) {
+      // Cloud-synced folders (OneDrive/Google Drive/Dropbox) can transiently lock the file mid-
+      // sync, surfacing as e.g. "state cached in an interface object... changed since it was read
+      // from disk" - one short retry clears most of these before giving up and surfacing an error.
+      if (attempt < 1) {
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        return writeProjectJsonToFolder(handle, project, attempt + 1);
+      }
+      throw e;
+    }
   }
 
   async function readProjectJsonFromFolder(handle) {

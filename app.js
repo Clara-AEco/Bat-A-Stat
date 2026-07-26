@@ -145,6 +145,17 @@ function NewProjectModal({ onClose, onCreate }) {
 
 // ---------------- Workspace (a single open project) ----------------
 
+// Cloud-synced folders (OneDrive/Google Drive/Dropbox) transiently lock a file mid-sync, which
+// surfaces from the File System Access API as a raw, alarming DOMException message. Translated
+// to something that makes clear the browser copy (IndexedDB) is still safe regardless.
+function friendlyFolderError(e) {
+  const msg = e && e.message ? e.message : String(e);
+  if (/state.*changed since it was read from disk|cached in an interface object/i.test(msg)) {
+    return "Couldn't save to the linked folder just now - it may be mid-sync (e.g. OneDrive). Your data is safe in the browser and this will retry automatically on the next change.";
+  }
+  return `Couldn't save to the linked folder: ${msg}`;
+}
+
 function Workspace({ project, onChange, onBackToProjects, onExport }) {
   const [selection, setSelection] = useState({ locationId: null, deploymentId: null });
   const [activeTab, setActiveTab] = useState('overview');
@@ -190,7 +201,7 @@ function Workspace({ project, onChange, onBackToProjects, onExport }) {
       setFolderStatus('linked');
       setFolderError(null);
     } catch (e) {
-      if (e.name !== 'AbortError') setFolderError(e.message);
+      if (e.name !== 'AbortError') setFolderError(friendlyFolderError(e));
     }
   }
 
@@ -201,9 +212,10 @@ function Workspace({ project, onChange, onBackToProjects, onExport }) {
       if (perm === 'granted') {
         setFolderStatus('linked');
         await S.writeProjectJsonToFolder(folderHandleRef.current, project);
+        setFolderError(null);
       }
     } catch (e) {
-      setFolderError(e.message);
+      setFolderError(friendlyFolderError(e));
     }
   }
 
@@ -226,7 +238,9 @@ function Workspace({ project, onChange, onBackToProjects, onExport }) {
     if (folderStatus === 'linked' && folderHandleRef.current) {
       if (folderSaveTimer.current) clearTimeout(folderSaveTimer.current);
       folderSaveTimer.current = setTimeout(() => {
-        S.writeProjectJsonToFolder(folderHandleRef.current, next).catch((e) => setFolderError(e.message));
+        S.writeProjectJsonToFolder(folderHandleRef.current, next)
+          .then(() => setFolderError(null)) // a later successful save must clear any earlier error - it was staying on screen forever otherwise
+          .catch((e) => setFolderError(friendlyFolderError(e)));
       }, 500);
     }
   }
@@ -1167,6 +1181,18 @@ function sortEventsByPrimaryId(events) {
   });
 }
 
+// By resolved Final ID (manual review wins over BTO's primary candidate) rather than the raw BTO
+// guess - lets calls be grouped/browsed by what they've actually been identified as, e.g. to
+// review every call currently labelled "Myotis sp" together regardless of what BTO first thought.
+function sortEventsByFinalId(events) {
+  return [...events].sort((a, b) => {
+    const la = M.resolveFinalId(a).finalId, lb = M.resolveFinalId(b).finalId;
+    if (la !== lb) return la.localeCompare(lb);
+    if (a.surveyDate !== b.surveyDate) return (a.surveyDate || '').localeCompare(b.surveyDate || '');
+    return (a.time || '').localeCompare(b.time || '');
+  });
+}
+
 function freqToPixelY(f, sampleRate, height) {
   const nyquist = sampleRate / 2;
   return height * (1 - f / nyquist);
@@ -1733,21 +1759,30 @@ function MeasureField({ label, value, unit, onChange, tool, active, onToggleTool
 function ReviewTab({ deployment, onPatchEvent, onAddManualEvent, wavFileMap, setWavFileMap, customLabels, onAddCustomLabel }) {
   const allEvents = deployment.detectionEvents || [];
   const profile = deployment.qaProfile || DEFAULT_QA_PROFILE;
-  const [sortMode, setSortMode] = useState('primaryId'); // 'primaryId' | 'chronological'
-  const sorted = useMemo(
-    () => (sortMode === 'primaryId' ? sortEventsByPrimaryId(allEvents) : sortEventsChronologically(allEvents)),
-    [allEvents, sortMode]
-  );
+  const [sortMode, setSortMode] = useState('primaryId'); // 'primaryId' | 'finalId' | 'chronological'
+  const sorted = useMemo(() => {
+    if (sortMode === 'finalId') return sortEventsByFinalId(allEvents);
+    if (sortMode === 'chronological') return sortEventsChronologically(allEvents);
+    return sortEventsByPrimaryId(allEvents);
+  }, [allEvents, sortMode]);
   const [queueOnly, setQueueOnly] = useState(true);
   const [unreviewedOnly, setUnreviewedOnly] = useState(false);
+  // Lets the whole list be narrowed to just one resolved Final ID - e.g. to check every call
+  // currently labelled "Myotis sp" together, independent of QA queue/unreviewed status.
+  const [finalIdFilter, setFinalIdFilter] = useState('');
+  const finalIdOptions = useMemo(
+    () => Array.from(new Set(allEvents.map((e) => M.resolveFinalId(e).finalId))).sort(),
+    [allEvents]
+  );
 
   const queueFiltered = queueOnly ? sorted.filter((e) => QaProfiles.computeQaInclusion(e, profile).included) : sorted;
-  const list = unreviewedOnly ? queueFiltered.filter((e) => !e.manualReview.reviewed) : queueFiltered;
+  const idFiltered = finalIdFilter ? queueFiltered.filter((e) => M.resolveFinalId(e).finalId === finalIdFilter) : queueFiltered;
+  const list = unreviewedOnly ? idFiltered.filter((e) => !e.manualReview.reviewed) : idFiltered;
 
   const [currentId, setCurrentId] = useState(list[0] ? list[0].id : null);
   useEffect(() => {
     if (!list.find((e) => e.id === currentId) && list.length) setCurrentId(list[0].id);
-  }, [list.length, unreviewedOnly, queueOnly]);
+  }, [list.length, unreviewedOnly, queueOnly, finalIdFilter]);
 
   const currentIndex = list.findIndex((e) => e.id === currentId);
   // Falls back to allEvents when currentId points at something outside the filtered list (e.g.
@@ -1943,7 +1978,18 @@ function ReviewTab({ deployment, onPatchEvent, onAddManualEvent, wavFileMap, set
           style: { background: 'var(--bg-card)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 6, padding: '3px 6px', fontSize: 12 },
         },
           h('option', { value: 'primaryId' }, 'Primary ID'),
+          h('option', { value: 'finalId' }, 'Final ID'),
           h('option', { value: 'chronological' }, 'Chronological')
+        )
+      ),
+      h('label', { style: { fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6 }, title: 'Narrow the list to just one resolved Final ID - e.g. to review every call currently labelled the same species together.' },
+        'Final ID',
+        h('select', {
+          value: finalIdFilter, onChange: (e) => setFinalIdFilter(e.target.value),
+          style: { background: 'var(--bg-card)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 6, padding: '3px 6px', fontSize: 12, maxWidth: 160 },
+        },
+          h('option', { value: '' }, 'All'),
+          finalIdOptions.map((id) => h('option', { key: id, value: id }, id))
         )
       ),
       h('label', { style: { fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6 } },
