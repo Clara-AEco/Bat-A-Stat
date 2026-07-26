@@ -475,7 +475,7 @@ function DeploymentPanel({ location, deployment, activeTab, setActiveTab, onPatc
   const [wavFileMap, setWavFileMap] = useState(new Map());
   let tabContent;
   if (activeTab === 'overview') {
-    tabContent = h(DeploymentOverviewTab, { deployment, onPatch });
+    tabContent = h(DeploymentOverviewTab, { deployment, onPatch, wavFileMap });
   } else if (activeTab === 'detections') {
     tabContent = h(DetectionsTab, { deployment, onImportBto });
   } else if (activeTab === 'qa') {
@@ -610,7 +610,7 @@ function ComingSoonTab({ tab }) {
   );
 }
 
-function DeploymentOverviewTab({ deployment, onPatch }) {
+function DeploymentOverviewTab({ deployment, onPatch, wavFileMap }) {
   const effort = deployment.surveyEffort || {};
   function patchEffort(patch) {
     onPatch({ surveyEffort: { ...effort, ...patch } });
@@ -623,9 +623,36 @@ function DeploymentOverviewTab({ deployment, onPatch }) {
   );
   const suggestedNights = distinctSurveyDates.size;
 
+  // Suggests Start/End date from whichever data is already available - WAV filename timestamps
+  // if a folder's been loaded (most exact), otherwise the date range BTO already reported across
+  // the imported detection events. Recomputes live as CSVs are imported or a WAV folder is loaded.
+  const suggestedRange = useMemo(() => {
+    if (wavFileMap && wavFileMap.size > 0) {
+      let min = null, max = null;
+      for (const name of wavFileMap.keys()) {
+        const dt = Wav.parseTimestampFromFilename(name);
+        if (!dt) continue;
+        if (!min || dt < min) min = dt;
+        if (!max || dt > max) max = dt;
+      }
+      if (min && max) return { start: toDateInputValue(min), end: toDateInputValue(max), source: 'WAV filenames' };
+    }
+    const dates = events.map((e) => parseActualDateOnly(e.actualDate)).filter(Boolean);
+    if (dates.length) {
+      const min = new Date(Math.min(...dates)), max = new Date(Math.max(...dates));
+      return { start: toDateInputValue(min), end: toDateInputValue(max), source: 'BTO data' };
+    }
+    return null;
+  }, [wavFileMap, events]);
+  const rangeMatches = suggestedRange && suggestedRange.start === deployment.startDate && suggestedRange.end === deployment.endDate;
+
   return h('div', { className: 'content' },
     h('div', { className: 'section-title' }, 'Details'),
     h(Field, { label: 'Name' }, h('input', { value: deployment.name, onChange: (e) => onPatch({ name: e.target.value }) })),
+    suggestedRange && !rangeMatches && h('div', { className: 'card', style: { marginBottom: 12, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 } },
+      h('div', { className: 'card-sub' }, `${suggestedRange.source} suggest${suggestedRange.source === 'BTO data' ? 's' : ''} ${suggestedRange.start} → ${suggestedRange.end}. This is a suggestion only - always editable below.`),
+      h('button', { className: 'btn btn-secondary btn-small', style: { flexShrink: 0 }, onClick: () => onPatch({ startDate: suggestedRange.start, endDate: suggestedRange.end }) }, 'Use suggested dates')
+    ),
     h('div', { className: 'field-row' },
       h(Field, { label: 'Start date' }, h('input', { type: 'date', value: deployment.startDate, onChange: (e) => onPatch({ startDate: e.target.value }) })),
       h(Field, { label: 'End date' }, h('input', { type: 'date', value: deployment.endDate, onChange: (e) => onPatch({ endDate: e.target.value }) }))
@@ -652,7 +679,7 @@ function DeploymentOverviewTab({ deployment, onPatch }) {
       h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Total'), h('div', { className: 'stat-box-value' }, String((deployment.detectionEvents || []).length))),
       h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'BTO imports'), h('div', { className: 'stat-box-value' }, String((deployment.btoImports || []).length)))
     ),
-    h('div', { className: 'card-sub', style: { marginTop: 10 } }, 'BTO import lands in Phase 2 — this deployment is ready to receive it.')
+    (deployment.detectionEvents || []).length === 0 && h('div', { className: 'card-sub', style: { marginTop: 10 } }, 'Import a BTO CSV on the Detections tab to get started.')
   );
 }
 
@@ -912,6 +939,20 @@ function estimateOffsetSec(ev) {
   return (eventTime.getTime() - fileStart.getTime()) / 1000;
 }
 
+// BTO's "actual date" column, DD/MM/YYYY, date only (no time - unlike parseEventTimestamp above).
+function parseActualDateOnly(actualDate) {
+  if (!actualDate) return null;
+  const [d, m, y] = actualDate.split('/').map(Number);
+  if (!y || !m || !d) return null;
+  const dt = new Date(y, m - 1, d);
+  return isNaN(dt.getTime()) ? null : dt;
+}
+
+function toDateInputValue(date) {
+  const y = date.getFullYear(), m = String(date.getMonth() + 1).padStart(2, '0'), d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
 function primaryIdLabel(ev) {
   return ev.primaryBtoId ? (ev.primaryBtoId.englishName || ev.primaryBtoId.species) : 'No ID';
 }
@@ -945,6 +986,47 @@ function BoxOverlay({ box, view, sampleRate, width, specHeight }) {
   });
 }
 
+// Draws the measured max/min frequency and per-pulse duration/IPI directly on the sonogram, so
+// the numbers in the stat cards below can be checked at a glance against the call itself.
+function MeasurementOverlay({ measurement, box, view, sampleRate, width, specHeight }) {
+  const x0 = timeToPixel(box.t0, view, width);
+  const x1 = timeToPixel(box.t1, view, width);
+  const parts = [];
+
+  if (measurement.maxFreqHz != null) {
+    const y = freqToPixelY(measurement.maxFreqHz, sampleRate, specHeight);
+    if (y >= 0 && y <= specHeight) {
+      parts.push(h('div', {
+        key: 'max', style: { position: 'absolute', left: x0, top: y, width: Math.max(1, x1 - x0), borderTop: '1px dashed #ffb454', pointerEvents: 'none' },
+      }, h('span', { style: { position: 'absolute', left: 2, top: -13, fontSize: 9, color: '#ffb454', fontFamily: 'var(--font-mono)', background: 'rgba(10,12,14,0.75)', padding: '0 3px', borderRadius: 3, whiteSpace: 'nowrap' } }, `max ${(measurement.maxFreqHz / 1000).toFixed(1)}k`)));
+    }
+  }
+  if (measurement.minFreqHz != null) {
+    const y = freqToPixelY(measurement.minFreqHz, sampleRate, specHeight);
+    if (y >= 0 && y <= specHeight) {
+      parts.push(h('div', {
+        key: 'min', style: { position: 'absolute', left: x0, top: y, width: Math.max(1, x1 - x0), borderTop: '1px dashed #7ec8e3', pointerEvents: 'none' },
+      }, h('span', { style: { position: 'absolute', left: 2, top: 3, fontSize: 9, color: '#7ec8e3', fontFamily: 'var(--font-mono)', background: 'rgba(10,12,14,0.75)', padding: '0 3px', borderRadius: 3, whiteSpace: 'nowrap' } }, `min ${(measurement.minFreqHz / 1000).toFixed(1)}k`)));
+    }
+  }
+  (measurement.pulses || []).forEach((p, i) => {
+    const px0 = timeToPixel(p.startSec, view, width);
+    const px1 = timeToPixel(p.endSec, view, width);
+    parts.push(h('div', {
+      key: `pulse-${i}`, style: { position: 'absolute', left: px0, top: specHeight - 2, width: Math.max(1, px1 - px0), borderTop: '2px solid var(--teal)', pointerEvents: 'none' },
+    }, h('span', { style: { position: 'absolute', left: 0, top: 3, fontSize: 9, color: 'var(--teal)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap' } }, `${p.durationMs.toFixed(1)}ms`)));
+    if (i > 0 && measurement.ipiMs && measurement.ipiMs[i - 1] != null) {
+      const prevEndX = timeToPixel(measurement.pulses[i - 1].endSec, view, width);
+      const midX = (prevEndX + px0) / 2;
+      parts.push(h('div', {
+        key: `ipi-${i}`, style: { position: 'absolute', left: midX, top: specHeight - 16, transform: 'translateX(-50%)', fontSize: 9, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap', pointerEvents: 'none' },
+      }, `IPI ${measurement.ipiMs[i - 1].toFixed(0)}ms`));
+    }
+  });
+
+  return h(React.Fragment, null, ...parts);
+}
+
 const SONOGRAM_WIDTH = 860, SPEC_HEIGHT = 260, OSC_HEIGHT = 70;
 const AXIS_LEFT_WIDTH = 46, AXIS_BOTTOM_HEIGHT = 20;
 const MIN_ZOOM_WINDOW_SEC = 0.003;
@@ -964,7 +1046,7 @@ function timeToPixel(t, view, width) {
   return range > 0 ? ((t - view.t0) / range) * width : 0;
 }
 
-function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box, onBoxChange, guidelines, partMarkers }) {
+function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box, onBoxChange, guidelines, partMarkers, measurement }) {
   const specCanvasRef = useRef(null);
   const oscCanvasRef = useRef(null);
   const dragRef = useRef(null);
@@ -1138,6 +1220,7 @@ function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box
           },
         }),
         box && spec && h(BoxOverlay, { box, view, sampleRate, width: SONOGRAM_WIDTH, specHeight: SPEC_HEIGHT }),
+        box && spec && measurement && h(MeasurementOverlay, { measurement, box, view, sampleRate, width: SONOGRAM_WIDTH, specHeight: SPEC_HEIGHT }),
         hover && h(React.Fragment, null,
           h('div', { style: { position: 'absolute', left: hover.x, top: 0, height: SPEC_HEIGHT, borderLeft: '1px dashed rgba(255,255,255,0.35)', pointerEvents: 'none' } }),
           hover.y <= SPEC_HEIGHT && h('div', { style: { position: 'absolute', left: 0, top: hover.y, width: SONOGRAM_WIDTH, borderTop: '1px dashed rgba(255,255,255,0.35)', pointerEvents: 'none' } }),
@@ -1414,20 +1497,26 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, custom
   useEffect(() => { setBox(null); setShapeOverride(null); }, [currentEvent && currentEvent.id]);
 
   const measurement = useMemo(
-    () => (box && spec && decodedWav ? Dsp.measureBox(spec, decodedWav.samples, decodedWav.sampleRate, box) : null),
-    [box, spec, decodedWav]
+    // floorDb (the "Brightness" slider) drives what counts as part of the call for max/min/
+    // start/end frequency too, so raising Brightness to reveal a faint high-frequency onset also
+    // raises what gets measured - no separate hidden threshold to fight against.
+    () => (box && spec && decodedWav ? Dsp.measureBox(spec, decodedWav.samples, decodedWav.sampleRate, box, floorDb) : null),
+    [box, spec, decodedWav, floorDb]
   );
   const shapeAuto = useMemo(() => (measurement ? Dsp.classifyShape(measurement.ridge) : null), [measurement]);
   const finalShape = shapeOverride || (shapeAuto && shapeAuto.shape) || null;
 
   const speciesResults = useMemo(() => {
     if (!measurement) return [];
+    const meanIpiMs = measurement.ipiMs && measurement.ipiMs.length
+      ? measurement.ipiMs.reduce((s, v) => s + v, 0) / measurement.ipiMs.length
+      : null;
     return SpeciesData.scoreSpecies({
       peak: measurement.peakFreqHz != null ? measurement.peakFreqHz / 1000 : null,
       start: measurement.startFreqHz != null ? measurement.startFreqHz / 1000 : null,
       end: measurement.endFreqHz != null ? measurement.endFreqHz / 1000 : null,
       duration: measurement.durationMs,
-      ipi: null,
+      ipi: meanIpiMs,
     }, finalShape);
   }, [measurement, finalShape]);
 
@@ -1519,7 +1608,10 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, custom
             h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, 'FFT size',
               h('select', { value: fftSize, onChange: (e) => setFftSize(Number(e.target.value)), style: { background: 'var(--bg-card)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 6, padding: '3px 6px' } },
                 Dsp.FFT_SIZES.map((s) => h('option', { key: s, value: s }, s)))),
-            h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 140 } }, 'Brightness',
+            h('label', {
+              style: { display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 140 },
+              title: 'Also sets what counts as part of the call for Max/Min/Start/End frequency - raise this until the quietest parts of the call are visible before measuring.',
+            }, 'Brightness',
               h('input', { type: 'range', min: -100, max: -20, value: floorDb, onChange: (e) => setFloorDb(Number(e.target.value)), style: { flex: 1 } })),
             h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 140 } }, 'Contrast',
               h('input', { type: 'range', min: 10, max: 100, value: rangeDb, onChange: (e) => setRangeDb(Number(e.target.value)), style: { flex: 1 } })),
@@ -1546,7 +1638,7 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, custom
               },
             })
           ),
-          h(Sonogram, { spec, samples: decodedWav.samples, sampleRate: decodedWav.sampleRate, floorDb, rangeDb, saturation, box, onBoxChange: setBox, guidelines, partMarkers }),
+          h(Sonogram, { spec, samples: decodedWav.samples, sampleRate: decodedWav.sampleRate, floorDb, rangeDb, saturation, box, onBoxChange: setBox, guidelines, partMarkers, measurement }),
           h('div', { className: 'card-sub', style: { marginTop: 6 } }, 'Drag to box a call and measure it - scroll to zoom the time axis.'),
           spec.truncated && h('div', { className: 'card-sub', style: { marginTop: 4, color: 'var(--accent)' } },
             `This recording is longer than ${Dsp.MAX_ANALYSIS_DURATION_SEC || 30}s - showing the first ${Math.round(spec.durationSec)}s only.`),
@@ -1561,6 +1653,16 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, custom
             h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Start freq'), h('div', { className: 'stat-box-value' }, measurement.startFreqHz != null ? (measurement.startFreqHz / 1000).toFixed(1) + ' kHz' : '-')),
             h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'End freq'), h('div', { className: 'stat-box-value' }, measurement.endFreqHz != null ? (measurement.endFreqHz / 1000).toFixed(1) + ' kHz' : '-')),
             h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Duration'), h('div', { className: 'stat-box-value' }, measurement.durationMs.toFixed(1) + ' ms' + (measurement.durationRefined ? '' : ' (raw)')))
+          ),
+          measurement.pulses && measurement.pulses.length > 1 && h('div', { style: { marginTop: 10, fontSize: 12 } },
+            h('div', { style: { color: 'var(--text-faint)', marginBottom: 4 } },
+              `${measurement.pulses.length} pulses found in this selection - Duration above is the first pulse only:`),
+            h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px 14px', fontFamily: 'var(--font-mono)' } },
+              measurement.pulses.map((p, i) => h(React.Fragment, { key: i },
+                h('span', null, `#${i + 1}: ${p.durationMs.toFixed(1)}ms`),
+                i < measurement.ipiMs.length && h('span', { style: { color: 'var(--text-faint)' } }, `→ IPI ${measurement.ipiMs[i].toFixed(0)}ms →`)
+              ))
+            )
           ),
           h('div', { style: { marginTop: 10, display: 'flex', alignItems: 'center', gap: 10 } },
             h('span', { style: { fontSize: 12, color: 'var(--text-muted)' } }, 'Shape:'),

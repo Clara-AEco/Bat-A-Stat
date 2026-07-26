@@ -203,10 +203,17 @@ window.BatID = window.BatID || {};
 
   // ---------------- Measurement ----------------
 
-  const DEFAULT_THRESHOLD_DB = 20; // how far below the box's own peak still counts as "signal"
+  // Matches the sonogram's own visual "Brightness" floor by default, so max/min/start/end
+  // frequency reflect exactly what's visible on screen rather than a second, hidden threshold.
+  // Previously this was 20dB down from the *box's own peak*, which silently cut off the faint,
+  // low-power leading edge of fast FM sweeps (e.g. Serotine) well before it stopped being visible
+  // to the analyst - reading Max Freq far lower than what the sonogram clearly showed. Per the
+  // training material's own guidance ("ensure the threshold/brightness is high enough so that the
+  // quietest components of the call are visible"), the fix is to use one shared, adjustable floor.
+  const DEFAULT_FLOOR_DB = -70;
 
-  function measureBox(spec, samples, sampleRate, box, thresholdDb) {
-    thresholdDb = thresholdDb == null ? DEFAULT_THRESHOLD_DB : thresholdDb;
+  function measureBox(spec, samples, sampleRate, box, floorDb) {
+    const activeFloor = floorDb == null ? DEFAULT_FLOOR_DB : floorDb;
     const nyquist = sampleRate / 2;
     const f0 = box.f0 == null ? 0 : box.f0;
     const f1 = box.f1 == null ? nyquist : box.f1;
@@ -222,7 +229,6 @@ window.BatID = window.BatID || {};
         if (db > peakDb) peakDb = db;
       }
     }
-    const activeFloor = peakDb - thresholdDb;
 
     let maxBin = -1, minBin = Infinity;
     const ridge = [];
@@ -260,17 +266,84 @@ window.BatID = window.BatID || {};
     const endFreqHz = ridge.length ? avgFreqOf(ridge.slice(Math.max(0, ridge.length - 3))) : null;
 
     const rawDurationMs = (box.t1 - box.t0) * 1000;
-    const refined = refineDurationFromOscillogram(samples, sampleRate, box.t0, box.t1);
+
+    // Segment the box into individual pulses rather than treating its whole time span as one
+    // "duration" - a box drawn across two or more pulses previously measured the entire span
+    // (first pulse's start to last pulse's end), silently including the gap between them, not
+    // an average and not any single pulse's real duration. The headline Duration now reflects
+    // just the first pulse (the call the box was drawn around); every pulse found, and the
+    // interpulse interval(s) between them, are reported separately so nothing is hidden.
+    const pulses = detectPulses(samples, sampleRate, box.t0, box.t1);
+    const ipiMs = pulses.length >= 2
+      ? pulses.slice(1).map((p, i) => (p.startSec - pulses[i].startSec) * 1000)
+      : [];
+
+    let durationMs, durationRefined;
+    if (pulses.length > 0) {
+      durationMs = pulses[0].durationMs;
+      durationRefined = true;
+    } else {
+      // No clean envelope pulse found (e.g. very noisy recording) - fall back to the previous
+      // edge-crossing approach as a best-effort estimate.
+      const refined = refineDurationFromOscillogram(samples, sampleRate, box.t0, box.t1);
+      durationMs = refined != null ? refined : rawDurationMs;
+      durationRefined = refined != null;
+    }
 
     return {
       maxFreqHz, minFreqHz, peakFreqHz, startFreqHz, endFreqHz,
-      durationMs: refined != null ? refined : rawDurationMs,
+      durationMs,
       rawDurationMs,
-      durationRefined: refined != null,
+      durationRefined,
+      pulses,
+      ipiMs,
       ridge,
       peakDb,
-      thresholdDb,
+      floorDb: activeFloor,
     };
+  }
+
+  // Finds every distinct amplitude-envelope pulse within [t0, t1] (own peak within the window,
+  // not the box's spectral peak) - lets a box spanning several pulses report each one plus the
+  // interpulse interval(s) between them, instead of one blended/misleading duration reading.
+  // Brief dips shorter than minGapSec are treated as still inside the same pulse (its envelope
+  // rarely reads as a clean flat top), so pulses aren't spuriously split by noise.
+  function detectPulses(samples, sampleRate, t0, t1, thresholdRatio, minGapSec) {
+    thresholdRatio = thresholdRatio == null ? 0.1 : thresholdRatio;
+    minGapSec = minGapSec == null ? 0.0005 : minGapSec;
+    const i0 = Math.max(0, Math.floor(t0 * sampleRate));
+    const i1 = Math.min(samples.length, Math.ceil(t1 * sampleRate));
+    if (i1 - i0 < 8) return [];
+
+    let peak = 0;
+    for (let i = i0; i < i1; i++) { const a = Math.abs(samples[i]); if (a > peak) peak = a; }
+    if (peak <= 0) return [];
+    const thresh = peak * thresholdRatio;
+
+    const runs = [];
+    let start = null;
+    for (let i = i0; i < i1; i++) {
+      const above = Math.abs(samples[i]) >= thresh;
+      if (above && start == null) start = i;
+      else if (!above && start != null) { runs.push([start, i]); start = null; }
+    }
+    if (start != null) runs.push([start, i1]);
+
+    const minGapSamples = Math.max(1, Math.floor(minGapSec * sampleRate));
+    const merged = [];
+    for (const [s, e] of runs) {
+      if (merged.length && s - merged[merged.length - 1][1] < minGapSamples) {
+        merged[merged.length - 1][1] = e;
+      } else {
+        merged.push([s, e]);
+      }
+    }
+
+    return merged.map(([s, e]) => ({
+      startSec: s / sampleRate,
+      endSec: e / sampleRate,
+      durationMs: ((e - s) / sampleRate) * 1000,
+    }));
   }
 
   // Finds amplitude-envelope crossings near t0/t1 to refine call duration, per the training
@@ -396,7 +469,7 @@ window.BatID = window.BatID || {};
 
   ns.Dsp = {
     FFT_SIZES,
-    DEFAULT_THRESHOLD_DB,
+    DEFAULT_FLOOR_DB,
     MAX_ANALYSIS_DURATION_SEC,
     computeSpectrogram,
     frameIndexForTime,
@@ -404,6 +477,7 @@ window.BatID = window.BatID || {};
     renderSpectrogramImageData,
     computeOscillogramColumns,
     measureBox,
+    detectPulses,
     refineDurationFromOscillogram,
     classifyShape,
     heterodyneMix,
