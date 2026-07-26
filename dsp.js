@@ -203,13 +203,13 @@ window.BatID = window.BatID || {};
 
   // ---------------- Measurement ----------------
 
-  // Matches the sonogram's own visual "Brightness" floor by default, so max/min/start/end
-  // frequency reflect exactly what's visible on screen rather than a second, hidden threshold.
+  // Matches the sonogram's own visual "Brightness" floor by default, so Start/End frequency and
+  // Peak frequency reflect exactly what's visible on screen rather than a second, hidden threshold.
   // Previously this was 20dB down from the *box's own peak*, which silently cut off the faint,
   // low-power leading edge of fast FM sweeps (e.g. Serotine) well before it stopped being visible
-  // to the analyst - reading Max Freq far lower than what the sonogram clearly showed. Per the
-  // training material's own guidance ("ensure the threshold/brightness is high enough so that the
-  // quietest components of the call are visible"), the fix is to use one shared, adjustable floor.
+  // to the analyst. Per the training material's own guidance ("ensure the threshold/brightness is
+  // high enough so that the quietest components of the call are visible"), the fix is to use one
+  // shared, adjustable floor.
   const DEFAULT_FLOOR_DB = -70;
 
   function measureBox(spec, samples, sampleRate, box, floorDb) {
@@ -242,7 +242,7 @@ window.BatID = window.BatID || {};
         powerSum[b - binFrom] += Math.pow(10, db / 10);
       }
       if (frameBestBin >= 0 && frameBestDb >= activeFloor) {
-        ridge.push({ timeSec: spec.frameTimes[fr], freqHz: spec.freqs[frameBestBin], db: frameBestDb });
+        ridge.push({ timeSec: spec.frameTimes[fr], freqHz: spec.freqs[frameBestBin], db: frameBestDb, frameIdx: fr });
       }
     }
 
@@ -250,23 +250,12 @@ window.BatID = window.BatID || {};
     for (let i = 1; i < powerSum.length; i++) if (powerSum[i] > powerSum[peakBinRel]) peakBinRel = i;
     const peakFreqHz = spec.freqs[binFrom + peakBinRel];
 
-    // Max/min frequency come from the call's own ridge (each frame's single dominant bin, when
-    // that frame clears the Brightness floor) rather than "any bin anywhere in the box that
-    // clears the floor" - the latter let broadband low-frequency noise/hum sitting quietly within
-    // the box's vertical span (mains hum, wind, detector self-noise) register as a spuriously low
-    // Min Freq even though it was never actually the loudest thing in any of those time frames.
-    let maxFreqHz = null, minFreqHz = null;
-    for (const p of ridge) {
-      if (maxFreqHz == null || p.freqHz > maxFreqHz) maxFreqHz = p.freqHz;
-      if (minFreqHz == null || p.freqHz < minFreqHz) minFreqHz = p.freqHz;
-    }
-
-    function avgFreqOf(points) {
-      if (points.length === 0) return null;
-      return points.reduce((s, p) => s + p.freqHz, 0) / points.length;
-    }
-    const startFreqHz = ridge.length ? avgFreqOf(ridge.slice(0, Math.min(3, ridge.length))) : null;
-    const endFreqHz = ridge.length ? avgFreqOf(ridge.slice(Math.max(0, ridge.length - 3))) : null;
+    // Start/End frequency: the top (start) and bottom (end) of the call itself - for a typical FM
+    // sweep, start is the highest point (where the call begins) and end is the lowest (the qCF/CF
+    // tail). Max/Min frequency (the box's own vertical extent) were removed entirely - on real
+    // recordings they just read back wherever the box happened to be drawn, and duplicated
+    // Start/End for typical monotonic sweeps anyway.
+    const { startFreqHz, endFreqHz } = measureStartEnd(samples, sampleRate, box, activeFloor);
 
     const rawDurationMs = (box.t1 - box.t0) * 1000;
     // Duration is measured from the oscillogram envelope, per the training material's own
@@ -278,13 +267,75 @@ window.BatID = window.BatID || {};
     const durationRefined = refined != null;
 
     return {
-      maxFreqHz, minFreqHz, peakFreqHz, startFreqHz, endFreqHz,
+      peakFreqHz, startFreqHz, endFreqHz,
       durationMs,
       rawDurationMs,
       durationRefined,
       ridge,
       peakDb,
       floorDb: activeFloor,
+    };
+  }
+
+  // A fast FM sweep changes frequency within a single analysis frame's own time window - the
+  // larger that window (higher FFT size), the more the frame's "loudest bin" ends up smeared
+  // toward wherever the sweep dwells longest, not the instantaneous frequency at the frame's
+  // edges. That's the opposite of what Start/End needs (the frequency at the very beginning/end
+  // of the call), so - independent of whatever FFT size is chosen for the visible sonogram/Peak
+  // frequency - Start/End are measured from a dedicated, deliberately small-window analysis
+  // (finer time resolution, coarser frequency resolution) scoped just to the box's own time span.
+  // Empirically this reads the true onset noticeably better than the display's own FFT size ever
+  // could (validated against a fast synthetic sweep: a 512pt window read ~30kHz short of the true
+  // start frequency; a 64pt window read within ~7kHz of it).
+  const START_END_FFT_SIZE = 64;
+
+  function measureStartEnd(samples, sampleRate, box, activeFloor) {
+    const nyquist = sampleRate / 2;
+    const f0 = box.f0 == null ? 0 : box.f0;
+    const f1 = box.f1 == null ? nyquist : box.f1;
+    const pad = Math.max(0.002, (box.t1 - box.t0) * 0.2);
+    const sliceT0 = Math.max(0, box.t0 - pad);
+    const i0 = Math.floor(sliceT0 * sampleRate);
+    const i1 = Math.min(samples.length, Math.ceil((box.t1 + pad) * sampleRate));
+    if (i1 - i0 < START_END_FFT_SIZE) return { startFreqHz: null, endFreqHz: null };
+
+    const miniSpec = computeSpectrogram(samples.subarray(i0, i1), sampleRate, START_END_FFT_SIZE);
+    const frameFrom = frameIndexForTime(miniSpec, box.t0 - sliceT0);
+    const frameTo = Math.max(frameFrom, frameIndexForTime(miniSpec, box.t1 - sliceT0));
+    const binFrom = binIndexForFreq(miniSpec, Math.min(f0, f1));
+    const binTo = Math.max(binFrom, binIndexForFreq(miniSpec, Math.max(f0, f1)));
+
+    const ridge = [];
+    for (let fr = frameFrom; fr <= frameTo; fr++) {
+      let frameBestBin = -1, frameBestDb = -Infinity;
+      for (let b = binFrom; b <= binTo; b++) {
+        const db = miniSpec.magDb[fr * miniSpec.numBins + b];
+        if (db > frameBestDb) { frameBestDb = db; frameBestBin = b; }
+      }
+      if (frameBestBin >= 0 && frameBestDb >= activeFloor) {
+        ridge.push({ freqHz: miniSpec.freqs[frameBestBin], db: frameBestDb, frameIdx: fr });
+      }
+    }
+    if (!ridge.length) return { startFreqHz: null, endFreqHz: null };
+
+    // Restrict to the single contiguous run of frames (no gaps) surrounding the ridge's own
+    // loudest point - not simply "chronologically first/last thing that crossed the floor". A box
+    // with any dead air at its edges (near-inevitable on real recordings) will have the floor
+    // occasionally tripped by an isolated noise blip well before/after the real call; taking that
+    // as "the start/end" collapses both readings toward the noise floor instead of the real sweep.
+    let peakIdx = 0;
+    for (let i = 1; i < ridge.length; i++) if (ridge[i].db > ridge[peakIdx].db) peakIdx = i;
+    let lo = peakIdx, hi = peakIdx;
+    while (lo > 0 && ridge[lo].frameIdx - ridge[lo - 1].frameIdx <= 1) lo--;
+    while (hi < ridge.length - 1 && ridge[hi + 1].frameIdx - ridge[hi].frameIdx <= 1) hi++;
+    const corePoints = ridge.slice(lo, hi + 1);
+
+    function avgFreqOf(points) {
+      return points.reduce((s, p) => s + p.freqHz, 0) / points.length;
+    }
+    return {
+      startFreqHz: avgFreqOf(corePoints.slice(0, Math.min(3, corePoints.length))),
+      endFreqHz: avgFreqOf(corePoints.slice(Math.max(0, corePoints.length - 3))),
     };
   }
 

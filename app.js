@@ -1067,27 +1067,28 @@ function BoxOverlay({ box, view, sampleRate, width, specHeight }) {
   });
 }
 
-// Draws the measured max/min frequency directly on the sonogram, so the stat-card numbers can be
-// checked at a glance against the call itself.
+// Draws the measured Start/End frequency directly on the sonogram, so the stat-card numbers can
+// be checked at a glance against the call itself. (Previously drew Max/Min frequency - removed
+// along with the measurement itself; see measureBox's comment in dsp.js for why.)
 function MeasurementOverlay({ measurement, box, view, sampleRate, width, specHeight }) {
   const x0 = timeToPixel(box.t0, view, width);
   const x1 = timeToPixel(box.t1, view, width);
   const parts = [];
 
-  if (measurement.maxFreqHz != null) {
-    const y = freqToPixelY(measurement.maxFreqHz, sampleRate, specHeight);
+  if (measurement.startFreqHz != null) {
+    const y = freqToPixelY(measurement.startFreqHz, sampleRate, specHeight);
     if (y >= 0 && y <= specHeight) {
       parts.push(h('div', {
-        key: 'max', style: { position: 'absolute', left: x0, top: y, width: Math.max(1, x1 - x0), borderTop: '1px dashed #ffb454', pointerEvents: 'none' },
-      }, h('span', { style: { position: 'absolute', left: 2, top: -13, fontSize: 9, color: '#ffb454', fontFamily: 'var(--font-mono)', background: 'rgba(10,12,14,0.75)', padding: '0 3px', borderRadius: 3, whiteSpace: 'nowrap' } }, `max ${(measurement.maxFreqHz / 1000).toFixed(1)}k`)));
+        key: 'start', style: { position: 'absolute', left: x0, top: y, width: Math.max(1, x1 - x0), borderTop: '1px dashed #ffb454', pointerEvents: 'none' },
+      }, h('span', { style: { position: 'absolute', left: 2, top: -13, fontSize: 9, color: '#ffb454', fontFamily: 'var(--font-mono)', background: 'rgba(10,12,14,0.75)', padding: '0 3px', borderRadius: 3, whiteSpace: 'nowrap' } }, `start ${(measurement.startFreqHz / 1000).toFixed(1)}k`)));
     }
   }
-  if (measurement.minFreqHz != null) {
-    const y = freqToPixelY(measurement.minFreqHz, sampleRate, specHeight);
+  if (measurement.endFreqHz != null) {
+    const y = freqToPixelY(measurement.endFreqHz, sampleRate, specHeight);
     if (y >= 0 && y <= specHeight) {
       parts.push(h('div', {
-        key: 'min', style: { position: 'absolute', left: x0, top: y, width: Math.max(1, x1 - x0), borderTop: '1px dashed #7ec8e3', pointerEvents: 'none' },
-      }, h('span', { style: { position: 'absolute', left: 2, top: 3, fontSize: 9, color: '#7ec8e3', fontFamily: 'var(--font-mono)', background: 'rgba(10,12,14,0.75)', padding: '0 3px', borderRadius: 3, whiteSpace: 'nowrap' } }, `min ${(measurement.minFreqHz / 1000).toFixed(1)}k`)));
+        key: 'end', style: { position: 'absolute', left: x0, top: y, width: Math.max(1, x1 - x0), borderTop: '1px dashed #7ec8e3', pointerEvents: 'none' },
+      }, h('span', { style: { position: 'absolute', left: 2, top: 3, fontSize: 9, color: '#7ec8e3', fontFamily: 'var(--font-mono)', background: 'rgba(10,12,14,0.75)', padding: '0 3px', borderRadius: 3, whiteSpace: 'nowrap' } }, `end ${(measurement.endFreqHz / 1000).toFixed(1)}k`)));
     }
   }
 
@@ -1752,8 +1753,6 @@ function ReviewTab({ deployment, onPatchEvent, onAddManualEvent, wavFileMap, set
         measurement && h('div', { className: 'card', style: { marginTop: 14 } },
           h('div', { className: 'stat-grid' },
             h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Peak freq'), h('div', { className: 'stat-box-value' }, measurement.peakFreqHz != null ? (measurement.peakFreqHz / 1000).toFixed(1) + ' kHz' : '-')),
-            h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Max freq'), h('div', { className: 'stat-box-value' }, measurement.maxFreqHz != null ? (measurement.maxFreqHz / 1000).toFixed(1) + ' kHz' : '-')),
-            h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Min freq'), h('div', { className: 'stat-box-value' }, measurement.minFreqHz != null ? (measurement.minFreqHz / 1000).toFixed(1) + ' kHz' : '-')),
             h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Start freq'), h('div', { className: 'stat-box-value' }, measurement.startFreqHz != null ? (measurement.startFreqHz / 1000).toFixed(1) + ' kHz' : '-')),
             h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'End freq'), h('div', { className: 'stat-box-value' }, measurement.endFreqHz != null ? (measurement.endFreqHz / 1000).toFixed(1) + ' kHz' : '-')),
             h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Duration'), h('div', { className: 'stat-box-value' }, measurement.durationMs.toFixed(1) + ' ms' + (measurement.durationRefined ? '' : ' (raw)')))
