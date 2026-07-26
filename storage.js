@@ -1,0 +1,169 @@
+// IndexedDB persistence of the whole Project tree, plus JSON export/import for backup/portability.
+window.BatID = window.BatID || {};
+
+(function (ns) {
+  const DB_NAME = 'BatAStat';
+  const OLD_DB_NAME = 'BatIDHelper'; // pre-rename database - migrated from once, then left alone
+  // v2: repairs installs where the "projects" store never got created (e.g. an interrupted
+  // first-ever open left the database stuck at v1 with no store - reopening at v1 forever after
+  // never re-runs onupgradeneeded, so the store would never exist and every transaction would
+  // fail with "object store not found". Bumping the version forces onupgradeneeded to run again.
+  const DB_VERSION = 2;
+  const STORE = 'projects';
+
+  let dbPromise = null;
+  let migratePromise = null;
+
+  function openDbNamed(name) {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(name, DB_VERSION);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(STORE)) {
+          db.createObjectStore(STORE, { keyPath: 'id' });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  function getAllFrom(db) {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readonly');
+      const req = tx.objectStore(STORE).getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  // One-time MOVE of any projects left in the pre-rename "BatIDHelper" database into the new
+  // "BatAStat" one, so renaming the app doesn't orphan work already saved under the old name.
+  // Projects are deleted from the old database once copied - otherwise every fresh page load
+  // would re-copy them back in, silently resurrecting anything the user deleted after migrating.
+  async function migrateFromOldDbOnce() {
+    if (migratePromise) return migratePromise;
+    migratePromise = (async () => {
+      try {
+        if (indexedDB.databases) {
+          const dbs = await indexedDB.databases();
+          if (!dbs.some((d) => d.name === OLD_DB_NAME)) return;
+        }
+        const oldDb = await openDbNamed(OLD_DB_NAME);
+        if (!oldDb.objectStoreNames.contains(STORE)) { oldDb.close(); return; }
+        const oldProjects = await getAllFrom(oldDb);
+        if (oldProjects.length === 0) { oldDb.close(); return; }
+
+        const newDb = await openDb();
+        const existingIds = new Set((await getAllFrom(newDb)).map((p) => p.id));
+        const toCopy = oldProjects.filter((p) => !existingIds.has(p.id));
+        if (toCopy.length > 0) {
+          await new Promise((resolve, reject) => {
+            const tx = newDb.transaction(STORE, 'readwrite');
+            toCopy.forEach((p) => tx.objectStore(STORE).put(p));
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+          });
+        }
+        // Every old project is now accounted for in the new DB (just copied, or already there
+        // from a prior migration) - clear the old store so nothing can be resurrected later.
+        await new Promise((resolve, reject) => {
+          const tx = oldDb.transaction(STORE, 'readwrite');
+          oldProjects.forEach((p) => tx.objectStore(STORE).delete(p.id));
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+        });
+        oldDb.close();
+      } catch (e) {
+        console.warn('Bat-A-Stat: migration from the old BatIDHelper database failed', e);
+      }
+    })();
+    return migratePromise;
+  }
+
+  function openDb() {
+    if (dbPromise) return dbPromise;
+    dbPromise = openDbNamed(DB_NAME);
+    return dbPromise;
+  }
+
+  async function saveProject(project) {
+    ns.Models.touch(project);
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).put(project);
+      tx.oncomplete = () => resolve(project);
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function loadProject(id) {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readonly');
+      const req = tx.objectStore(STORE).get(id);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function listProjects() {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readonly');
+      const req = tx.objectStore(STORE).getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function deleteProject(id) {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).delete(id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  function exportProjectJson(project) {
+    return JSON.stringify(project, null, 2);
+  }
+
+  function downloadProjectJson(project) {
+    const json = exportProjectJson(project);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const safeName = (project.projectName || 'project').replace(/[^A-Za-z0-9_-]+/g, '_');
+    a.href = url;
+    a.download = `BatAStat_${safeName}_${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function importProjectJson(jsonString, { asCopy = false } = {}) {
+    const project = JSON.parse(jsonString);
+    if (asCopy) {
+      project.id = ns.Models.uid();
+      project.projectName = (project.projectName || 'Project') + ' (copy)';
+    }
+    return project;
+  }
+
+  ns.Storage = {
+    openDb,
+    migrateFromOldDbOnce,
+    saveProject,
+    loadProject,
+    listProjects,
+    deleteProject,
+    exportProjectJson,
+    downloadProjectJson,
+    importProjectJson,
+  };
+})(window.BatID);
