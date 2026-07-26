@@ -302,6 +302,49 @@ window.BatID = window.BatID || {};
     return ((endIdx - startIdx) / sampleRate) * 1000;
   }
 
+  // ---------------- Audio playback helpers (heterodyne / time expansion) ----------------
+
+  function onePoleLowpass(x, sampleRate, cutoffHz) {
+    const rc = 1 / (2 * Math.PI * cutoffHz);
+    const dt = 1 / sampleRate;
+    const alpha = dt / (rc + dt);
+    const y = new Float32Array(x.length);
+    let prev = 0;
+    for (let i = 0; i < x.length; i++) { prev += alpha * (x[i] - prev); y[i] = prev; }
+    return y;
+  }
+
+  // Simulates a heterodyne bat detector: mixes the ultrasonic signal down by a tunable local
+  // oscillator frequency (like tuning a real detector), then low-pass filters out everything but
+  // the audible difference tone. Cascaded 1-pole filter for a steeper (~12dB/oct) rolloff.
+  function heterodyneMix(samples, sampleRate, tuneFreqHz, cutoffHz) {
+    cutoffHz = cutoffHz || 8000;
+    const mixed = new Float32Array(samples.length);
+    const w = (2 * Math.PI * tuneFreqHz) / sampleRate;
+    for (let i = 0; i < samples.length; i++) mixed[i] = samples[i] * Math.cos(w * i);
+    let filtered = onePoleLowpass(mixed, sampleRate, cutoffHz);
+    filtered = onePoleLowpass(filtered, sampleRate, cutoffHz);
+    let peak = 0;
+    for (let i = 0; i < filtered.length; i++) { const a = Math.abs(filtered[i]); if (a > peak) peak = a; }
+    if (peak > 0) { const g = 0.8 / peak; for (let i = 0; i < filtered.length; i++) filtered[i] *= g; }
+    return filtered;
+  }
+
+  // Linear-interpolation resample (safe here because the signal is already band-limited by the
+  // heterodyne lowpass before this is called, so there's no aliasing risk).
+  function resampleLinear(x, inRate, outRate) {
+    const outLen = Math.max(1, Math.floor((x.length * outRate) / inRate));
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const srcIdx = (i * inRate) / outRate;
+      const i0 = Math.floor(srcIdx);
+      const i1 = Math.min(x.length - 1, i0 + 1);
+      const frac = srcIdx - i0;
+      out[i] = x[i0] * (1 - frac) + x[i1] * frac;
+    }
+    return out;
+  }
+
   // ---------------- Shape classification (suggestion only, always editable) ----------------
 
   function classifyShape(ridge) {
@@ -363,5 +406,7 @@ window.BatID = window.BatID || {};
     measureBox,
     refineDurationFromOscillogram,
     classifyShape,
+    heterodyneMix,
+    resampleLinear,
   };
 })(window.BatID);

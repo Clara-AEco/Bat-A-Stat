@@ -751,6 +751,21 @@ function sortEventsChronologically(events) {
   });
 }
 
+function primaryIdLabel(ev) {
+  return ev.primaryBtoId ? (ev.primaryBtoId.englishName || ev.primaryBtoId.species) : 'No ID';
+}
+
+// Groups every call by BTO's Primary ID (chronological within each species) - much faster to
+// review in batches when the same species' calls repeat back-to-back.
+function sortEventsByPrimaryId(events) {
+  return [...events].sort((a, b) => {
+    const la = primaryIdLabel(a), lb = primaryIdLabel(b);
+    if (la !== lb) return la.localeCompare(lb);
+    if (a.surveyDate !== b.surveyDate) return (a.surveyDate || '').localeCompare(b.surveyDate || '');
+    return (a.time || '').localeCompare(b.time || '');
+  });
+}
+
 function freqToPixelY(f, sampleRate, height) {
   const nyquist = sampleRate / 2;
   return height * (1 - f / nyquist);
@@ -976,6 +991,92 @@ function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box
   );
 }
 
+const TE_FACTORS = [5, 10, 20];
+
+// Plays the currently boxed region (or the whole visible recording if nothing's boxed) either as
+// a simulated heterodyne detector (mix + lowpass, tunable) or time-expanded (slowed + pitched
+// down by a fixed factor) - both audible ways of listening to an otherwise ultrasonic call.
+function AudioPlayback({ samples, sampleRate, box }) {
+  const [mode, setMode] = useState('heterodyne');
+  const [tuneKHz, setTuneKHz] = useState(45);
+  const [teFactor, setTeFactor] = useState(10);
+  const [playing, setPlaying] = useState(false);
+  const [error, setError] = useState(null);
+  const ctxRef = useRef(null);
+  const sourceRef = useRef(null);
+
+  function stop() {
+    if (sourceRef.current) {
+      try { sourceRef.current.stop(); } catch (e) { /* already stopped */ }
+      sourceRef.current = null;
+    }
+    setPlaying(false);
+  }
+
+  // Stop if the underlying recording changes (e.g. moved to the next call) or on unmount.
+  useEffect(() => stop, [samples]);
+
+  function play() {
+    stop();
+    setError(null);
+    try {
+      const duration = samples.length / sampleRate;
+      let t0 = 0, t1 = duration;
+      if (box) {
+        const pad = Math.min(0.02, (box.t1 - box.t0) * 0.2);
+        t0 = Math.max(0, box.t0 - pad);
+        t1 = Math.min(duration, box.t1 + pad);
+      }
+      const i0 = Math.floor(t0 * sampleRate), i1 = Math.min(samples.length, Math.ceil(t1 * sampleRate));
+      const slice = samples.subarray(i0, i1);
+      if (slice.length < 8) { setError('Selection too short to play.'); return; }
+
+      if (!ctxRef.current) ctxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      const ctx = ctxRef.current;
+      if (ctx.state === 'suspended') ctx.resume();
+
+      let data, outRate;
+      if (mode === 'heterodyne') {
+        const mixed = Dsp.heterodyneMix(slice, sampleRate, tuneKHz * 1000, 8000);
+        outRate = Math.min(48000, sampleRate);
+        data = Dsp.resampleLinear(mixed, sampleRate, outRate);
+      } else {
+        outRate = Math.max(8000, Math.min(192000, Math.round(sampleRate / teFactor)));
+        data = slice;
+      }
+      const buffer = ctx.createBuffer(1, data.length, outRate);
+      buffer.copyToChannel(data instanceof Float32Array ? data : new Float32Array(data), 0);
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(ctx.destination);
+      src.onended = () => { setPlaying(false); sourceRef.current = null; };
+      src.start();
+      sourceRef.current = src;
+      setPlaying(true);
+    } catch (e) {
+      setError('Could not play audio: ' + (e && e.message ? e.message : e));
+    }
+  }
+
+  const selectStyle = { background: 'var(--bg-card)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 6, padding: '3px 6px', fontSize: 12 };
+
+  return h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 12, marginTop: 8 } },
+    h('span', { style: { color: 'var(--text-faint)', textTransform: 'uppercase', fontSize: 11 } }, 'Listen:'),
+    h('select', { value: mode, onChange: (e) => setMode(e.target.value), style: selectStyle },
+      h('option', { value: 'heterodyne' }, 'Heterodyne'),
+      h('option', { value: 'timeExpansion' }, 'Time expansion')
+    ),
+    mode === 'heterodyne' && h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, 'Tune (kHz)',
+      h('input', { type: 'number', value: tuneKHz, min: 10, max: 150, onChange: (e) => setTuneKHz(Number(e.target.value)), style: { ...selectStyle, width: 55 } })),
+    mode === 'timeExpansion' && h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, 'Factor',
+      h('select', { value: teFactor, onChange: (e) => setTeFactor(Number(e.target.value)), style: selectStyle },
+        TE_FACTORS.map((f) => h('option', { key: f, value: f }, `${f}x`)))),
+    h('button', { className: 'btn btn-secondary btn-small', onClick: playing ? stop : play }, playing ? '■ Stop' : '▶ Play'),
+    box && h('span', { className: 'card-sub' }, '(boxed region)'),
+    error && h('span', { style: { color: 'var(--danger)' } }, error)
+  );
+}
+
 function WavFolderPicker({ wavFileMap, setWavFileMap }) {
   const inputRef = useRef(null);
   const [error, setError] = useState(null);
@@ -1018,7 +1119,11 @@ const QA_REASON_LABELS = {
 function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
   const allEvents = deployment.detectionEvents || [];
   const profile = deployment.qaProfile || DEFAULT_QA_PROFILE;
-  const sorted = useMemo(() => sortEventsChronologically(allEvents), [allEvents]);
+  const [sortMode, setSortMode] = useState('primaryId'); // 'primaryId' | 'chronological'
+  const sorted = useMemo(
+    () => (sortMode === 'primaryId' ? sortEventsByPrimaryId(allEvents) : sortEventsChronologically(allEvents)),
+    [allEvents, sortMode]
+  );
   const [queueOnly, setQueueOnly] = useState(true);
   const [unreviewedOnly, setUnreviewedOnly] = useState(false);
 
@@ -1121,6 +1226,16 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
     h(WavFolderPicker, { wavFileMap, setWavFileMap }),
     h('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
       h('label', { style: { fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6 } },
+        'Sort',
+        h('select', {
+          value: sortMode, onChange: (e) => setSortMode(e.target.value),
+          style: { background: 'var(--bg-card)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 6, padding: '3px 6px', fontSize: 12 },
+        },
+          h('option', { value: 'primaryId' }, 'Primary ID'),
+          h('option', { value: 'chronological' }, 'Chronological')
+        )
+      ),
+      h('label', { style: { fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6 } },
         h('input', { type: 'checkbox', checked: queueOnly, onChange: (e) => setQueueOnly(e.target.checked) }),
         'QA queue only'
       ),
@@ -1200,7 +1315,8 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
           h(Sonogram, { spec, samples: decodedWav.samples, sampleRate: decodedWav.sampleRate, floorDb, rangeDb, saturation, box, onBoxChange: setBox, guidelines }),
           h('div', { className: 'card-sub', style: { marginTop: 6 } }, 'Drag to box a call and measure it - scroll to zoom the time axis.'),
           spec.truncated && h('div', { className: 'card-sub', style: { marginTop: 4, color: 'var(--accent)' } },
-            `This recording is longer than ${Dsp.MAX_ANALYSIS_DURATION_SEC || 30}s - showing the first ${Math.round(spec.durationSec)}s only.`)
+            `This recording is longer than ${Dsp.MAX_ANALYSIS_DURATION_SEC || 30}s - showing the first ${Math.round(spec.durationSec)}s only.`),
+          h(AudioPlayback, { samples: decodedWav.samples, sampleRate: decodedWav.sampleRate, box })
         ),
 
         measurement && h('div', { className: 'card', style: { marginTop: 14 } },
