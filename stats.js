@@ -348,6 +348,48 @@ window.BatID = window.BatID || {};
     };
   }
 
+  // Stage 6 (Level 1B): compares every Deployment at the same Location, in chronological order, to
+  // see how activity/richness/dominance shift through the year. Each row's species turnover
+  // (gained/lost) is against the immediately preceding deployment only - a simple presence/absence
+  // diff, not a similarity index (Jaccard/Sørensen/Bray-Curtis are separate, later work - not
+  // duplicated here). Deliberately reads each deployment through the same building blocks as
+  // computeAllStats (buildAnalysisDataset -> computeActivityStats/computeSpeciesStats) rather than
+  // a parallel calculation, so a deployment's numbers here always match what its own Statistics tab
+  // shows.
+  function computeLocationComparison(location) {
+    const deployments = (location.deployments || [])
+      .slice()
+      .sort((a, b) => (a.startDate || '').localeCompare(b.startDate || ''));
+
+    let previousSpeciesSet = null;
+    const rows = deployments.map((dep) => {
+      const dataset = buildAnalysisDataset(dep.detectionEvents || []);
+      const effort = computeEffortStats(dep, dataset);
+      const activity = computeActivityStats(dataset, effort);
+      const species = computeSpeciesStats(dataset);
+      const speciesSet = new Set(species.composition.map((s) => s.species));
+      const speciesGained = previousSpeciesSet ? Array.from(speciesSet).filter((s) => !previousSpeciesSet.has(s)) : [];
+      const speciesLost = previousSpeciesSet ? Array.from(previousSpeciesSet).filter((s) => !speciesSet.has(s)) : [];
+      previousSpeciesSet = speciesSet;
+      return {
+        deploymentId: dep.id,
+        deploymentName: dep.name,
+        startDate: dep.startDate,
+        endDate: dep.endDate,
+        nights: effort.nightsInData,
+        totalDetections: activity.totalDetections,
+        detectionsPerNight: activity.detectionsPerNight,
+        richness: species.richness,
+        dominantSpecies: species.dominantSpecies ? species.dominantSpecies.species : null,
+        dominantPct: species.dominantSpecies ? species.dominantSpecies.pct : null,
+        speciesGained,
+        speciesLost,
+      };
+    });
+
+    return { deployments: rows };
+  }
+
   // Below this many judged calls, a reliability percentage swings too wildly on one or two more
   // reviews to stand on its own - Stage 3's fallback hierarchy (computeReliabilityBySpecies, below)
   // and Stage 4's QA-adjusted redistribution (computeSpeciesStatsQaAdjusted) both use this as the
@@ -657,6 +699,7 @@ window.BatID = window.BatID || {};
     computeReliabilityBySpecies,
     computeConfusionBreakdown,
     computeAllStats,
+    computeLocationComparison,
     mean, median, stdDev, percentile, wilsonInterval,
   };
 })(window.BatID);

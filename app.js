@@ -523,6 +523,8 @@ function DeploymentPanel({ location, deployment, activeTab, setActiveTab, onPatc
     tabContent = h(ReviewTab, { deployment, onPatchEvent, wavFileMap, setWavFileMap, customLabels, onAddCustomLabel });
   } else if (activeTab === 'stats') {
     tabContent = h(StatisticsTab, { deployment, location });
+  } else if (activeTab === 'comparisons') {
+    tabContent = h(ComparisonsTab, { location, deployment });
   } else {
     tabContent = h(ComingSoonTab, { tab: DEPLOYMENT_TABS.find((t) => t.id === activeTab) });
   }
@@ -907,6 +909,53 @@ function StatisticsTab({ deployment, location }) {
       h('div', { className: 'card-sub', style: { marginBottom: 6 } }, 'Cumulative activity percentiles:'),
       h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '6px 18px', fontSize: 12, fontFamily: 'var(--font-mono)' } },
         [10, 25, 50, 75, 90].map((p) => h('span', { key: p }, `${p}%: ${timing.sunsetRelative ? fmtHour(timing.percentiles[p]) : fmtNum(timing.percentiles[p])}`))
+      )
+    )
+  );
+}
+
+// Stage 6 (Level 1B): how this Location's deployments compare through the year - one row per
+// deployment, in chronological order, with the current deployment highlighted so it's easy to spot
+// where "now" sits in the sequence.
+function ComparisonsTab({ location, deployment }) {
+  const comparison = useMemo(() => Stats.computeLocationComparison(location), [location]);
+  const rows = comparison.deployments;
+
+  if (rows.length < 2) {
+    return h('div', { className: 'content' },
+      h('div', { className: 'empty-state' },
+        h('div', { className: 'empty-title' }, 'Need at least two deployments to compare'),
+        h('div', { className: 'empty-text' }, `${location.name} has ${rows.length} deployment${rows.length === 1 ? '' : 's'} so far - add another to see activity, richness and species turnover through the year.`)
+      )
+    );
+  }
+
+  return h('div', { className: 'content' },
+    h('div', { className: 'section-title' }, `Through the year at ${location.name}`),
+    h('div', { className: 'card-sub', style: { marginBottom: 8 } },
+      "Species gained/lost are against the immediately preceding deployment only (a simple presence/absence difference) - not a similarity index."),
+    h('div', { className: 'card', style: { padding: 0, overflow: 'hidden' } },
+      h('div', { style: { overflowX: 'auto' } },
+        h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
+          h('thead', null, h('tr', null,
+            ['Deployment', 'Dates', 'Nights', 'Detections/night', 'Richness', 'Dominant species', 'Gained', 'Lost'].map((c) => h('th', {
+              key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
+            }, c))
+          )),
+          h('tbody', null, rows.map((r) => h('tr', {
+            key: r.deploymentId,
+            style: r.deploymentId === deployment.id ? { background: 'rgba(255,150,50,0.08)' } : null,
+          },
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, r.deploymentName || '(untitled)'),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, `${r.startDate || '?'} → ${r.endDate || '?'}`),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, r.nights),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(r.detectionsPerNight)),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, r.richness),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, r.dominantSpecies ? `${r.dominantSpecies} (${fmtNum(r.dominantPct)}%)` : '-'),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-muted)' } }, r.speciesGained.length ? r.speciesGained.join(', ') : '-'),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-muted)' } }, r.speciesLost.length ? r.speciesLost.join(', ') : '-')
+          )))
+        )
       )
     )
   );
