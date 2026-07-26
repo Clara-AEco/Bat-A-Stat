@@ -65,5 +65,53 @@ window.BatID = window.BatID || {};
     };
   }
 
-  ns.QaProfiles = { stableHash01, effectiveThreshold, computeQaInclusion, computeQaSummary };
+  // Informational only - Clara confirmed the original rule stands: an unreviewed event's BTO
+  // primary always counts toward analysis (flagged if below threshold), never silently excluded,
+  // so stats stay usable at any point during QA rather than swinging as review work progresses.
+  // 'pending-required-qa' is purely a highlight for species marked for mandatory full review -
+  // it does NOT mean the event is left out of any statistic.
+  function computeAnalysisStatus(event, profile) {
+    if (event.manualReview && event.manualReview.reviewed) return 'included';
+    const { reason } = computeQaInclusion(event, profile);
+    return reason === '100pct-species' ? 'pending-required-qa' : 'included';
+  }
+
+  // Grades a reviewed event's BTO primary result against what manual review actually found.
+  // knownBatSpeciesNames (optional): the app's own reference species list, used to tell "reviewer
+  // reassigned to a different real bat species" apart from a custom/non-bat/genus-level label -
+  // without it, anything not matching the primary just falls into the 'reassigned-other' bucket.
+  // Does NOT yet distinguish incorrect-identification-level / false-positive-non-bat / bat-
+  // present-unidentifiable from each other - that needs the reviewer to record which one
+  // explicitly (a structured taxonomy/outcome picker), not string-matching a free-text label.
+  function computeQaOutcome(event, knownBatSpeciesNames) {
+    if (!event.manualReview || !event.manualReview.reviewed) {
+      return { primaryIdCorrect: null, eventComplete: null, qaOutcome: 'unresolved' };
+    }
+    const finalId = event.manualReview.finalId;
+    const hasAdditional = ((event.manualReview.additionalTaxa) || []).length > 0;
+    const primary = event.primaryBtoId;
+    const primaryLabel = primary ? (primary.englishName || primary.species) : null;
+
+    if (finalId === 'Noise / No ID') {
+      return { primaryIdCorrect: primaryLabel ? false : null, eventComplete: false, qaOutcome: 'false-positive-noise' };
+    }
+    if (!primaryLabel) {
+      return { primaryIdCorrect: null, eventComplete: !hasAdditional, qaOutcome: 'no-bto-primary' };
+    }
+    const primaryRetained = finalId === primaryLabel;
+    if (primaryRetained) {
+      return hasAdditional
+        ? { primaryIdCorrect: true, eventComplete: false, qaOutcome: 'correct-but-incomplete' }
+        : { primaryIdCorrect: true, eventComplete: true, qaOutcome: 'correct' };
+    }
+    const isKnownBatSpecies = !knownBatSpeciesNames || knownBatSpeciesNames.includes(finalId);
+    return isKnownBatSpecies
+      ? { primaryIdCorrect: false, eventComplete: false, qaOutcome: 'incorrect-species' }
+      : { primaryIdCorrect: false, eventComplete: false, qaOutcome: 'reassigned-other' };
+  }
+
+  ns.QaProfiles = {
+    stableHash01, effectiveThreshold, computeQaInclusion, computeQaSummary,
+    computeAnalysisStatus, computeQaOutcome,
+  };
 })(window.BatID);

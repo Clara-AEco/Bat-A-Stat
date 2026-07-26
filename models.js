@@ -87,6 +87,37 @@ window.BatID = window.BatID || {};
       },
       btoImports: [], // [{ id, fileName, importedAt, rowCount, eventIds: [...] }]
       detectionEvents: [],
+      // Real-world detector placement isn't always acoustically ideal (theft/vandalism risk,
+      // concealment, low mounting) - recording this alongside results means QA-derived
+      // reliability reads as "observed performance under THIS deployment's conditions", not a
+      // universal BTO accuracy figure. Every field optional - nothing here blocks analysis, it's
+      // context to show alongside it (never an automatic correction to activity counts).
+      microphonePlacement: {
+        heightMetres: null,
+        orientation: '', // e.g. "horizontal" | "vertical" | "angled" - free text, no fixed list imposed
+        mountingType: '', // e.g. "tree-mounted" | "pole-mounted" | "building" | "ground"
+        enclosureUsed: null,
+        nearbyVegetation: null,
+        vegetationDistanceMetres: null,
+        leavesWithinImmediateField: null,
+        nearbyPath: null,
+        nearbyRoad: null,
+        nearbyWater: null,
+        nearbyLighting: null,
+        theftRiskConstraint: null,
+        vandalismRiskConstraint: null,
+        placementQuality: null, // 'recommended' | 'partially-constrained' | 'strongly-constrained'
+        notes: '',
+      },
+      acousticConditions: {
+        vegetationNoise: null, // 'low' | 'moderate' | 'high'
+        windNoise: null,
+        rainNoise: null,
+        anthropogenicNoise: null,
+        clippingOrOverloadObserved: null,
+        weakSignalPrevalence: null,
+        notes: '',
+      },
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };

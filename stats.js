@@ -251,7 +251,7 @@ window.BatID = window.BatID || {};
     };
   }
 
-  function computeAllStats(deployment, location) {
+  function computeAllStats(deployment, location, knownBatSpeciesNames) {
     const dataset = buildAnalysisDataset(deployment.detectionEvents || []);
     const effort = computeEffortStats(deployment, dataset);
     const events = deployment.detectionEvents || [];
@@ -263,7 +263,7 @@ window.BatID = window.BatID || {};
       activity: computeActivityStats(dataset, effort),
       species: computeSpeciesStats(dataset),
       timing: computeTimingStats(dataset, location),
-      reliability: computeReliabilityStats(events),
+      reliability: computeReliabilityStats(events, knownBatSpeciesNames),
     };
   }
 
@@ -281,24 +281,24 @@ window.BatID = window.BatID || {};
   //    added species? Stricter than (A): a "correct but incomplete" event fails this one.
   // C. Additional-species rate: how often did manual review find a species BTO's primary result
   //    didn't represent - most relevant where field conditions may mask weaker/overlapping calls.
-  function computeReliabilityStats(events) {
+  function computeReliabilityStats(events, knownBatSpeciesNames) {
     const reviewed = (events || []).filter((ev) => ev.manualReview && ev.manualReview.reviewed && ev.primaryBtoId);
     const n = reviewed.length;
     let primaryCorrect = 0, complete = 0, withAdditional = 0;
+    const byOutcome = {};
     for (const ev of reviewed) {
-      const primaryLabel = ev.primaryBtoId.englishName || ev.primaryBtoId.species;
-      const finalId = ev.manualReview.finalId;
-      const additional = ev.manualReview.additionalTaxa || [];
-      const primaryRetained = finalId === primaryLabel;
-      if (primaryRetained) primaryCorrect++;
-      if (primaryRetained && additional.length === 0) complete++;
-      if (additional.length > 0) withAdditional++;
+      const outcome = ns.QaProfiles.computeQaOutcome(ev, knownBatSpeciesNames);
+      byOutcome[outcome.qaOutcome] = (byOutcome[outcome.qaOutcome] || 0) + 1;
+      if (outcome.primaryIdCorrect) primaryCorrect++;
+      if (outcome.eventComplete) complete++;
+      if ((ev.manualReview.additionalTaxa || []).length > 0) withAdditional++;
     }
     return {
       reviewedSampleSize: n,
       primaryIdReliabilityPct: n > 0 ? (primaryCorrect / n) * 100 : null,
       completeEventReliabilityPct: n > 0 ? (complete / n) * 100 : null,
       additionalSpeciesRatePct: n > 0 ? (withAdditional / n) * 100 : null,
+      byOutcome,
     };
   }
 

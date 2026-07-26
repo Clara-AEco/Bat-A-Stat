@@ -10,6 +10,16 @@ const QaProfiles = window.BatID.QaProfiles;
 const Sun = window.BatID.Sun;
 const Stats = window.BatID.Stats;
 
+const QA_OUTCOME_LABELS = {
+  correct: 'Correct',
+  'correct-but-incomplete': 'Correct but incomplete',
+  'incorrect-species': 'Incorrect species',
+  'reassigned-other': 'Reassigned (genus/group/non-bat/unidentified)',
+  'false-positive-noise': 'False positive - noise',
+  'no-bto-primary': 'No BTO primary to grade',
+  unresolved: 'Unresolved',
+};
+
 const DEPLOYMENT_TABS = [
   { id: 'overview', label: 'Overview', phase: 1 },
   { id: 'detections', label: 'Detections', phase: 2 },
@@ -657,7 +667,7 @@ function fmtDateTime(d) {
 }
 
 function StatisticsTab({ deployment, location }) {
-  const stats = useMemo(() => Stats.computeAllStats(deployment, location), [deployment, location]);
+  const stats = useMemo(() => Stats.computeAllStats(deployment, location, ALL_SPECIES_NAMES), [deployment, location]);
   const { effort, activity, species, timing, reliability, totalDetectionEvents, totalSpeciesRecords } = stats;
 
   if (totalDetectionEvents === 0) {
@@ -678,11 +688,16 @@ function StatisticsTab({ deployment, location }) {
       "Based on manually reviewed calls that had a BTO primary result to check against. Describes what was observed under this deployment's own recording conditions, not a general BTO accuracy figure - and does not yet include confidence intervals or a small-sample fallback (that's follow-on work)."),
     reliability.reviewedSampleSize === 0
       ? h('div', { className: 'card-sub' }, 'No reviewed calls with a BTO primary result yet - reliability will appear here once some QA has been done.')
-      : h('div', { className: 'stat-grid' },
-          h(StatBox, { label: 'Primary-ID reliability', value: fmtNum(reliability.primaryIdReliabilityPct) + '%' }),
-          h(StatBox, { label: 'Complete-event reliability', value: fmtNum(reliability.completeEventReliabilityPct) + '%' }),
-          h(StatBox, { label: 'Additional-species rate', value: fmtNum(reliability.additionalSpeciesRatePct) + '%' }),
-          h(StatBox, { label: 'Reviewed sample (n)', value: reliability.reviewedSampleSize })
+      : h(React.Fragment, null,
+          h('div', { className: 'stat-grid' },
+            h(StatBox, { label: 'Primary-ID reliability', value: fmtNum(reliability.primaryIdReliabilityPct) + '%' }),
+            h(StatBox, { label: 'Complete-event reliability', value: fmtNum(reliability.completeEventReliabilityPct) + '%' }),
+            h(StatBox, { label: 'Additional-species rate', value: fmtNum(reliability.additionalSpeciesRatePct) + '%' }),
+            h(StatBox, { label: 'Reviewed sample (n)', value: reliability.reviewedSampleSize })
+          ),
+          h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '6px 16px', marginTop: 10, fontSize: 12, fontFamily: 'var(--font-mono)' } },
+            Object.entries(reliability.byOutcome).map(([outcome, count]) => h('span', { key: outcome }, `${QA_OUTCOME_LABELS[outcome] || outcome}: ${count}`))
+          )
         ),
 
     h('div', { className: 'section-title' }, 'Survey effort'),
@@ -840,7 +855,101 @@ function DeploymentOverviewTab({ deployment, onPatch, wavFileMap, location }) {
       h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'BTO imports'), h('div', { className: 'stat-box-value' }, String((deployment.btoImports || []).length))),
       h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Manually added'), h('div', { className: 'stat-box-value' }, String(events.filter((e) => e.addedManually).length)))
     ),
-    (deployment.detectionEvents || []).length === 0 && h('div', { className: 'card-sub', style: { marginTop: 10 } }, 'Import a BTO CSV on the Detections tab to get started.')
+    (deployment.detectionEvents || []).length === 0 && h('div', { className: 'card-sub', style: { marginTop: 10 } }, 'Import a BTO CSV on the Detections tab to get started.'),
+
+    h(RecordingConditionsSection, { deployment, onPatch })
+  );
+}
+
+const PLACEMENT_QUALITY_LABELS = {
+  recommended: 'Recommended placement',
+  'partially-constrained': 'Partially constrained',
+  'strongly-constrained': 'Strongly constrained',
+};
+
+// Real-world detector placement isn't always acoustically ideal (theft/vandalism risk, low
+// mounting, concealment). Recording this alongside results means QA reliability reads as
+// "observed under THIS deployment's conditions", not a universal BTO accuracy claim - and lets
+// later comparisons flag "these differ partly because recording conditions differed" rather than
+// silently attributing a richness/completeness gap to biology. Every field optional; collapsed by
+// default so it doesn't get in the way when there's nothing unusual to record.
+function RecordingConditionsSection({ deployment, onPatch }) {
+  const [expanded, setExpanded] = useState(false);
+  const mic = deployment.microphonePlacement || {};
+  const acoustic = deployment.acousticConditions || {};
+  function patchMic(patch) { onPatch({ microphonePlacement: { ...mic, ...patch } }); }
+  function patchAcoustic(patch) { onPatch({ acousticConditions: { ...acoustic, ...patch } }); }
+
+  const issues = [];
+  if (mic.theftRiskConstraint) issues.push('positioned to reduce theft risk');
+  if (mic.vandalismRiskConstraint) issues.push('positioned to reduce vandalism risk');
+  if (mic.leavesWithinImmediateField) issues.push('leaves within the immediate microphone field');
+  else if (mic.nearbyVegetation) issues.push('close to vegetation');
+  if (mic.nearbyRoad) issues.push('near a road');
+  if (mic.nearbyPath) issues.push('near a path');
+  if (acoustic.vegetationNoise === 'high') issues.push('high vegetation noise observed');
+  if (acoustic.windNoise === 'high') issues.push('high wind noise observed');
+  if (acoustic.anthropogenicNoise === 'high') issues.push('high anthropogenic noise observed');
+
+  const boolField = (label, key, patchFn, obj) => h('label', { key, style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 } },
+    h('input', { type: 'checkbox', checked: !!obj[key], onChange: (e) => patchFn({ [key]: e.target.checked }) }), label);
+  const selectField = (label, key, options) => h(Field, { key, label },
+    h('select', {
+      value: acoustic[key] || '', onChange: (e) => patchAcoustic({ [key]: e.target.value || null }),
+      style: { background: 'var(--bg-card)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 8, padding: '9px 10px' },
+    }, h('option', { value: '' }, 'Unknown'), options.map((o) => h('option', { key: o, value: o }, o))));
+
+  return h('div', { style: { marginTop: 24 } },
+    h('div', { className: 'section-title', style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', margin: 0 } },
+      h('span', null, 'Recording conditions'),
+      h('button', { className: 'btn btn-secondary btn-small', onClick: () => setExpanded(!expanded) }, expanded ? 'Hide' : (mic.placementQuality ? 'Edit' : '+ Record conditions'))
+    ),
+    h('div', { className: 'card-sub', style: { marginTop: 6, marginBottom: 10 } },
+      `Recording conditions: ${mic.placementQuality ? PLACEMENT_QUALITY_LABELS[mic.placementQuality] : 'Not yet assessed'}.`,
+      issues.length > 0 && ` Primary issue: ${issues[0]}.`
+    ),
+    expanded && h('div', { className: 'card' },
+      h(Field, { label: 'Overall placement quality' },
+        h('select', {
+          value: mic.placementQuality || '', onChange: (e) => patchMic({ placementQuality: e.target.value || null }),
+          style: { background: 'var(--bg-card)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 8, padding: '9px 10px' },
+        },
+          h('option', { value: '' }, 'Not yet assessed'),
+          Object.entries(PLACEMENT_QUALITY_LABELS).map(([v, label]) => h('option', { key: v, value: v }, label))
+        )
+      ),
+      h('div', { className: 'field-row' },
+        h(Field, { label: 'Microphone height (m)' }, h('input', { type: 'number', step: 'any', value: mic.heightMetres ?? '', onChange: (e) => patchMic({ heightMetres: e.target.value === '' ? null : Number(e.target.value) }) })),
+        h(Field, { label: 'Mounting type' }, h('input', { value: mic.mountingType || '', placeholder: 'e.g. tree-mounted', onChange: (e) => patchMic({ mountingType: e.target.value }) })),
+        h(Field, { label: 'Orientation' }, h('input', { value: mic.orientation || '', placeholder: 'e.g. horizontal', onChange: (e) => patchMic({ orientation: e.target.value }) }))
+      ),
+      h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px 18px', marginBottom: 14 } },
+        boolField('Enclosure used', 'enclosureUsed', patchMic, mic),
+        boolField('Nearby vegetation', 'nearbyVegetation', patchMic, mic),
+        boolField('Leaves within immediate field', 'leavesWithinImmediateField', patchMic, mic),
+        boolField('Nearby path', 'nearbyPath', patchMic, mic),
+        boolField('Nearby road', 'nearbyRoad', patchMic, mic),
+        boolField('Nearby water', 'nearbyWater', patchMic, mic),
+        boolField('Nearby lighting', 'nearbyLighting', patchMic, mic),
+        boolField('Theft-risk constraint', 'theftRiskConstraint', patchMic, mic),
+        boolField('Vandalism-risk constraint', 'vandalismRiskConstraint', patchMic, mic)
+      ),
+      mic.nearbyVegetation && h(Field, { label: 'Vegetation distance (m)' }, h('input', { type: 'number', step: 'any', value: mic.vegetationDistanceMetres ?? '', onChange: (e) => patchMic({ vegetationDistanceMetres: e.target.value === '' ? null : Number(e.target.value) }) })),
+      h(Field, { label: 'Placement notes' }, h('textarea', { rows: 2, value: mic.notes || '', onChange: (e) => patchMic({ notes: e.target.value }) })),
+
+      h('div', { className: 'section-title', style: { fontSize: 14 } }, 'Acoustic conditions'),
+      h('div', { className: 'field-row' },
+        selectField('Vegetation noise', 'vegetationNoise', ['low', 'moderate', 'high']),
+        selectField('Wind noise', 'windNoise', ['low', 'moderate', 'high']),
+        selectField('Rain noise', 'rainNoise', ['low', 'moderate', 'high'])
+      ),
+      h('div', { className: 'field-row' },
+        selectField('Anthropogenic noise', 'anthropogenicNoise', ['low', 'moderate', 'high']),
+        selectField('Weak-signal prevalence', 'weakSignalPrevalence', ['low', 'moderate', 'high'])
+      ),
+      boolField('Clipping / overload observed', 'clippingOrOverloadObserved', patchAcoustic, acoustic),
+      h(Field, { label: 'Acoustic condition notes' }, h('textarea', { rows: 2, value: acoustic.notes || '', onChange: (e) => patchAcoustic({ notes: e.target.value }) }))
+    )
   );
 }
 
@@ -2224,6 +2333,7 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, custom
           h('div', { className: 'card-sub', style: { marginBottom: 8 } }, 'Quick label (sets Final ID and moves to the next call):'),
           h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8 } },
             quickSpecies.map((label) => h('button', { key: label, className: 'btn btn-secondary btn-small', onClick: () => setFinalId(label) }, label)),
+            h('button', { className: 'btn btn-secondary btn-small', onClick: () => setFinalId('Bat (unidentified)') }, 'Bat (unidentified)'),
             h('button', { className: 'btn btn-danger btn-small', onClick: () => setFinalId('Noise / No ID') }, 'Noise / No ID')
           ),
           h(CustomLabelInput, { onSubmit: (label) => setFinalIdWithCustomTracking(label, true) })
