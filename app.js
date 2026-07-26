@@ -6,12 +6,13 @@ const Bto = window.BatID.Bto;
 const Wav = window.BatID.Wav;
 const Dsp = window.BatID.Dsp;
 const SpeciesData = window.BatID.SpeciesData;
+const QaProfiles = window.BatID.QaProfiles;
 
 const DEPLOYMENT_TABS = [
   { id: 'overview', label: 'Overview', phase: 1 },
   { id: 'detections', label: 'Detections', phase: 2 },
-  { id: 'review', label: 'Manual Review', phase: 3 },
   { id: 'qa', label: 'QA', phase: 4 },
+  { id: 'review', label: 'Manual Review', phase: 3 },
   { id: 'stats', label: 'Statistics', phase: 5 },
   { id: 'figures', label: 'Figures', phase: 6 },
   { id: 'comparisons', label: 'Comparisons', phase: 7 },
@@ -380,6 +381,8 @@ function DeploymentPanel({ location, deployment, activeTab, setActiveTab, onPatc
     tabContent = h(DeploymentOverviewTab, { deployment, onPatch });
   } else if (activeTab === 'detections') {
     tabContent = h(DetectionsTab, { deployment, onImportBto });
+  } else if (activeTab === 'qa') {
+    tabContent = h(QaTab, { deployment, onPatch, wavFileMap, setWavFileMap, onGoToReview: () => setActiveTab('review') });
   } else if (activeTab === 'review') {
     tabContent = h(ReviewTab, { deployment, onPatchEvent, wavFileMap, setWavFileMap });
   } else {
@@ -553,6 +556,102 @@ function DeploymentOverviewTab({ deployment, onPatch }) {
       h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'BTO imports'), h('div', { className: 'stat-box-value' }, String((deployment.btoImports || []).length)))
     ),
     h('div', { className: 'card-sub', style: { marginTop: 10 } }, 'BTO import lands in Phase 2 — this deployment is ready to receive it.')
+  );
+}
+
+// ---------------- QA (review-queue rules, drives Manual Review) ----------------
+
+function StatBox({ label, value }) {
+  return h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, label), h('div', { className: 'stat-box-value' }, String(value)));
+}
+
+function QaTab({ deployment, onPatch, wavFileMap, setWavFileMap, onGoToReview }) {
+  const events = deployment.detectionEvents || [];
+  const profile = deployment.qaProfile || { samplePercent: 10, probabilityThreshold: 50, speciesRequiring100Percent: [], alwaysReviewNoId: true };
+  function patchProfile(patch) {
+    onPatch({ qaProfile: { ...profile, ...patch } });
+  }
+
+  const summary = useMemo(() => QaProfiles.computeQaSummary(events, profile), [events, profile]);
+  const speciesList = useMemo(() => {
+    const counts = computeSpeciesCounts(events);
+    return Object.keys(counts).filter((s) => s !== 'Noise / No ID').sort();
+  }, [events]);
+
+  const [newSpecies, setNewSpecies] = useState('');
+  function addRequiredSpecies() {
+    const trimmed = newSpecies.trim();
+    if (!trimmed || profile.speciesRequiring100Percent.includes(trimmed)) return;
+    patchProfile({ speciesRequiring100Percent: [...profile.speciesRequiring100Percent, trimmed] });
+    setNewSpecies('');
+  }
+  function removeRequiredSpecies(name) {
+    patchProfile({ speciesRequiring100Percent: profile.speciesRequiring100Percent.filter((s) => s !== name) });
+  }
+
+  const inputStyle = {
+    background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 8,
+    color: 'var(--text)', padding: '7px 10px', fontSize: 13, fontFamily: 'var(--font-body)',
+  };
+
+  return h('div', { className: 'content' },
+    h('div', { className: 'section-title' }, 'WAV files'),
+    h(WavFolderPicker, { wavFileMap, setWavFileMap }),
+    h('div', { className: 'card-sub', style: { marginTop: 6 } },
+      "Selecting a folder includes every WAV file in its subfolders automatically - handy since some detectors split each survey night into its own folder and others dump everything in one. Loaded once here, it's available in Manual Review too."),
+
+    h('div', { className: 'section-title' }, 'Review queue rules'),
+    h('div', { className: 'field-row' },
+      h(Field, { label: 'Random sample % (everything else)' },
+        h('input', { type: 'number', min: 0, max: 100, value: profile.samplePercent, onChange: (e) => patchProfile({ samplePercent: Number(e.target.value) }) })),
+      h(Field, { label: 'Probability threshold % (review anything below this)' },
+        h('input', { type: 'number', min: 0, max: 100, value: profile.probabilityThreshold, onChange: (e) => patchProfile({ probabilityThreshold: Number(e.target.value) }) }))
+    ),
+    h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, marginBottom: 18, color: 'var(--text-muted)' } },
+      h('input', { type: 'checkbox', checked: profile.alwaysReviewNoId, onChange: (e) => patchProfile({ alwaysReviewNoId: e.target.checked }) }),
+      'Always review calls BTO could not identify at all (No ID)'
+    ),
+
+    h('div', { className: 'section-title' }, 'Species requiring 100% review'),
+    h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 } },
+      profile.speciesRequiring100Percent.length === 0 && h('span', { className: 'card-sub' }, 'None set - add species below (e.g. rare or easily-confused species).'),
+      profile.speciesRequiring100Percent.map((s) => h('span', {
+        key: s, className: 'pill', style: { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '5px 10px' },
+      }, s, h('button', {
+        onClick: () => removeRequiredSpecies(s),
+        style: { background: 'none', border: 'none', color: 'inherit', cursor: 'pointer', padding: 0, fontSize: 14, lineHeight: 1 },
+      }, '×')))
+    ),
+    h('div', { style: { display: 'flex', gap: 8, marginBottom: 24 } },
+      h('input', {
+        value: newSpecies, list: 'qa-species-list', placeholder: 'Add species (e.g. Barbastelle)...', style: { ...inputStyle, flex: 1, maxWidth: 260 },
+        onChange: (e) => setNewSpecies(e.target.value),
+        onKeyDown: (e) => { if (e.key === 'Enter') addRequiredSpecies(); },
+      }),
+      h('datalist', { id: 'qa-species-list' }, speciesList.map((s) => h('option', { key: s, value: s }))),
+      h('button', { className: 'btn btn-secondary btn-small', disabled: !newSpecies.trim(), onClick: addRequiredSpecies }, 'Add')
+    ),
+
+    h('div', { className: 'section-title' }, 'Queue summary'),
+    h('div', { className: 'stat-grid' },
+      h(StatBox, { label: 'Total detections', value: summary.totalEvents }),
+      h(StatBox, { label: 'In review queue', value: summary.queued }),
+      h(StatBox, { label: 'Reviewed', value: summary.queuedReviewed }),
+      h(StatBox, { label: 'Remaining', value: summary.queuedRemaining })
+    ),
+    h('div', { className: 'card-sub', style: { marginTop: 10 } },
+      `No ID: ${summary.byReason['no-id']} · Below threshold: ${summary.byReason['below-threshold']} · 100%-species: ${summary.byReason['100pct-species']} · Sampled: ${summary.byReason.sampled} · Not selected: ${summary.byReason['not-selected']}`),
+
+    summary.queued > 0 && (
+      summary.queuedRemaining > 0
+        ? h('div', { className: 'card', style: { marginTop: 16, borderColor: 'var(--danger)' } },
+            h('div', { style: { color: 'var(--danger)', fontWeight: 600 } },
+              `⚠ ${summary.queuedRemaining} of ${summary.queued} queued calls still need review - statistics won't reflect a complete QA pass until this reaches zero.`))
+        : h('div', { className: 'card', style: { marginTop: 16, borderColor: 'var(--teal)' } },
+            h('div', { style: { color: 'var(--teal)', fontWeight: 600 } }, `✓ QA complete - all ${summary.queued} queued calls have been reviewed.`))
+    ),
+
+    h('button', { className: 'btn btn-primary', style: { marginTop: 16 }, onClick: onGoToReview }, 'Go to Manual Review →')
   );
 }
 
@@ -758,16 +857,29 @@ function WavFolderPicker({ wavFileMap, setWavFileMap }) {
   );
 }
 
+const DEFAULT_QA_PROFILE = { samplePercent: 10, probabilityThreshold: 50, speciesRequiring100Percent: [], alwaysReviewNoId: true };
+const QA_REASON_LABELS = {
+  'no-id': 'Queued - No ID (always reviewed)',
+  'below-threshold': 'Queued - below probability threshold',
+  '100pct-species': 'Queued - 100%-review species',
+  sampled: 'Queued - random sample',
+  'not-selected': 'Not in queue',
+};
+
 function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
   const allEvents = deployment.detectionEvents || [];
+  const profile = deployment.qaProfile || DEFAULT_QA_PROFILE;
   const sorted = useMemo(() => sortEventsChronologically(allEvents), [allEvents]);
+  const [queueOnly, setQueueOnly] = useState(true);
   const [unreviewedOnly, setUnreviewedOnly] = useState(false);
-  const list = unreviewedOnly ? sorted.filter((e) => !e.manualReview.reviewed) : sorted;
+
+  const queueFiltered = queueOnly ? sorted.filter((e) => QaProfiles.computeQaInclusion(e, profile).included) : sorted;
+  const list = unreviewedOnly ? queueFiltered.filter((e) => !e.manualReview.reviewed) : queueFiltered;
 
   const [currentId, setCurrentId] = useState(list[0] ? list[0].id : null);
   useEffect(() => {
     if (!list.find((e) => e.id === currentId) && list.length) setCurrentId(list[0].id);
-  }, [list.length, unreviewedOnly]);
+  }, [list.length, unreviewedOnly, queueOnly]);
 
   const currentIndex = list.findIndex((e) => e.id === currentId);
   const currentEvent = currentIndex >= 0 ? list[currentIndex] : null;
@@ -858,7 +970,12 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
     return h('div', { className: 'content' },
       h('div', { className: 'empty-state' },
         h('div', { className: 'empty-title' }, 'No detection events to review'),
-        h('div', { className: 'empty-text' }, 'Import a BTO CSV on the Detections tab first.')
+        h('div', { className: 'empty-text' },
+          allEvents.length === 0
+            ? 'Import a BTO CSV on the Detections tab first.'
+            : queueOnly
+              ? "Nothing matches the current QA rules (or everything's already reviewed). Adjust the sample %/threshold on the QA tab, or untick \"QA queue only\" to browse every call."
+              : 'Nothing matches the current filters.')
       )
     );
   }
@@ -867,6 +984,10 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
     h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, flexWrap: 'wrap', gap: 10 } },
       h(WavFolderPicker, { wavFileMap, setWavFileMap }),
       h('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
+        h('label', { style: { fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6 } },
+          h('input', { type: 'checkbox', checked: queueOnly, onChange: (e) => setQueueOnly(e.target.checked) }),
+          'QA queue only'
+        ),
         h('label', { style: { fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6 } },
           h('input', { type: 'checkbox', checked: unreviewedOnly, onChange: (e) => setUnreviewedOnly(e.target.checked) }),
           'Unreviewed only'
@@ -972,7 +1093,7 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
         h(AttrRow, { label: 'Time', value: currentEvent.time }),
         h(AttrRow, { label: 'Location', value: currentEvent.latitude != null ? `${currentEvent.latitude}, ${currentEvent.longitude}` : '-' }),
         h(AttrRow, { label: 'Candidates', value: String(currentEvent.candidateSpecies.length) }),
-        h(AttrRow, { label: 'QA status', value: currentEvent.qaStatus || 'not set (Phase 4)' })
+        h(AttrRow, { label: 'QA status', value: QA_REASON_LABELS[QaProfiles.computeQaInclusion(currentEvent, profile).reason] })
       )
     ),
 

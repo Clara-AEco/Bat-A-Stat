@@ -62,7 +62,15 @@ window.BatID = window.BatID || {};
         excludedPeriods: '',
         qaCompletionPct: null,
       },
-      qaProfileId: null,
+      // Drives the Manual Review queue: sample % for everything else, a probability floor
+      // below which every call is queued regardless of species, species that always get
+      // reviewed in full, and whether unidentified ("No ID") calls are always queued too.
+      qaProfile: {
+        samplePercent: 10,
+        probabilityThreshold: 50,
+        speciesRequiring100Percent: [],
+        alwaysReviewNoId: true,
+      },
       btoImports: [], // [{ id, fileName, importedAt, rowCount, eventIds: [...] }]
       detectionEvents: [],
       createdAt: nowIso(),
