@@ -669,7 +669,18 @@ function fmtDateTime(d) {
 
 function StatisticsTab({ deployment, location }) {
   const stats = useMemo(() => Stats.computeAllStats(deployment, location, ALL_SPECIES_NAMES), [deployment, location]);
-  const { effort, activity, species, timing, reliability, reliabilityByProbabilityBand, reliabilityBySpecies, totalDetectionEvents, totalSpeciesRecords } = stats;
+  const { effort, activity, species, speciesQaAdjusted, timing, reliability, reliabilityByProbabilityBand, reliabilityBySpecies, confusionBreakdown, totalDetectionEvents, totalSpeciesRecords } = stats;
+  const [expandedSpecies, setExpandedSpecies] = useState(() => new Set());
+  const [speciesView, setSpeciesView] = useState('raw'); // 'raw' | 'qa-adjusted'
+  const confusionBySpecies = useMemo(() => new Map((confusionBreakdown || []).map((c) => [c.species, c])), [confusionBreakdown]);
+
+  function toggleExpanded(sp) {
+    setExpandedSpecies((prev) => {
+      const next = new Set(prev);
+      if (next.has(sp)) next.delete(sp); else next.add(sp);
+      return next;
+    });
+  }
 
   if (totalDetectionEvents === 0) {
     return h('div', { className: 'content' },
@@ -729,22 +740,48 @@ function StatisticsTab({ deployment, location }) {
             h('div', { style: { overflowX: 'auto' } },
               h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
                 h('thead', null, h('tr', null,
-                  ['Species', 'Reliability shown', '95% CI', 'Level', 'Reviewed (n)'].map((c) => h('th', {
+                  ['', 'Species', 'Reliability shown', '95% CI', 'Level', 'Reviewed (n)'].map((c) => h('th', {
                     key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
                   }, c))
                 )),
-                h('tbody', null, (reliabilityBySpecies || []).map((s) => h('tr', { key: s.species, title: s.fallbackNote || '' },
-                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, s.species),
-                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(s.primaryIdReliabilityPct) + '%'),
-                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtCi(s.primaryIdReliabilityCiLowerPct, s.primaryIdReliabilityCiUpperPct) || '-'),
-                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, s.fallbackLevel === 'species' ? 'Species' : s.fallbackLevel === 'genus' ? 'Genus (fallback)' : 'Deployment (fallback)'),
-                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.reviewedSampleSize)
-                )))
+                h('tbody', null, (reliabilityBySpecies || []).map((s) => {
+                  const confusion = confusionBySpecies.get(s.species);
+                  const isExpanded = expandedSpecies.has(s.species);
+                  const rows = [
+                    h('tr', {
+                      key: s.species, title: s.fallbackNote || '',
+                      style: confusion ? { cursor: 'pointer' } : null,
+                      onClick: confusion ? () => toggleExpanded(s.species) : undefined,
+                    },
+                      h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', width: 16 } }, confusion ? (isExpanded ? '▾' : '▸') : ''),
+                      h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, s.species),
+                      h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(s.primaryIdReliabilityPct) + '%'),
+                      h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtCi(s.primaryIdReliabilityCiLowerPct, s.primaryIdReliabilityCiUpperPct) || '-'),
+                      h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, s.fallbackLevel === 'species' ? 'Species' : s.fallbackLevel === 'genus' ? 'Genus (fallback)' : 'Deployment (fallback)'),
+                      h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.reviewedSampleSize)
+                    ),
+                  ];
+                  if (isExpanded && confusion) {
+                    rows.push(h('tr', { key: s.species + '-detail' },
+                      h('td', { colSpan: 6, style: { padding: '4px 10px 12px 32px', borderBottom: '1px solid var(--border)', background: 'var(--bg-subtle, rgba(255,255,255,0.02))' } },
+                        h('div', { style: { fontSize: 10, color: 'var(--text-faint)', textTransform: 'uppercase', marginBottom: 4 } },
+                          `What ${confusion.reviewedSampleSize} reviewed "${s.species}" call(s) actually resolved to`),
+                        h('div', { style: { display: 'flex', flexDirection: 'column', gap: 3 } },
+                          confusion.breakdown.map((t) => h('div', { key: t.finalId, style: { display: 'flex', gap: 8, fontFamily: 'var(--font-mono)', fontSize: 12 } },
+                            h('span', { style: { minWidth: 160, color: t.isPrimaryRetained ? 'var(--text-muted)' : 'inherit' } }, t.isPrimaryRetained ? `${t.finalId} (correct)` : t.finalId),
+                            h('span', null, `${t.count} (${fmtNum(t.pct)}%)`)
+                          ))
+                        )
+                      )
+                    ));
+                  }
+                  return rows;
+                }))
               )
             )
           ),
           h('div', { className: 'card-sub', style: { marginTop: 4 } },
-            'Species with fewer than 10 judged calls of their own borrow a coarser estimate (genus, then whole deployment) rather than showing an unstable species-specific number - hover a row for the reason.')
+            'Species with fewer than 10 judged calls of their own borrow a coarser estimate (genus, then whole deployment) rather than showing an unstable species-specific number - hover a row for the reason. Click a row with an arrow to see what its reviewed calls actually resolved to.')
         ),
 
     h('div', { className: 'section-title' }, 'Survey effort'),
@@ -769,30 +806,58 @@ function StatisticsTab({ deployment, location }) {
       h(StatBox, { label: 'Nightly CV', value: fmtNum(activity.nightlyCv, 2) })
     ),
 
-    h('div', { className: 'section-title' }, 'Species'),
-    h('div', { className: 'stat-grid' },
-      h(StatBox, { label: 'Richness', value: species.richness }),
-      h(StatBox, { label: 'Dominant species', value: species.dominantSpecies ? species.dominantSpecies.species : '-' }),
-      h(StatBox, { label: 'Dominant %', value: species.dominantSpecies ? fmtNum(species.dominantSpecies.pct) + '%' : '-' })
-    ),
-    species.composition.length > 0 && h('div', { className: 'card', style: { marginTop: 12, padding: 0, overflow: 'hidden' } },
-      h('div', { style: { overflowX: 'auto' } },
-        h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
-          h('thead', null, h('tr', null,
-            ['Species', 'Count', '% of total', 'Active nights', 'Detection freq.'].map((c) => h('th', {
-              key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
-            }, c))
-          )),
-          h('tbody', null, species.composition.map((s) => h('tr', { key: s.species },
-            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, s.species),
-            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.count),
-            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(s.pct) + '%'),
-            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.activeNights),
-            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.detectionFrequencyPct != null ? fmtNum(s.detectionFrequencyPct) + '%' : '-')
-          )))
-        )
+    h('div', { className: 'section-title', style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
+      h('span', null, 'Species'),
+      h('div', { style: { display: 'flex', gap: 4 } },
+        h('button', {
+          className: 'btn btn-small ' + (speciesView === 'raw' ? 'btn-primary' : 'btn-secondary'),
+          onClick: () => setSpeciesView('raw'),
+        }, 'Raw'),
+        h('button', {
+          className: 'btn btn-small ' + (speciesView === 'qa-adjusted' ? 'btn-primary' : 'btn-secondary'),
+          onClick: () => setSpeciesView('qa-adjusted'),
+        }, 'QA-adjusted')
       )
     ),
+    speciesView === 'qa-adjusted' && h('div', { className: 'card-sub', style: { marginBottom: 8 } },
+      "Still-unreviewed calls are redistributed using the confusion pattern from reviewed calls of the same BTO primary (e.g. if reviewed \"Leisler's Bat\" calls turned out mostly Serotine, unreviewed Leisler's calls are counted mostly toward Serotine here instead). Species without at least 10 reviewed calls of their own are left as raw counts - not enough evidence yet to trust a correction. First-cut estimate: assumes each species' reviewed sample generalises to its unreviewed calls in this deployment."),
+    (() => {
+      const activeSpecies = speciesView === 'qa-adjusted' ? speciesQaAdjusted : species;
+      const rows = activeSpecies.composition;
+      const valueLabel = speciesView === 'qa-adjusted' ? 'Est. count' : 'Count';
+      return h(React.Fragment, null,
+        h('div', { className: 'stat-grid' },
+          h(StatBox, { label: 'Richness', value: activeSpecies.richness }),
+          h(StatBox, { label: 'Dominant species', value: activeSpecies.dominantSpecies ? activeSpecies.dominantSpecies.species : '-' }),
+          h(StatBox, { label: 'Dominant %', value: activeSpecies.dominantSpecies ? fmtNum(activeSpecies.dominantSpecies.pct) + '%' : '-' })
+        ),
+        rows.length > 0 && h('div', { className: 'card', style: { marginTop: 12, padding: 0, overflow: 'hidden' } },
+          h('div', { style: { overflowX: 'auto' } },
+            h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
+              h('thead', null, h('tr', null,
+                ['Species', valueLabel, '% of total', 'Active nights', 'Detection freq.'].map((c) => h('th', {
+                  key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
+                }, c))
+              )),
+              h('tbody', null, rows.map((s) => h('tr', { key: s.species },
+                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } },
+                  s.species,
+                  speciesView === 'qa-adjusted' && s.ownCallsReassigned
+                    ? h('span', { style: { color: 'var(--text-faint)', fontSize: 10, marginLeft: 6 }, title: 'Unreviewed calls with this BTO primary were mostly reassigned to other species' }, '(reassigned away)')
+                    : null,
+                  speciesView === 'qa-adjusted' && s.receivedReassignedCalls
+                    ? h('span', { style: { color: 'var(--text-faint)', fontSize: 10, marginLeft: 6 }, title: 'Includes calls reassigned here from a different BTO primary' }, '(gained calls)')
+                    : null),
+                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, speciesView === 'qa-adjusted' ? fmtNum(s.weight, 1) : s.count),
+                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(s.pct) + '%'),
+                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.activeNights),
+                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.detectionFrequencyPct != null ? fmtNum(s.detectionFrequencyPct) + '%' : '-')
+              )))
+            )
+          )
+        )
+      );
+    })(),
 
     h('div', { className: 'section-title' }, 'Timing'),
     h('div', { className: 'card-sub', style: { marginBottom: 8 } },

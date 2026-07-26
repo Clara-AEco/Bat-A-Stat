@@ -272,6 +272,7 @@ window.BatID = window.BatID || {};
     const dataset = buildAnalysisDataset(deployment.detectionEvents || []);
     const effort = computeEffortStats(deployment, dataset);
     const events = deployment.detectionEvents || [];
+    const confusionBreakdown = computeConfusionBreakdown(events);
     return {
       dataset,
       totalDetectionEvents: events.length,
@@ -279,10 +280,12 @@ window.BatID = window.BatID || {};
       effort,
       activity: computeActivityStats(dataset, effort),
       species: computeSpeciesStats(dataset),
+      speciesQaAdjusted: computeSpeciesStatsQaAdjusted(dataset, confusionBreakdown),
       timing: computeTimingStats(dataset, location),
       reliability: computeReliabilityStats(events, knownBatSpeciesNames),
       reliabilityByProbabilityBand: computeReliabilityByProbabilityBand(events, knownBatSpeciesNames),
       reliabilityBySpecies: computeReliabilityBySpecies(events, knownBatSpeciesNames),
+      confusionBreakdown,
     };
   }
 
@@ -473,16 +476,126 @@ window.BatID = window.BatID || {};
     }).sort((a, b) => b.reviewedSampleSize - a.reviewedSampleSize);
   }
 
+  // For each BTO-primary species, what did manually reviewed calls with that primary actually
+  // resolve to (including staying correct)? This is the piece reliability alone can't show: a 0%
+  // reliability figure says BTO's primary was wrong, not what it should have been instead. If one
+  // alternate ID dominates the breakdown (e.g. 96% of reviewed "Leisler's Bat" calls turned out to
+  // be Serotine), that's the evidence needed to judge whether bulk-relabelling the rest is safe;
+  // if it's scattered across several corrections, it isn't. Feeds both the Statistics tab's
+  // per-species drill-down and the QA-adjusted species estimate below.
+  function computeConfusionBreakdown(events) {
+    const reviewed = (events || []).filter((ev) => ev.manualReview && ev.manualReview.reviewed && ev.primaryBtoId);
+    const bySpecies = new Map();
+    for (const ev of reviewed) {
+      const primary = ev.primaryBtoId.englishName || ev.primaryBtoId.species;
+      const finalId = ev.manualReview.finalId;
+      if (!bySpecies.has(primary)) bySpecies.set(primary, new Map());
+      const targets = bySpecies.get(primary);
+      targets.set(finalId, (targets.get(finalId) || 0) + 1);
+    }
+    return Array.from(bySpecies.entries()).map(([species, targets]) => {
+      const total = Array.from(targets.values()).reduce((a, b) => a + b, 0);
+      const breakdown = Array.from(targets.entries())
+        .map(([finalId, count]) => ({ finalId, count, pct: (count / total) * 100, isPrimaryRetained: finalId === species }))
+        .sort((a, b) => b.count - a.count);
+      return { species, reviewedSampleSize: total, breakdown };
+    }).sort((a, b) => b.reviewedSampleSize - a.reviewedSampleSize);
+  }
+
+  // Stage 4: Raw vs QA-adjusted species composition. Raw (computeSpeciesStats, above - what's used
+  // everywhere else in the app) takes every still-unreviewed event's BTO primary at face value.
+  // QA-adjusted goes a step further for species with enough reviewed calls to trust a correction:
+  // each unreviewed event's single count is redistributed across computeConfusionBreakdown's
+  // targets in the same proportions reviewed calls with that primary actually turned out to be -
+  // e.g. if 96% of reviewed "Leisler's Bat" calls were actually Serotine, an unreviewed Leisler's
+  // call contributes 0.96 to Serotine and 0.04 to Leisler's, rather than 1 full count to Leisler's.
+  // Species/primaries with fewer than minSample reviewed calls are left entirely as raw ("low-
+  // frequency species handling") - there isn't enough evidence yet to trust a correction, and
+  // guessing one would just swap one kind of error for another.
+  //
+  // Caveat (documented, not hidden): this assumes a species' reviewed-call confusion pattern
+  // generalises to that species' still-unreviewed calls in this deployment. Because the QA profile
+  // samples more heavily at low BTO confidence, that assumption is weakest exactly where the
+  // correction matters most - cross-check the by-probability-band reliability before trusting a
+  // QA-adjusted figure for a species whose reviewed sample skews toward one confidence band.
+  function computeSpeciesStatsQaAdjusted(dataset, confusionBreakdown, minSample) {
+    minSample = minSample || MIN_RELIABLE_SAMPLE;
+    const confusionBySpecies = new Map((confusionBreakdown || []).map((c) => [c.species, c]));
+    const weights = {};
+    const nightsBySpecies = {};
+    // Two distinct reasons a species' QA-adjusted number can differ from its raw one - worth
+    // showing separately since they read differently: "ownCallsReassigned" means this species'
+    // own unreviewed calls turned out to mostly be something else (its count likely dropped);
+    // "receivedReassignedCalls" means it gained calls that were originally a different BTO primary
+    // (its count likely rose). A species can be both at once.
+    const ownCallsReassigned = new Set();
+    const receivedReassignedCalls = new Set();
+    const unadjustedLowSampleSpeciesNames = new Set();
+
+    function addWeight(species, w, surveyDate) {
+      weights[species] = (weights[species] || 0) + w;
+      if (surveyDate) {
+        nightsBySpecies[species] = nightsBySpecies[species] || new Set();
+        nightsBySpecies[species].add(surveyDate);
+      }
+    }
+
+    for (const row of dataset) {
+      if (row.category !== 'bat') continue;
+      if (row.source !== 'primary-bto') {
+        // Already the reviewer's own finding (manual or manual-additional) - nothing to adjust.
+        addWeight(row.finalId, 1, row.surveyDate);
+        continue;
+      }
+      const confusion = confusionBySpecies.get(row.finalId);
+      if (!confusion || confusion.reviewedSampleSize < minSample) {
+        unadjustedLowSampleSpeciesNames.add(row.finalId);
+        addWeight(row.finalId, 1, row.surveyDate);
+        continue;
+      }
+      const retained = confusion.breakdown.find((t) => t.finalId === row.finalId);
+      if (!retained || retained.pct < 100) ownCallsReassigned.add(row.finalId);
+      for (const target of confusion.breakdown) {
+        if (target.pct <= 0) continue;
+        addWeight(target.finalId, target.pct / 100, row.surveyDate);
+        if (target.finalId !== row.finalId) receivedReassignedCalls.add(target.finalId);
+      }
+    }
+
+    const totalNightsInData = new Set(dataset.filter((d) => d.category === 'bat').map((d) => d.surveyDate).filter(Boolean)).size;
+    const totalWeight = Object.values(weights).reduce((a, b) => a + b, 0);
+    const composition = Object.entries(weights)
+      .map(([species, weight]) => ({
+        species, weight,
+        pct: totalWeight ? (weight / totalWeight) * 100 : 0,
+        activeNights: nightsBySpecies[species] ? nightsBySpecies[species].size : 0,
+        detectionFrequencyPct: totalNightsInData && nightsBySpecies[species] ? (nightsBySpecies[species].size / totalNightsInData) * 100 : null,
+        ownCallsReassigned: ownCallsReassigned.has(species),
+        receivedReassignedCalls: receivedReassignedCalls.has(species),
+      }))
+      .sort((a, b) => b.weight - a.weight);
+
+    return {
+      richness: composition.length,
+      totalWeight,
+      composition,
+      dominantSpecies: composition[0] || null,
+      unadjustedLowSampleSpeciesNames: Array.from(unadjustedLowSampleSpeciesNames),
+    };
+  }
+
   ns.Stats = {
     buildAnalysisDataset,
     computeEffortStats,
     suggestValidRecordingHours,
     computeActivityStats,
     computeSpeciesStats,
+    computeSpeciesStatsQaAdjusted,
     computeTimingStats,
     computeReliabilityStats,
     computeReliabilityByProbabilityBand,
     computeReliabilityBySpecies,
+    computeConfusionBreakdown,
     computeAllStats,
     mean, median, stdDev, percentile, wilsonInterval,
   };
