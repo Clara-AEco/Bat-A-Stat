@@ -225,6 +225,48 @@ window.BatID = window.BatID || {};
     };
   }
 
+  // Stage 5 (Level 1A): nightly variation within a single deployment - a richer per-night view than
+  // Activity's plain nightly counts (above), pairing each night's activity total with its own
+  // richness and dominant species, and flagging nights whose total activity is a statistical
+  // outlier against the rest of the deployment (|z-score| >= 2) - useful for catching a single
+  // anomalous night (storm, detector fault, unusually warm night) before it skews a headline mean.
+  function computeNightlyStats(dataset) {
+    const activityRows = dataset.filter((d) => d.category === 'bat' || d.category === 'unidentified');
+    const batRows = dataset.filter((d) => d.category === 'bat');
+    const nights = Array.from(new Set(dataset.map((d) => d.surveyDate).filter(Boolean))).sort();
+
+    const perNight = nights.map((night) => {
+      const nightActivity = activityRows.filter((d) => d.surveyDate === night);
+      const nightBat = batRows.filter((d) => d.surveyDate === night);
+      const counts = {};
+      for (const d of nightBat) counts[d.finalId] = (counts[d.finalId] || 0) + 1;
+      const composition = Object.entries(counts).map(([species, count]) => ({ species, count })).sort((a, b) => b.count - a.count);
+      return {
+        surveyDate: night,
+        totalDetections: nightActivity.length,
+        batDetections: nightBat.length,
+        richness: composition.length,
+        dominantSpecies: composition[0] ? composition[0].species : null,
+        dominantCount: composition[0] ? composition[0].count : null,
+      };
+    });
+
+    const totals = perNight.map((n) => n.totalDetections);
+    const avg = mean(totals);
+    const sd = stdDev(totals, avg);
+    for (const n of perNight) {
+      n.zScore = sd ? (n.totalDetections - avg) / sd : null;
+      n.isOutlier = n.zScore != null && Math.abs(n.zScore) >= 2;
+    }
+
+    return {
+      perNight,
+      nightlyMean: avg,
+      nightlySd: sd,
+      outlierNights: perNight.filter((n) => n.isOutlier),
+    };
+  }
+
   // First/last detection, peak activity windows, and cumulative-activity percentiles. Uses
   // sunset-relative hours when a Location's lat/lon is available (Sun.hoursRelativeToSunset),
   // falling back to raw clock time otherwise - sunset-relative is what actually makes activity
@@ -281,6 +323,7 @@ window.BatID = window.BatID || {};
       activity: computeActivityStats(dataset, effort),
       species: computeSpeciesStats(dataset),
       speciesQaAdjusted: computeSpeciesStatsQaAdjusted(dataset, confusionBreakdown),
+      nightly: computeNightlyStats(dataset),
       timing: computeTimingStats(dataset, location),
       reliability: computeReliabilityStats(events, knownBatSpeciesNames),
       reliabilityByProbabilityBand: computeReliabilityByProbabilityBand(events, knownBatSpeciesNames),
@@ -290,11 +333,11 @@ window.BatID = window.BatID || {};
   }
 
   // Below this many judged calls, a reliability percentage swings too wildly on one or two more
-  // reviews to stand on its own (e.g. 2/3 vs 3/3 is a 33-point jump) - Stage 3's fallback hierarchy
-  // (computeReliabilityBySpecies, below) uses this as the point where it stops trusting a level's
-  // own number and borrows the next coarser one instead. Not derived from anything statistical,
-  // just a practical judgement call - easy to change in one place if 10 turns out wrong in practice.
-  const MIN_RELIABLE_SAMPLE = 10;
+  // reviews to stand on its own - Stage 3's fallback hierarchy (computeReliabilityBySpecies, below)
+  // and Stage 4's QA-adjusted redistribution (computeSpeciesStatsQaAdjusted) both use this as the
+  // point where they stop trusting a level's own number and borrow a coarser one instead. Raised
+  // from 10 to 50 per Clara's call - 10 wasn't a large enough sample to trust a correction against.
+  const MIN_RELIABLE_SAMPLE = 50;
 
   // First cut at "how good is BTO's own primary identification, given what manual review actually
   // found" - the three headline measures from Clara's QA-reliability spec. Only counts reviewed
@@ -591,6 +634,7 @@ window.BatID = window.BatID || {};
     computeActivityStats,
     computeSpeciesStats,
     computeSpeciesStatsQaAdjusted,
+    computeNightlyStats,
     computeTimingStats,
     computeReliabilityStats,
     computeReliabilityByProbabilityBand,
