@@ -250,6 +250,14 @@ window.BatID = window.BatID || {};
     for (let i = 1; i < powerSum.length; i++) if (powerSum[i] > powerSum[peakBinRel]) peakBinRel = i;
     const peakFreqHz = spec.freqs[binFrom + peakBinRel];
 
+    // Power spectrum (dB vs frequency) across the box's own frequency range, for the analyst to
+    // visually confirm/read Peak Frequency themselves - the automated reading above is a
+    // suggestion, not a substitute for looking at the actual curve.
+    const powerSpectrum = [];
+    for (let i = 0; i < powerSum.length; i++) {
+      powerSpectrum.push({ freqHz: spec.freqs[binFrom + i], db: 10 * Math.log10(powerSum[i] + 1e-12) });
+    }
+
     // Start/End frequency: the top (start) and bottom (end) of the call itself - for a typical FM
     // sweep, start is the highest point (where the call begins) and end is the lowest (the qCF/CF
     // tail). Max/Min frequency (the box's own vertical extent) were removed entirely - on real
@@ -272,6 +280,7 @@ window.BatID = window.BatID || {};
       rawDurationMs,
       durationRefined,
       ridge,
+      powerSpectrum,
       peakDb,
       floorDb: activeFloor,
     };

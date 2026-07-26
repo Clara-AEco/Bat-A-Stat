@@ -1232,7 +1232,7 @@ function timeToPixel(t, view, width) {
   return range > 0 ? ((t - view.t0) / range) * width : 0;
 }
 
-function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box, onBoxChange, guidelines, partMarkers, measurement, onSelectPart }) {
+function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box, onBoxChange, guidelines, partMarkers, measurement, onSelectPart, captureMode, onCapture }) {
   const specCanvasRef = useRef(null);
   const oscCanvasRef = useRef(null);
   const dragRef = useRef(null);
@@ -1340,10 +1340,26 @@ function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box
   function handleMouseUp(e) {
     if (!dragRef.current) return;
     const p = localXY(e);
-    const x0 = Math.min(dragRef.current.x, p.x), x1 = Math.max(dragRef.current.x, p.x);
-    const y0 = Math.min(dragRef.current.y, p.y), y1 = Math.max(dragRef.current.y, p.y);
+    const start = dragRef.current;
     dragRef.current = null;
     setDragRect(null);
+
+    // Manual-measurement tools take over the same drag gesture when armed: a line drag reads a
+    // time span (Duration/IPI, ignoring Y - only the time delta matters), a point "click" (any
+    // drag, however small) reads the frequency at that Y. Neither touches the measurement box.
+    if (captureMode === 'duration-line' || captureMode === 'ipi-line') {
+      const ms = Math.abs(pixelToTime(p.x) - pixelToTime(start.x)) * 1000;
+      if (ms > 0 && onCapture) onCapture(captureMode, ms);
+      return;
+    }
+    if (captureMode === 'start-point' || captureMode === 'end-point') {
+      const freqHz = pixelToFreq((start.y + p.y) / 2);
+      if (onCapture) onCapture(captureMode, freqHz);
+      return;
+    }
+
+    const x0 = Math.min(start.x, p.x), x1 = Math.max(start.x, p.x);
+    const y0 = Math.min(start.y, p.y), y1 = Math.max(start.y, p.y);
     if (x1 - x0 < 3) return;
     const t0 = pixelToTime(x0), t1 = pixelToTime(x1);
     const f1 = pixelToFreq(y0), f0 = pixelToFreq(y1);
@@ -1371,9 +1387,9 @@ function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box
           key: kHz, style: { position: 'absolute', right: 6, top: freqToPixelY(kHz * 1000, sampleRate, SPEC_HEIGHT) - 6, fontSize: 10, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' },
         }, kHz))
       ),
-      h('div', { style: { position: 'relative', width: SONOGRAM_WIDTH, flexShrink: 0 } },
+      h('div', { style: { position: 'relative', width: SONOGRAM_WIDTH, flexShrink: 0, outline: captureMode ? '2px solid var(--accent)' : 'none', outlineOffset: -2 } },
         h('canvas', {
-          ref: specCanvasRef, style: { width: SONOGRAM_WIDTH, height: SPEC_HEIGHT, display: 'block', cursor: 'crosshair', borderRadius: '8px 8px 0 0', background: '#0a0c0e' },
+          ref: specCanvasRef, style: { width: SONOGRAM_WIDTH, height: SPEC_HEIGHT, display: 'block', cursor: captureMode ? 'copy' : 'crosshair', borderRadius: '8px 8px 0 0', background: '#0a0c0e' },
           onMouseDown: handleMouseDown, onMouseMove: handleMouseMove, onMouseUp: handleMouseUp,
           onMouseLeave: () => { dragRef.current = null; setDragRect(null); setHover(null); },
         }),
@@ -1438,6 +1454,88 @@ function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box
       h('span', { className: 'card-sub' }, 'Scroll to zoom (time axis)'),
       isZoomed && h('button', { className: 'btn btn-secondary btn-small', onClick: () => setView({ t0: 0, t1: spec.durationSec }) }, 'Reset zoom')
     )
+  );
+}
+
+const POWER_SPEC_WIDTH = 860, POWER_SPEC_HEIGHT = 130;
+
+// Power spectrum (dB vs frequency) for the boxed region - what BatSound/Kaleidoscope call the
+// "Power Spectrum", read by eye to confirm Peak Frequency. Click anywhere on the curve to set the
+// Peak Frequency override to that point - since this is the only reliable way to work out peak
+// energy by hand when the sonogram alone doesn't make it obvious.
+function PowerSpectrumChart({ powerSpectrum, onPickFreq }) {
+  const canvasRef = useRef(null);
+  const [hover, setHover] = useState(null);
+  const bounds = useMemo(() => {
+    if (!powerSpectrum || !powerSpectrum.length) return null;
+    let minF = Infinity, maxF = -Infinity, minDb = Infinity, maxDb = -Infinity;
+    for (const p of powerSpectrum) {
+      if (p.freqHz < minF) minF = p.freqHz;
+      if (p.freqHz > maxF) maxF = p.freqHz;
+      if (p.db < minDb) minDb = p.db;
+      if (p.db > maxDb) maxDb = p.db;
+    }
+    return { minF, maxF, minDb, maxDb: maxDb + (maxDb - minDb) * 0.08 };
+  }, [powerSpectrum]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !powerSpectrum || !bounds) return;
+    canvas.width = POWER_SPEC_WIDTH; canvas.height = POWER_SPEC_HEIGHT;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#0a0c0e';
+    ctx.fillRect(0, 0, POWER_SPEC_WIDTH, POWER_SPEC_HEIGHT);
+    const { minF, maxF, minDb, maxDb } = bounds;
+    const xFor = (f) => ((f - minF) / Math.max(1, maxF - minF)) * POWER_SPEC_WIDTH;
+    const yFor = (db) => POWER_SPEC_HEIGHT - ((db - minDb) / Math.max(1e-6, maxDb - minDb)) * POWER_SPEC_HEIGHT;
+    ctx.strokeStyle = '#4fb8a8';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    powerSpectrum.forEach((p, i) => {
+      const x = xFor(p.freqHz), y = yFor(p.db);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    // Mark the curve's own peak for reference.
+    let peak = powerSpectrum[0];
+    for (const p of powerSpectrum) if (p.db > peak.db) peak = p;
+    ctx.fillStyle = '#e8833a';
+    ctx.beginPath();
+    ctx.arc(xFor(peak.freqHz), yFor(peak.db), 3, 0, Math.PI * 2);
+    ctx.fill();
+  }, [powerSpectrum, bounds]);
+
+  if (!powerSpectrum || !powerSpectrum.length || !bounds) return null;
+  const { minF, maxF, minDb, maxDb } = bounds;
+
+  function xyToFreq(x) {
+    return minF + (x / POWER_SPEC_WIDTH) * (maxF - minF);
+  }
+  function localX(e) {
+    const rect = canvasRef.current.getBoundingClientRect();
+    return Math.max(0, Math.min(POWER_SPEC_WIDTH, (e.clientX - rect.left) * (POWER_SPEC_WIDTH / rect.width)));
+  }
+
+  return h('div', { style: { marginTop: 10 } },
+    h('div', { className: 'card-sub', style: { marginBottom: 4 } }, 'Power spectrum (dB vs frequency) - click the curve to set Peak Frequency:'),
+    h('div', { style: { position: 'relative', width: POWER_SPEC_WIDTH, maxWidth: '100%' } },
+      h('canvas', {
+        ref: canvasRef,
+        style: { width: '100%', height: POWER_SPEC_HEIGHT, display: 'block', cursor: 'crosshair', borderRadius: 8, background: '#0a0c0e' },
+        onMouseMove: (e) => { const x = localX(e); setHover({ x, freqHz: xyToFreq(x) }); },
+        onMouseLeave: () => setHover(null),
+        onClick: (e) => { const x = localX(e); if (onPickFreq) onPickFreq(xyToFreq(x)); },
+      }),
+      hover && h('div', {
+        style: {
+          position: 'absolute', left: Math.min(hover.x + 8, POWER_SPEC_WIDTH - 90), top: 6,
+          background: 'rgba(10,12,14,0.9)', border: '1px solid var(--border)', borderRadius: 4, padding: '2px 6px',
+          fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text)', pointerEvents: 'none', whiteSpace: 'nowrap',
+        },
+      }, `${(hover.freqHz / 1000).toFixed(1)} kHz`)
+    ),
+    h('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)' } },
+      h('span', null, `${(minF / 1000).toFixed(0)} kHz`), h('span', null, `${(maxF / 1000).toFixed(0)} kHz`))
   );
 }
 
@@ -1605,6 +1703,33 @@ const QA_REASON_LABELS = {
   'not-selected': 'Not in queue',
 };
 
+// One hand-editable measurement field, optionally with a capture-tool toggle button (🎯 click a
+// point on the sonogram, 📏 drag a line across it) that arms Sonogram's capture mode for this
+// field. Compact by design - Clara's own request after the previous read-only stat-box grid ate
+// too much space for what's now a hands-on measuring workflow.
+function MeasureField({ label, value, unit, onChange, tool, active, onToggleTool }) {
+  return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
+    h('label', { style: { fontSize: 10, color: 'var(--text-faint)', textTransform: 'uppercase', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 4 } },
+      h('span', null, label),
+      tool && h('button', {
+        onClick: onToggleTool, title: tool.title, type: 'button',
+        style: {
+          background: active ? 'var(--accent)' : 'none', border: '1px solid var(--border)', borderRadius: 4,
+          cursor: 'pointer', fontSize: 11, lineHeight: 1, padding: '2px 4px', color: active ? 'var(--accent-text)' : 'var(--text-faint)',
+        },
+      }, tool.icon)
+    ),
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 4 } },
+      h('input', {
+        type: 'number', step: 'any', value: value == null ? '' : value,
+        onChange: (e) => onChange(e.target.value === '' ? null : Number(e.target.value)),
+        style: { width: 68, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)', padding: '5px 6px', fontSize: 13, fontFamily: 'var(--font-mono)' },
+      }),
+      h('span', { style: { fontSize: 11, color: 'var(--text-faint)' } }, unit)
+    )
+  );
+}
+
 function ReviewTab({ deployment, onPatchEvent, onAddManualEvent, wavFileMap, setWavFileMap, customLabels, onAddCustomLabel }) {
   const allEvents = deployment.detectionEvents || [];
   const profile = deployment.qaProfile || DEFAULT_QA_PROFILE;
@@ -1716,31 +1841,69 @@ function ReviewTab({ deployment, onPatchEvent, onAddManualEvent, wavFileMap, set
 
   const [box, setBox] = useState(null);
   const [shapeOverride, setShapeOverride] = useState(null);
-  useEffect(() => { setBox(null); setShapeOverride(null); }, [currentEvent && currentEvent.id]);
+  // Hand-entered measurements always win over the automated suggestion below - the automated
+  // reading turned out too unreliable on real recordings to trust blindly (see dsp.js), so the
+  // workflow is now "measure by hand, using the auto reading only as a rough starting point".
+  // Stored in the same units as the automated fields (Hz/ms) and persisted onto the event's own
+  // manualReview.sonogramAnalysis once a Final ID is set, so returning to a reviewed call restores
+  // exactly what was measured rather than starting blank.
+  const [overrides, setOverrides] = useState({});
+  const [captureMode, setCaptureMode] = useState(null); // null | 'start-point' | 'end-point' | 'duration-line' | 'ipi-line'
+  useEffect(() => {
+    setBox(null);
+    setCaptureMode(null);
+    const saved = currentEvent && currentEvent.manualReview && currentEvent.manualReview.sonogramAnalysis;
+    setOverrides(saved && saved.measurements ? { ...saved.measurements } : {});
+    setShapeOverride(saved ? saved.shape : null);
+  }, [currentEvent && currentEvent.id]);
 
   const measurement = useMemo(
-    // floorDb (the "Brightness" slider) drives what counts as part of the call for max/min/
-    // start/end frequency too, so raising Brightness to reveal a faint high-frequency onset also
-    // raises what gets measured - no separate hidden threshold to fight against.
+    // floorDb (the "Brightness" slider) drives what counts as part of the call for start/end
+    // frequency too, so raising Brightness to reveal a faint high-frequency onset also raises
+    // what gets measured - no separate hidden threshold to fight against.
     () => (box && spec && decodedWav ? Dsp.measureBox(spec, decodedWav.samples, decodedWav.sampleRate, box, floorDb) : null),
     [box, spec, decodedWav, floorDb]
   );
   const shapeAuto = useMemo(() => (measurement ? Dsp.classifyShape(measurement.ridge) : null), [measurement]);
   const finalShape = shapeOverride || (shapeAuto && shapeAuto.shape) || null;
 
+  // Effective value for each field: hand-entered override first, automated suggestion otherwise.
+  const effective = {
+    peakFreqHz: overrides.peakFreqHz != null ? overrides.peakFreqHz : (measurement ? measurement.peakFreqHz : null),
+    startFreqHz: overrides.startFreqHz != null ? overrides.startFreqHz : (measurement ? measurement.startFreqHz : null),
+    endFreqHz: overrides.endFreqHz != null ? overrides.endFreqHz : (measurement ? measurement.endFreqHz : null),
+    durationMs: overrides.durationMs != null ? overrides.durationMs : (measurement ? measurement.durationMs : null),
+    ipiMs: overrides.ipiMs != null ? overrides.ipiMs : null, // never automated - hand-measured only
+  };
+  function setOverrideKHz(field, kHz) {
+    setOverrides((o) => ({ ...o, [field]: kHz == null ? null : kHz * 1000 }));
+  }
+  function setOverrideMs(field, ms) {
+    setOverrides((o) => ({ ...o, [field]: ms }));
+  }
+  // Draw-line (Duration/IPI) and click-point (Start/End) capture from the sonogram - one-shot,
+  // arming the tool again is a deliberate re-click so a stray drag afterwards can't overwrite it.
+  function handleCapture(mode, value) {
+    if (mode === 'duration-line') setOverrideMs('durationMs', +value.toFixed(2));
+    else if (mode === 'ipi-line') setOverrideMs('ipiMs', +value.toFixed(2));
+    else if (mode === 'start-point') setOverrideKHz('startFreqHz', +(value / 1000).toFixed(2));
+    else if (mode === 'end-point') setOverrideKHz('endFreqHz', +(value / 1000).toFixed(2));
+    setCaptureMode(null);
+  }
+  function toggleCapture(mode) {
+    setCaptureMode((m) => (m === mode ? null : mode));
+  }
+
   const speciesResults = useMemo(() => {
-    if (!measurement) return [];
-    // Interpulse interval isn't measured yet - reliably identifying individual pulses on real
-    // (noisy) field recordings turned out to need more than a simple amplitude threshold, so it's
-    // parked rather than shipped with numbers that don't represent real pulses.
+    if (effective.peakFreqHz == null && effective.startFreqHz == null && effective.endFreqHz == null && effective.durationMs == null) return [];
     return SpeciesData.scoreSpecies({
-      peak: measurement.peakFreqHz != null ? measurement.peakFreqHz / 1000 : null,
-      start: measurement.startFreqHz != null ? measurement.startFreqHz / 1000 : null,
-      end: measurement.endFreqHz != null ? measurement.endFreqHz / 1000 : null,
-      duration: measurement.durationMs,
-      ipi: null,
+      peak: effective.peakFreqHz != null ? effective.peakFreqHz / 1000 : null,
+      start: effective.startFreqHz != null ? effective.startFreqHz / 1000 : null,
+      end: effective.endFreqHz != null ? effective.endFreqHz / 1000 : null,
+      duration: effective.durationMs,
+      ipi: effective.ipiMs,
     }, finalShape);
-  }, [measurement, finalShape]);
+  }, [effective.peakFreqHz, effective.startFreqHz, effective.endFreqHz, effective.durationMs, effective.ipiMs, finalShape]);
 
   const speciesCounts = useMemo(() => computeSpeciesCounts(allEvents), [allEvents]);
   const btoQuickSpecies = Object.entries(speciesCounts).filter(([label]) => label !== 'Noise / No ID')
@@ -1762,7 +1925,10 @@ function ReviewTab({ deployment, onPatchEvent, onAddManualEvent, wavFileMap, set
   function setFinalId(label) {
     if (!currentEvent) return;
     onPatchEvent(currentEvent.id, {
-      manualReview: { ...currentEvent.manualReview, reviewed: true, finalId: label, reviewedAt: new Date().toISOString() },
+      manualReview: {
+        ...currentEvent.manualReview, reviewed: true, finalId: label, reviewedAt: new Date().toISOString(),
+        sonogramAnalysis: { measurements: effective, shape: finalShape },
+      },
     });
     goTo(currentIndex + 1);
   }
@@ -1861,27 +2027,66 @@ function ReviewTab({ deployment, onPatchEvent, onAddManualEvent, wavFileMap, set
               },
             })
           ),
-          h(Sonogram, { spec, samples: decodedWav.samples, sampleRate: decodedWav.sampleRate, floorDb, rangeDb, saturation, box, onBoxChange: setBox, guidelines, partMarkers, measurement, onSelectPart: (eventId) => setCurrentId(eventId) }),
-          h('div', { className: 'card-sub', style: { marginTop: 6 } }, 'Drag to box a call and measure it - scroll to zoom the time axis.'),
+          h(Sonogram, {
+            spec, samples: decodedWav.samples, sampleRate: decodedWav.sampleRate, floorDb, rangeDb, saturation, box, onBoxChange: setBox,
+            guidelines, partMarkers, onSelectPart: (eventId) => setCurrentId(eventId), captureMode, onCapture: handleCapture,
+            // Decorations reflect the effective (possibly hand-overridden) Start/End, not the raw
+            // automated reading - what's drawn on the sonogram should always match the input fields.
+            measurement: measurement && { ...measurement, startFreqHz: effective.startFreqHz, endFreqHz: effective.endFreqHz },
+          }),
+          h('div', { className: 'card-sub', style: { marginTop: 6 } },
+            captureMode
+              ? ({
+                  'duration-line': '📏 Drag across the call to measure Duration.',
+                  'ipi-line': '📏 Drag from one pulse to the next to measure the interpulse interval.',
+                  'start-point': '🎯 Click the top/start of the call to read Start Freq.',
+                  'end-point': '🎯 Click the bottom/end of the call to read End Freq.',
+                }[captureMode])
+              : 'Drag to box a call (for the automated suggestion below) - scroll to zoom the time axis.'),
           spec.truncated && h('div', { className: 'card-sub', style: { marginTop: 4, color: 'var(--accent)' } },
             `This recording is longer than ${Dsp.MAX_ANALYSIS_DURATION_SEC || 30}s - showing the first ${Math.round(spec.durationSec)}s only.`),
-          h(AudioPlayback, { samples: decodedWav.samples, sampleRate: decodedWav.sampleRate, box })
+          h(AudioPlayback, { samples: decodedWav.samples, sampleRate: decodedWav.sampleRate, box }),
+          measurement && h(PowerSpectrumChart, { powerSpectrum: measurement.powerSpectrum, onPickFreq: (hz) => setOverrideKHz('peakFreqHz', +(hz / 1000).toFixed(2)) })
         ),
 
-        measurement && h('div', { className: 'card', style: { marginTop: 14 } },
-          h('div', { className: 'stat-grid' },
-            h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Peak freq'), h('div', { className: 'stat-box-value' }, measurement.peakFreqHz != null ? (measurement.peakFreqHz / 1000).toFixed(1) + ' kHz' : '-')),
-            h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Start freq'), h('div', { className: 'stat-box-value' }, measurement.startFreqHz != null ? (measurement.startFreqHz / 1000).toFixed(1) + ' kHz' : '-')),
-            h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'End freq'), h('div', { className: 'stat-box-value' }, measurement.endFreqHz != null ? (measurement.endFreqHz / 1000).toFixed(1) + ' kHz' : '-')),
-            h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Duration'), h('div', { className: 'stat-box-value' }, measurement.durationMs.toFixed(1) + ' ms' + (measurement.durationRefined ? '' : ' (raw)')))
-          ),
-          h('div', { style: { marginTop: 10, display: 'flex', alignItems: 'center', gap: 10 } },
-            h('span', { style: { fontSize: 12, color: 'var(--text-muted)' } }, 'Shape:'),
-            h('select', {
-              value: finalShape || '', onChange: (e) => setShapeOverride(e.target.value),
-              style: { background: 'var(--bg-card)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 6, padding: '4px 8px' },
-            }, SpeciesData.SHAPE_LABELS.map((s) => h('option', { key: s, value: s }, s))),
-            shapeAuto && !shapeOverride && h('span', { className: 'pill' }, `auto-suggested (${Math.round(shapeAuto.confidence * 100)}%)`)
+        h('div', { className: 'card', style: { marginTop: 14, padding: 12 } },
+          h('div', { className: 'card-sub', style: { marginBottom: 8 } },
+            'Hand-measured values always win over the automated suggestion (shown until you enter your own). Use the 🎯/📏 tools to read straight off the sonogram.'),
+          h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'flex-end' } },
+            h(MeasureField, {
+              label: 'Peak freq', unit: 'kHz', value: effective.peakFreqHz != null ? +(effective.peakFreqHz / 1000).toFixed(2) : null,
+              onChange: (v) => setOverrideKHz('peakFreqHz', v),
+            }),
+            h(MeasureField, {
+              label: 'Start freq', unit: 'kHz', value: effective.startFreqHz != null ? +(effective.startFreqHz / 1000).toFixed(2) : null,
+              onChange: (v) => setOverrideKHz('startFreqHz', v),
+              tool: { icon: '🎯', title: 'Click point: click the sonogram at the start of the call' }, active: captureMode === 'start-point', onToggleTool: () => toggleCapture('start-point'),
+            }),
+            h(MeasureField, {
+              label: 'End freq', unit: 'kHz', value: effective.endFreqHz != null ? +(effective.endFreqHz / 1000).toFixed(2) : null,
+              onChange: (v) => setOverrideKHz('endFreqHz', v),
+              tool: { icon: '🎯', title: 'Click point: click the sonogram at the end of the call' }, active: captureMode === 'end-point', onToggleTool: () => toggleCapture('end-point'),
+            }),
+            h(MeasureField, {
+              label: 'Duration', unit: 'ms', value: effective.durationMs != null ? +effective.durationMs.toFixed(2) : null,
+              onChange: (v) => setOverrideMs('durationMs', v),
+              tool: { icon: '📏', title: 'Draw line: drag across the call on the sonogram' }, active: captureMode === 'duration-line', onToggleTool: () => toggleCapture('duration-line'),
+            }),
+            h(MeasureField, {
+              label: 'IPI', unit: 'ms', value: effective.ipiMs != null ? +effective.ipiMs.toFixed(2) : null,
+              onChange: (v) => setOverrideMs('ipiMs', v),
+              tool: { icon: '📏', title: 'Draw line: drag from one pulse to the next' }, active: captureMode === 'ipi-line', onToggleTool: () => toggleCapture('ipi-line'),
+            }),
+            h('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
+              h('label', { style: { fontSize: 10, color: 'var(--text-faint)', textTransform: 'uppercase' } }, 'Shape'),
+              h('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+                h('select', {
+                  value: finalShape || '', onChange: (e) => setShapeOverride(e.target.value),
+                  style: { background: 'var(--bg-card)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 6, padding: '5px 6px', fontSize: 13 },
+                }, SpeciesData.SHAPE_LABELS.map((s) => h('option', { key: s, value: s }, s))),
+                shapeAuto && !shapeOverride && h('span', { className: 'pill' }, `auto (${Math.round(shapeAuto.confidence * 100)}%)`)
+              )
+            )
           )
         )
       ),
@@ -1914,12 +2119,12 @@ function ReviewTab({ deployment, onPatchEvent, onAddManualEvent, wavFileMap, set
           h('div', { style: { overflowX: 'auto' } },
             h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 11 } },
               h('thead', null, h('tr', null,
-                ['Species', 'Score', 'Shape', 'Peak', 'Dur.', 'Start', 'End'].map((c) => h('th', { key: c, style: { textAlign: 'left', padding: '4px 8px', color: 'var(--text-faint)', fontSize: 9, textTransform: 'uppercase', whiteSpace: 'nowrap' } }, c))
+                ['Species', 'Score', 'Shape', 'Peak', 'Dur.', 'IPI', 'Start', 'End'].map((c) => h('th', { key: c, style: { textAlign: 'left', padding: '4px 8px', color: 'var(--text-faint)', fontSize: 9, textTransform: 'uppercase', whiteSpace: 'nowrap' } }, c))
               )),
               h('tbody', null, speciesResults.slice(0, 6).map((res) => h('tr', { key: res.species.name },
                 h('td', { style: { padding: '4px 8px', borderTop: '1px solid var(--border)', whiteSpace: 'nowrap' } }, res.species.name),
                 h('td', { style: { padding: '4px 8px', borderTop: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, `${Math.round(res.score * 100)}%`),
-                ...['shape', 'peak', 'duration', 'start', 'end'].map((k) => h('td', {
+                ...['shape', 'peak', 'duration', 'ipi', 'start', 'end'].map((k) => h('td', {
                   key: k, style: { padding: '4px 8px', borderTop: '1px solid var(--border)', color: res.checks[k] === true ? 'var(--teal)' : res.checks[k] === false ? 'var(--danger)' : 'var(--text-faint)' },
                 }, res.checks[k] === true ? '✓' : res.checks[k] === false ? '✗' : '-'))
               )))
