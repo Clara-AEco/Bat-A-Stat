@@ -769,6 +769,16 @@ function QaTab({ deployment, onPatch, wavFileMap, setWavFileMap, onGoToReview })
       "Selecting a folder includes every WAV file in its subfolders automatically - handy since some detectors split each survey night into its own folder and others dump everything in one. Loaded once here, it's available in Manual Review too."),
 
     h('div', { className: 'section-title' }, 'Review queue rules'),
+    h('div', { className: 'card', style: { marginBottom: 16, fontSize: 12, color: 'var(--text-muted)' } },
+      h('div', { style: { fontWeight: 600, marginBottom: 6, color: 'var(--text)' } }, "What does BTO itself recommend?"),
+      h('div', null,
+        "BTO's Acoustic Pipeline groups its own results by confidence: identifications below 50% probability are recommended to be discarded or checked (this app's ",
+        h('strong', null, '50% default threshold'),
+        ' matches that exactly); below 10% ("Folder 2") BTO recommends discarding outright unless you specifically want peace of mind that nothing usable is being missed; and for very large single-species volumes (tens of thousands of calls), BTO suggests auditing a random sample of up to ',
+        h('strong', null, '1,000 recordings'),
+        ' is enough for a robust error-rate estimate, rather than a fixed percentage. None of that is enforced automatically here - this app never silently drops a detection - but it\'s worth keeping in mind when you set the sample % and threshold below.'
+      )
+    ),
     h('div', { className: 'field-row' },
       h(Field, { label: 'Random sample % (everything else)' },
         h('input', { type: 'number', min: 0, max: 100, value: profile.samplePercent, onChange: (e) => patchProfile({ samplePercent: Number(e.target.value) }) })),
@@ -808,23 +818,41 @@ function QaTab({ deployment, onPatch, wavFileMap, setWavFileMap, onGoToReview })
       h('button', { className: 'btn btn-secondary btn-small', disabled: !newThresholdSpecies.trim(), onClick: addSpeciesThreshold }, 'Add')
     ),
 
-    h('div', { className: 'section-title' }, 'Species requiring 100% review'),
-    h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 } },
-      profile.speciesRequiring100Percent.length === 0 && h('span', { className: 'card-sub' }, 'None set - add species below (e.g. rare or easily-confused species).'),
-      profile.speciesRequiring100Percent.map((s) => h('span', {
+    h('div', { className: 'section-title' }, 'Full QA species (always 100% reviewed)'),
+    h('div', { className: 'card-sub', style: { marginBottom: 10 } },
+      'Tick any species BTO reported for this deployment that should always be fully reviewed, regardless of probability or the random sample - typically rare, protected, or easily-confused species. Everything else falls back to the threshold and sample rules above.'),
+    speciesList.length === 0
+      ? h('div', { className: 'card-sub', style: { marginBottom: 10 } }, "Import a BTO CSV first to see this deployment's own species list here.")
+      : h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '8px 18px', marginBottom: 10 } },
+          speciesList.map((s) => h('label', { key: s, style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 } },
+            h('input', {
+              type: 'checkbox', checked: profile.speciesRequiring100Percent.includes(s),
+              onChange: (e) => patchProfile({
+                speciesRequiring100Percent: e.target.checked
+                  ? [...profile.speciesRequiring100Percent, s]
+                  : profile.speciesRequiring100Percent.filter((x) => x !== s),
+              }),
+            }),
+            s
+          ))
+        ),
+    profile.speciesRequiring100Percent.some((s) => !speciesList.includes(s)) && h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 } },
+      h('span', { className: 'card-sub', style: { width: '100%' } }, "Also set, but not (yet) in this deployment's own results:"),
+      profile.speciesRequiring100Percent.filter((s) => !speciesList.includes(s)).map((s) => h('span', {
         key: s, className: 'pill', style: { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '5px 10px' },
       }, s, h('button', {
         onClick: () => removeRequiredSpecies(s),
         style: { background: 'none', border: 'none', color: 'inherit', cursor: 'pointer', padding: 0, fontSize: 14, lineHeight: 1 },
       }, '×')))
     ),
+    h('div', { className: 'card-sub', style: { marginBottom: 6 } }, "Add a species not yet in this deployment's results (e.g. before importing):"),
     h('div', { style: { display: 'flex', gap: 8, marginBottom: 24 } },
       h('input', {
         value: newSpecies, list: 'qa-species-list', placeholder: 'Add species (e.g. Barbastelle)...', style: { ...inputStyle, flex: 1, maxWidth: 260 },
         onChange: (e) => setNewSpecies(e.target.value),
         onKeyDown: (e) => { if (e.key === 'Enter') addRequiredSpecies(); },
       }),
-      h('datalist', { id: 'qa-species-list' }, speciesList.map((s) => h('option', { key: s, value: s }))),
+      h('datalist', { id: 'qa-species-list' }, ALL_SPECIES_NAMES.map((s) => h('option', { key: s, value: s }))),
       h('button', { className: 'btn btn-secondary btn-small', disabled: !newSpecies.trim(), onClick: addRequiredSpecies }, 'Add')
     ),
 
@@ -1039,8 +1067,8 @@ function BoxOverlay({ box, view, sampleRate, width, specHeight }) {
   });
 }
 
-// Draws the measured max/min frequency and per-pulse duration/IPI directly on the sonogram, so
-// the numbers in the stat cards below can be checked at a glance against the call itself.
+// Draws the measured max/min frequency directly on the sonogram, so the stat-card numbers can be
+// checked at a glance against the call itself.
 function MeasurementOverlay({ measurement, box, view, sampleRate, width, specHeight }) {
   const x0 = timeToPixel(box.t0, view, width);
   const x1 = timeToPixel(box.t1, view, width);
@@ -1062,20 +1090,6 @@ function MeasurementOverlay({ measurement, box, view, sampleRate, width, specHei
       }, h('span', { style: { position: 'absolute', left: 2, top: 3, fontSize: 9, color: '#7ec8e3', fontFamily: 'var(--font-mono)', background: 'rgba(10,12,14,0.75)', padding: '0 3px', borderRadius: 3, whiteSpace: 'nowrap' } }, `min ${(measurement.minFreqHz / 1000).toFixed(1)}k`)));
     }
   }
-  (measurement.pulses || []).forEach((p, i) => {
-    const px0 = timeToPixel(p.startSec, view, width);
-    const px1 = timeToPixel(p.endSec, view, width);
-    parts.push(h('div', {
-      key: `pulse-${i}`, style: { position: 'absolute', left: px0, top: specHeight - 2, width: Math.max(1, px1 - px0), borderTop: '2px solid var(--teal)', pointerEvents: 'none' },
-    }, h('span', { style: { position: 'absolute', left: 0, top: 3, fontSize: 9, color: 'var(--teal)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap' } }, `${p.durationMs.toFixed(1)}ms`)));
-    if (i > 0 && measurement.ipiMs && measurement.ipiMs[i - 1] != null) {
-      const prevEndX = timeToPixel(measurement.pulses[i - 1].endSec, view, width);
-      const midX = (prevEndX + px0) / 2;
-      parts.push(h('div', {
-        key: `ipi-${i}`, style: { position: 'absolute', left: midX, top: specHeight - 16, transform: 'translateX(-50%)', fontSize: 9, color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap', pointerEvents: 'none' },
-      }, `IPI ${measurement.ipiMs[i - 1].toFixed(0)}ms`));
-    }
-  });
 
   return h(React.Fragment, null, ...parts);
 }
@@ -1597,15 +1611,15 @@ function ReviewTab({ deployment, onPatchEvent, onAddManualEvent, wavFileMap, set
 
   const speciesResults = useMemo(() => {
     if (!measurement) return [];
-    const meanIpiMs = measurement.ipiMs && measurement.ipiMs.length
-      ? measurement.ipiMs.reduce((s, v) => s + v, 0) / measurement.ipiMs.length
-      : null;
+    // Interpulse interval isn't measured yet - reliably identifying individual pulses on real
+    // (noisy) field recordings turned out to need more than a simple amplitude threshold, so it's
+    // parked rather than shipped with numbers that don't represent real pulses.
     return SpeciesData.scoreSpecies({
       peak: measurement.peakFreqHz != null ? measurement.peakFreqHz / 1000 : null,
       start: measurement.startFreqHz != null ? measurement.startFreqHz / 1000 : null,
       end: measurement.endFreqHz != null ? measurement.endFreqHz / 1000 : null,
       duration: measurement.durationMs,
-      ipi: meanIpiMs,
+      ipi: null,
     }, finalShape);
   }, [measurement, finalShape]);
 
@@ -1743,16 +1757,6 @@ function ReviewTab({ deployment, onPatchEvent, onAddManualEvent, wavFileMap, set
             h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Start freq'), h('div', { className: 'stat-box-value' }, measurement.startFreqHz != null ? (measurement.startFreqHz / 1000).toFixed(1) + ' kHz' : '-')),
             h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'End freq'), h('div', { className: 'stat-box-value' }, measurement.endFreqHz != null ? (measurement.endFreqHz / 1000).toFixed(1) + ' kHz' : '-')),
             h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Duration'), h('div', { className: 'stat-box-value' }, measurement.durationMs.toFixed(1) + ' ms' + (measurement.durationRefined ? '' : ' (raw)')))
-          ),
-          measurement.pulses && measurement.pulses.length > 1 && h('div', { style: { marginTop: 10, fontSize: 12 } },
-            h('div', { style: { color: 'var(--text-faint)', marginBottom: 4 } },
-              `${measurement.pulses.length} pulses found in this selection - Duration above is the first pulse only:`),
-            h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px 14px', fontFamily: 'var(--font-mono)' } },
-              measurement.pulses.map((p, i) => h(React.Fragment, { key: i },
-                h('span', null, `#${i + 1}: ${p.durationMs.toFixed(1)}ms`),
-                i < measurement.ipiMs.length && h('span', { style: { color: 'var(--text-faint)' } }, `→ IPI ${measurement.ipiMs[i].toFixed(0)}ms →`)
-              ))
-            )
           ),
           h('div', { style: { marginTop: 10, display: 'flex', alignItems: 'center', gap: 10 } },
             h('span', { style: { fontSize: 12, color: 'var(--text-muted)' } }, 'Shape:'),

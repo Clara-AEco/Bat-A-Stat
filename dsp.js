@@ -230,7 +230,6 @@ window.BatID = window.BatID || {};
       }
     }
 
-    let maxBin = -1, minBin = Infinity;
     const ridge = [];
     // Power-spectrum sum per bin (linear power, not dB) for a robust peak-frequency reading.
     const powerSum = new Float64Array(binTo - binFrom + 1);
@@ -239,10 +238,6 @@ window.BatID = window.BatID || {};
       let frameBestBin = -1, frameBestDb = -Infinity;
       for (let b = binFrom; b <= binTo; b++) {
         const db = spec.magDb[fr * spec.numBins + b];
-        if (db >= activeFloor) {
-          if (b > maxBin) maxBin = b;
-          if (b < minBin) minBin = b;
-        }
         if (db > frameBestDb) { frameBestDb = db; frameBestBin = b; }
         powerSum[b - binFrom] += Math.pow(10, db / 10);
       }
@@ -255,8 +250,16 @@ window.BatID = window.BatID || {};
     for (let i = 1; i < powerSum.length; i++) if (powerSum[i] > powerSum[peakBinRel]) peakBinRel = i;
     const peakFreqHz = spec.freqs[binFrom + peakBinRel];
 
-    const maxFreqHz = maxBin >= 0 ? spec.freqs[maxBin] : null;
-    const minFreqHz = minBin <= binTo ? spec.freqs[minBin] : null;
+    // Max/min frequency come from the call's own ridge (each frame's single dominant bin, when
+    // that frame clears the Brightness floor) rather than "any bin anywhere in the box that
+    // clears the floor" - the latter let broadband low-frequency noise/hum sitting quietly within
+    // the box's vertical span (mains hum, wind, detector self-noise) register as a spuriously low
+    // Min Freq even though it was never actually the loudest thing in any of those time frames.
+    let maxFreqHz = null, minFreqHz = null;
+    for (const p of ridge) {
+      if (maxFreqHz == null || p.freqHz > maxFreqHz) maxFreqHz = p.freqHz;
+      if (minFreqHz == null || p.freqHz < minFreqHz) minFreqHz = p.freqHz;
+    }
 
     function avgFreqOf(points) {
       if (points.length === 0) return null;
@@ -266,84 +269,23 @@ window.BatID = window.BatID || {};
     const endFreqHz = ridge.length ? avgFreqOf(ridge.slice(Math.max(0, ridge.length - 3))) : null;
 
     const rawDurationMs = (box.t1 - box.t0) * 1000;
-
-    // Segment the box into individual pulses rather than treating its whole time span as one
-    // "duration" - a box drawn across two or more pulses previously measured the entire span
-    // (first pulse's start to last pulse's end), silently including the gap between them, not
-    // an average and not any single pulse's real duration. The headline Duration now reflects
-    // just the first pulse (the call the box was drawn around); every pulse found, and the
-    // interpulse interval(s) between them, are reported separately so nothing is hidden.
-    const pulses = detectPulses(samples, sampleRate, box.t0, box.t1);
-    const ipiMs = pulses.length >= 2
-      ? pulses.slice(1).map((p, i) => (p.startSec - pulses[i].startSec) * 1000)
-      : [];
-
-    let durationMs, durationRefined;
-    if (pulses.length > 0) {
-      durationMs = pulses[0].durationMs;
-      durationRefined = true;
-    } else {
-      // No clean envelope pulse found (e.g. very noisy recording) - fall back to the previous
-      // edge-crossing approach as a best-effort estimate.
-      const refined = refineDurationFromOscillogram(samples, sampleRate, box.t0, box.t1);
-      durationMs = refined != null ? refined : rawDurationMs;
-      durationRefined = refined != null;
-    }
+    // Duration is measured from the oscillogram envelope, per the training material's own
+    // guidance - multi-pulse segmentation/interpulse interval was tried and parked: on real field
+    // recordings it badly over-segmented (raw sample amplitude oscillates at the call's own
+    // carrier frequency, not just at the true envelope), so it's not shipped for now.
+    const refined = refineDurationFromOscillogram(samples, sampleRate, box.t0, box.t1);
+    const durationMs = refined != null ? refined : rawDurationMs;
+    const durationRefined = refined != null;
 
     return {
       maxFreqHz, minFreqHz, peakFreqHz, startFreqHz, endFreqHz,
       durationMs,
       rawDurationMs,
       durationRefined,
-      pulses,
-      ipiMs,
       ridge,
       peakDb,
       floorDb: activeFloor,
     };
-  }
-
-  // Finds every distinct amplitude-envelope pulse within [t0, t1] (own peak within the window,
-  // not the box's spectral peak) - lets a box spanning several pulses report each one plus the
-  // interpulse interval(s) between them, instead of one blended/misleading duration reading.
-  // Brief dips shorter than minGapSec are treated as still inside the same pulse (its envelope
-  // rarely reads as a clean flat top), so pulses aren't spuriously split by noise.
-  function detectPulses(samples, sampleRate, t0, t1, thresholdRatio, minGapSec) {
-    thresholdRatio = thresholdRatio == null ? 0.1 : thresholdRatio;
-    minGapSec = minGapSec == null ? 0.0005 : minGapSec;
-    const i0 = Math.max(0, Math.floor(t0 * sampleRate));
-    const i1 = Math.min(samples.length, Math.ceil(t1 * sampleRate));
-    if (i1 - i0 < 8) return [];
-
-    let peak = 0;
-    for (let i = i0; i < i1; i++) { const a = Math.abs(samples[i]); if (a > peak) peak = a; }
-    if (peak <= 0) return [];
-    const thresh = peak * thresholdRatio;
-
-    const runs = [];
-    let start = null;
-    for (let i = i0; i < i1; i++) {
-      const above = Math.abs(samples[i]) >= thresh;
-      if (above && start == null) start = i;
-      else if (!above && start != null) { runs.push([start, i]); start = null; }
-    }
-    if (start != null) runs.push([start, i1]);
-
-    const minGapSamples = Math.max(1, Math.floor(minGapSec * sampleRate));
-    const merged = [];
-    for (const [s, e] of runs) {
-      if (merged.length && s - merged[merged.length - 1][1] < minGapSamples) {
-        merged[merged.length - 1][1] = e;
-      } else {
-        merged.push([s, e]);
-      }
-    }
-
-    return merged.map(([s, e]) => ({
-      startSec: s / sampleRate,
-      endSec: e / sampleRate,
-      durationMs: ((e - s) / sampleRate) * 1000,
-    }));
   }
 
   // Finds amplitude-envelope crossings near t0/t1 to refine call duration, per the training
@@ -477,7 +419,6 @@ window.BatID = window.BatID || {};
     renderSpectrogramImageData,
     computeOscillogramColumns,
     measureBox,
-    detectPulses,
     refineDurationFromOscillogram,
     classifyShape,
     heterodyneMix,
