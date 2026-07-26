@@ -15,6 +15,13 @@ window.BatID = window.BatID || {};
     return (h >>> 0) / 4294967296;
   }
 
+  // A species can override the global probability threshold (e.g. "the model is good with
+  // Common/Soprano Pipistrelle, accept anything above 60% instead of the usual 50%").
+  function effectiveThreshold(label, profile) {
+    const override = (profile.speciesThresholds || []).find((s) => s.species === label);
+    return override ? override.threshold : profile.probabilityThreshold;
+  }
+
   // Returns { included, reason } for one event under the given profile.
   // reason: 'no-id' | 'below-threshold' | '100pct-species' | 'sampled' | 'not-selected'
   function computeQaInclusion(event, profile) {
@@ -24,8 +31,9 @@ window.BatID = window.BatID || {};
     }
     const label = primary.englishName || primary.species;
     const probabilityPct = primary.probability != null ? primary.probability * 100 : null;
+    const threshold = effectiveThreshold(label, profile);
 
-    if (probabilityPct != null && probabilityPct < profile.probabilityThreshold) {
+    if (probabilityPct != null && probabilityPct < threshold) {
       return { included: true, reason: 'below-threshold' };
     }
     if ((profile.speciesRequiring100Percent || []).includes(label)) {
@@ -57,5 +65,5 @@ window.BatID = window.BatID || {};
     };
   }
 
-  ns.QaProfiles = { stableHash01, computeQaInclusion, computeQaSummary };
+  ns.QaProfiles = { stableHash01, effectiveThreshold, computeQaInclusion, computeQaSummary };
 })(window.BatID);

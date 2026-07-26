@@ -8,8 +8,10 @@ window.BatID = window.BatID || {};
   // first-ever open left the database stuck at v1 with no store - reopening at v1 forever after
   // never re-runs onupgradeneeded, so the store would never exist and every transaction would
   // fail with "object store not found". Bumping the version forces onupgradeneeded to run again.
-  const DB_VERSION = 2;
+  // v3: adds the folderHandles store (project <-> linked local folder for file-based storage).
+  const DB_VERSION = 3;
   const STORE = 'projects';
+  const HANDLES_STORE = 'folderHandles';
 
   let dbPromise = null;
   let migratePromise = null;
@@ -21,6 +23,9 @@ window.BatID = window.BatID || {};
         const db = req.result;
         if (!db.objectStoreNames.contains(STORE)) {
           db.createObjectStore(STORE, { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains(HANDLES_STORE)) {
+          db.createObjectStore(HANDLES_STORE, { keyPath: 'projectId' });
         }
       };
       req.onsuccess = () => resolve(req.result);
@@ -128,6 +133,61 @@ window.BatID = window.BatID || {};
     });
   }
 
+  // ---------------- Folder-linked storage ----------------
+  // Lets the analyst choose a real folder on disk for a project's data instead of it being
+  // invisible inside the browser's IndexedDB - project.json in that folder becomes the whole
+  // project, shareable by just sharing the folder. IndexedDB stays the source of truth for the
+  // live session; the folder is kept in sync on every save. Chrome/Edge only (File System Access
+  // API) - Firefox/Safari callers should check `supportsFolderStorage` first.
+  const supportsFolderStorage = typeof window.showDirectoryPicker === 'function';
+
+  async function pickProjectFolder() {
+    return window.showDirectoryPicker({ mode: 'readwrite' });
+  }
+
+  async function saveFolderHandle(projectId, handle) {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(HANDLES_STORE, 'readwrite');
+      tx.objectStore(HANDLES_STORE).put({ projectId, handle });
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function loadFolderHandle(projectId) {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(HANDLES_STORE, 'readonly');
+      const req = tx.objectStore(HANDLES_STORE).get(projectId);
+      req.onsuccess = () => resolve(req.result ? req.result.handle : null);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function deleteFolderHandle(projectId) {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(HANDLES_STORE, 'readwrite');
+      tx.objectStore(HANDLES_STORE).delete(projectId);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function writeProjectJsonToFolder(handle, project) {
+    const fileHandle = await handle.getFileHandle('project.json', { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(JSON.stringify(project, null, 2));
+    await writable.close();
+  }
+
+  async function readProjectJsonFromFolder(handle) {
+    const fileHandle = await handle.getFileHandle('project.json');
+    const file = await fileHandle.getFile();
+    return JSON.parse(await file.text());
+  }
+
   function exportProjectJson(project) {
     return JSON.stringify(project, null, 2);
   }
@@ -165,5 +225,12 @@ window.BatID = window.BatID || {};
     exportProjectJson,
     downloadProjectJson,
     importProjectJson,
+    supportsFolderStorage,
+    pickProjectFolder,
+    saveFolderHandle,
+    loadFolderHandle,
+    deleteFolderHandle,
+    writeProjectJsonToFolder,
+    readProjectJsonFromFolder,
   };
 })(window.BatID);

@@ -59,16 +59,25 @@ function Field({ label, children }) {
 
 // ---------------- Projects list (landing page) ----------------
 
-function ProjectsListView({ projects, onOpen, onCreate, onImport, onDelete }) {
+function ProjectsListView({ projects, onOpen, onCreate, onImport, onOpenFromFolder, onDelete }) {
   const [showNew, setShowNew] = useState(false);
   const [pendingDelete, setPendingDelete] = useState(null); // project id awaiting confirmation
   const [importError, setImportError] = useState(null);
   const fileInputRef = useRef(null);
 
+  function openFromFolder() {
+    setImportError(null);
+    onOpenFromFolder().catch((err) => {
+      if (err && err.name === 'AbortError') return; // user cancelled the folder picker - not an error
+      setImportError(err && err.message ? err.message : String(err));
+    });
+  }
+
   return h('div', { className: 'content', style: { maxWidth: 720, margin: '0 auto' } },
     h('div', { className: 'section-title', style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
       h('span', null, 'Projects'),
       h('div', { style: { display: 'flex', gap: 8 } },
+        onOpenFromFolder && h('button', { className: 'btn btn-secondary btn-small', onClick: openFromFolder }, '📁 Open from folder'),
         h('button', { className: 'btn btn-secondary btn-small', onClick: () => fileInputRef.current.click() }, 'Import JSON'),
         h('button', { className: 'btn btn-primary btn-small', onClick: () => setShowNew(true) }, '+ New project')
       )
@@ -87,7 +96,7 @@ function ProjectsListView({ projects, onOpen, onCreate, onImport, onDelete }) {
         e.target.value = '';
       },
     }),
-    importError && h('div', { className: 'card', style: { marginBottom: 12, color: 'var(--danger)' } }, `Could not import that file: ${importError}`),
+    importError && h('div', { className: 'card', style: { marginBottom: 12, color: 'var(--danger)' } }, `Could not open that project: ${importError}`),
     projects.length === 0 && h('div', { className: 'empty-state' },
       h('div', { className: 'empty-title' }, 'No projects yet'),
       h('div', { className: 'empty-text' }, 'Create a project to start organising Locations, Deployments and Detection Events for a survey site.')
@@ -139,15 +148,85 @@ function Workspace({ project, onChange, onBackToProjects, onExport }) {
   const [activeTab, setActiveTab] = useState('overview');
   const [modal, setModal] = useState(null);
 
+  // Folder-linked storage: mirrors the project to a real project.json in a user-chosen folder,
+  // so its location is up to the analyst and the whole project is shareable as that one folder.
+  const [folderStatus, setFolderStatus] = useState('checking'); // checking | none | linked | permission-needed
+  const [folderError, setFolderError] = useState(null);
+  const folderHandleRef = useRef(null);
+  const folderSaveTimer = useRef(null);
+
+  // Tracks the most recently written project synchronously, so that several updateProject() calls
+  // fired back-to-back in the same event handler (e.g. adding a custom label then setting a Final ID)
+  // each build on the other's result instead of both cloning the same stale `project` prop and the
+  // second one silently overwriting the first before React has re-rendered with the new prop.
+  const latestProjectRef = useRef(project);
+  useEffect(() => { latestProjectRef.current = project; }, [project]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setFolderStatus('checking');
+    S.loadFolderHandle(project.id).then(async (handle) => {
+      if (cancelled) return;
+      if (!handle) { setFolderStatus('none'); return; }
+      folderHandleRef.current = handle;
+      try {
+        const perm = await handle.queryPermission({ mode: 'readwrite' });
+        setFolderStatus(perm === 'granted' ? 'linked' : 'permission-needed');
+      } catch (e) {
+        setFolderStatus('permission-needed');
+      }
+    }).catch(() => setFolderStatus('none'));
+    return () => { cancelled = true; };
+  }, [project.id]);
+
+  async function linkFolder() {
+    try {
+      const handle = await S.pickProjectFolder();
+      await S.saveFolderHandle(project.id, handle);
+      folderHandleRef.current = handle;
+      await S.writeProjectJsonToFolder(handle, project);
+      setFolderStatus('linked');
+      setFolderError(null);
+    } catch (e) {
+      if (e.name !== 'AbortError') setFolderError(e.message);
+    }
+  }
+
+  async function reconnectFolder() {
+    if (!folderHandleRef.current) return;
+    try {
+      const perm = await folderHandleRef.current.requestPermission({ mode: 'readwrite' });
+      if (perm === 'granted') {
+        setFolderStatus('linked');
+        await S.writeProjectJsonToFolder(folderHandleRef.current, project);
+      }
+    } catch (e) {
+      setFolderError(e.message);
+    }
+  }
+
+  async function unlinkFolder() {
+    await S.deleteFolderHandle(project.id);
+    folderHandleRef.current = null;
+    setFolderStatus('none');
+  }
+
   const selectedLocation = selection.locationId ? M.findLocation(project, selection.locationId) : null;
   const selectedDeployment = selection.deploymentId
     ? (M.findDeployment(project, selection.deploymentId) || {}).deployment
     : null;
 
   function updateProject(mutator) {
-    const next = structuredClone(project);
+    const next = structuredClone(latestProjectRef.current);
     mutator(next);
+    latestProjectRef.current = next;
     onChange(next);
+    if (folderStatus === 'linked' && folderHandleRef.current) {
+      if (folderSaveTimer.current) clearTimeout(folderSaveTimer.current);
+      folderSaveTimer.current = setTimeout(() => {
+        S.writeProjectJsonToFolder(folderHandleRef.current, next).catch((e) => setFolderError(e.message));
+      }, 500);
+    }
   }
 
   function addLocation(fields) {
@@ -201,6 +280,13 @@ function Workspace({ project, onChange, onBackToProjects, onExport }) {
       if (!found) return;
       const ev = (found.deployment.detectionEvents || []).find((e) => e.id === eventId);
       if (ev) Object.assign(ev, patch);
+    });
+  }
+
+  function addCustomLabel(label) {
+    updateProject((p) => {
+      p.customLabels = p.customLabels || [];
+      if (!p.customLabels.includes(label)) p.customLabels.push(label);
     });
   }
 
@@ -266,6 +352,8 @@ function Workspace({ project, onChange, onBackToProjects, onExport }) {
       onDelete: () => setModal({ kind: 'deleteDeployment', locationId: selectedLocation.id, deploymentId: selectedDeployment.id }),
       onImportBto: (csvText, fileName) => importBtoFile(selectedDeployment.id, csvText, fileName),
       onPatchEvent: (eventId, patch) => patchDetectionEvent(selectedDeployment.id, eventId, patch),
+      customLabels: project.customLabels || [],
+      onAddCustomLabel: addCustomLabel,
     });
   }
 
@@ -278,6 +366,15 @@ function Workspace({ project, onChange, onBackToProjects, onExport }) {
       h('div', { className: 'sidebar-section', style: { display: 'flex', gap: 6 } },
         h('button', { className: 'btn btn-secondary btn-small', style: { flex: 1 }, onClick: onBackToProjects }, '← Projects'),
         h('button', { className: 'btn btn-secondary btn-small', style: { flex: 1 }, onClick: onExport }, 'Export')
+      ),
+      S.supportsFolderStorage && h('div', { className: 'sidebar-section' },
+        folderStatus === 'none' && h('button', { className: 'btn btn-secondary btn-small', style: { width: '100%' }, onClick: linkFolder }, '📁 Link to a folder'),
+        folderStatus === 'linked' && h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
+          h('div', { className: 'card-sub', style: { color: 'var(--teal)' } }, '📁 Saved to linked folder'),
+          h('button', { className: 'btn btn-secondary btn-small', onClick: unlinkFolder }, 'Unlink')
+        ),
+        folderStatus === 'permission-needed' && h('button', { className: 'btn btn-secondary btn-small', style: { width: '100%' }, onClick: reconnectFolder }, '📁 Reconnect folder'),
+        folderError && h('div', { className: 'card-sub', style: { color: 'var(--danger)', marginTop: 4 } }, folderError)
       ),
       h('div', { className: 'sidebar-section', style: { flex: 1 } },
         h('div', { className: 'sidebar-section-title' },
@@ -374,7 +471,7 @@ function LocationOverview({ location, onPatch, onDelete, onAddDeployment }) {
   );
 }
 
-function DeploymentPanel({ location, deployment, activeTab, setActiveTab, onPatch, onDelete, onImportBto, onPatchEvent }) {
+function DeploymentPanel({ location, deployment, activeTab, setActiveTab, onPatch, onDelete, onImportBto, onPatchEvent, customLabels, onAddCustomLabel }) {
   const [wavFileMap, setWavFileMap] = useState(new Map());
   let tabContent;
   if (activeTab === 'overview') {
@@ -384,7 +481,7 @@ function DeploymentPanel({ location, deployment, activeTab, setActiveTab, onPatc
   } else if (activeTab === 'qa') {
     tabContent = h(QaTab, { deployment, onPatch, wavFileMap, setWavFileMap, onGoToReview: () => setActiveTab('review') });
   } else if (activeTab === 'review') {
-    tabContent = h(ReviewTab, { deployment, onPatchEvent, wavFileMap, setWavFileMap });
+    tabContent = h(ReviewTab, { deployment, onPatchEvent, wavFileMap, setWavFileMap, customLabels, onAddCustomLabel });
   } else {
     tabContent = h(ComingSoonTab, { tab: DEPLOYMENT_TABS.find((t) => t.id === activeTab) });
   }
@@ -567,7 +664,7 @@ function StatBox({ label, value }) {
 
 function QaTab({ deployment, onPatch, wavFileMap, setWavFileMap, onGoToReview }) {
   const events = deployment.detectionEvents || [];
-  const profile = deployment.qaProfile || { samplePercent: 10, probabilityThreshold: 50, speciesRequiring100Percent: [], alwaysReviewNoId: true };
+  const profile = deployment.qaProfile || DEFAULT_QA_PROFILE;
   function patchProfile(patch) {
     onPatch({ qaProfile: { ...profile, ...patch } });
   }
@@ -587,6 +684,22 @@ function QaTab({ deployment, onPatch, wavFileMap, setWavFileMap, onGoToReview })
   }
   function removeRequiredSpecies(name) {
     patchProfile({ speciesRequiring100Percent: profile.speciesRequiring100Percent.filter((s) => s !== name) });
+  }
+
+  const speciesThresholds = profile.speciesThresholds || [];
+  const [newThresholdSpecies, setNewThresholdSpecies] = useState('');
+  const [newThresholdValue, setNewThresholdValue] = useState(60);
+  function addSpeciesThreshold() {
+    const trimmed = newThresholdSpecies.trim();
+    if (!trimmed || speciesThresholds.some((s) => s.species === trimmed)) return;
+    patchProfile({ speciesThresholds: [...speciesThresholds, { species: trimmed, threshold: newThresholdValue }] });
+    setNewThresholdSpecies('');
+  }
+  function updateSpeciesThreshold(species, value) {
+    patchProfile({ speciesThresholds: speciesThresholds.map((s) => (s.species === species ? { ...s, threshold: value } : s)) });
+  }
+  function removeSpeciesThreshold(species) {
+    patchProfile({ speciesThresholds: speciesThresholds.filter((s) => s.species !== species) });
   }
 
   const inputStyle = {
@@ -610,6 +723,34 @@ function QaTab({ deployment, onPatch, wavFileMap, setWavFileMap, onGoToReview })
     h('label', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, marginBottom: 18, color: 'var(--text-muted)' } },
       h('input', { type: 'checkbox', checked: profile.alwaysReviewNoId, onChange: (e) => patchProfile({ alwaysReviewNoId: e.target.checked }) }),
       'Always review calls BTO could not identify at all (No ID)'
+    ),
+
+    h('div', { className: 'section-title' }, 'Per-species confidence thresholds'),
+    h('div', { className: 'card-sub', style: { marginBottom: 10 } },
+      'Overrides the global probability threshold above for species the model is known to handle well - e.g. accept Common/Soprano Pipistrelle above 60% instead of the usual 50%.'),
+    speciesThresholds.length === 0 && h('div', { className: 'card-sub', style: { marginBottom: 10 } }, 'None set.'),
+    speciesThresholds.length > 0 && h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 10 } },
+      speciesThresholds.map((s) => h('div', { key: s.species, style: { display: 'flex', alignItems: 'center', gap: 10 } },
+        h('span', { style: { minWidth: 160 } }, s.species),
+        h('input', {
+          type: 'number', min: 0, max: 100, value: s.threshold, style: { width: 70 },
+          onChange: (e) => updateSpeciesThreshold(s.species, Number(e.target.value)),
+        }),
+        h('span', { className: 'card-sub' }, '%'),
+        h('button', {
+          onClick: () => removeSpeciesThreshold(s.species),
+          style: { background: 'none', border: 'none', color: 'var(--danger)', cursor: 'pointer', fontSize: 13 },
+        }, 'Remove')
+      ))
+    ),
+    h('div', { style: { display: 'flex', gap: 8, marginBottom: 24 } },
+      h('input', {
+        value: newThresholdSpecies, list: 'qa-species-list', placeholder: 'Species (e.g. Common Pipistrelle)...', style: { ...inputStyle, flex: 1, maxWidth: 220 },
+        onChange: (e) => setNewThresholdSpecies(e.target.value),
+      }),
+      h('input', { type: 'number', min: 0, max: 100, value: newThresholdValue, style: { ...inputStyle, width: 70 }, onChange: (e) => setNewThresholdValue(Number(e.target.value)) }),
+      h('span', { className: 'card-sub', style: { alignSelf: 'center' } }, '%'),
+      h('button', { className: 'btn btn-secondary btn-small', disabled: !newThresholdSpecies.trim(), onClick: addSpeciesThreshold }, 'Add')
     ),
 
     h('div', { className: 'section-title' }, 'Species requiring 100% review'),
@@ -751,6 +892,26 @@ function sortEventsChronologically(events) {
   });
 }
 
+// Parses "DD/MM/YYYY" + "HH:MM:SS" (the BTO CSV's own format) into a Date.
+function parseEventTimestamp(ev) {
+  if (!ev.actualDate || !ev.time) return null;
+  const [d, m, y] = ev.actualDate.split('/').map(Number);
+  const [hh, mm, ss] = ev.time.split(':').map(Number);
+  if (!y || !m || !d) return null;
+  const dt = new Date(y, m - 1, d, hh || 0, mm || 0, ss || 0);
+  return isNaN(dt.getTime()) ? null : dt;
+}
+
+// Best-effort offset (seconds) of a Detection Event within its original WAV file, using the
+// file-start timestamp commonly embedded in detector filenames (e.g. "..._20260617_221514.wav")
+// against the event's own BTO timestamp. Null if either can't be parsed - never guessed silently.
+function estimateOffsetSec(ev) {
+  const fileStart = Wav.parseTimestampFromFilename(ev.originalWav);
+  const eventTime = parseEventTimestamp(ev);
+  if (!fileStart || !eventTime) return null;
+  return (eventTime.getTime() - fileStart.getTime()) / 1000;
+}
+
 function primaryIdLabel(ev) {
   return ev.primaryBtoId ? (ev.primaryBtoId.englishName || ev.primaryBtoId.species) : 'No ID';
 }
@@ -803,7 +964,7 @@ function timeToPixel(t, view, width) {
   return range > 0 ? ((t - view.t0) / range) * width : 0;
 }
 
-function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box, onBoxChange, guidelines }) {
+function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box, onBoxChange, guidelines, partMarkers }) {
   const specCanvasRef = useRef(null);
   const oscCanvasRef = useRef(null);
   const dragRef = useRef(null);
@@ -954,6 +1115,20 @@ function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box
           if (y < 0 || y > SPEC_HEIGHT) return null;
           return h('div', { key: kHz, style: { position: 'absolute', left: 0, top: y, width: SONOGRAM_WIDTH, borderTop: '1px dashed var(--accent)', pointerEvents: 'none' } },
             h('span', { style: { position: 'absolute', right: 2, top: -14, fontSize: 9, color: 'var(--accent)', fontFamily: 'var(--font-mono)' } }, `${kHz}k`));
+        }),
+        // BTO "part" boundaries within this same physical file (see estimateOffsetSec) - makes it
+        // obvious when what looks like one call bout is actually several BTO segments/species.
+        (partMarkers || []).map((m) => {
+          const x = timeToPixel(m.offsetSec, view, SONOGRAM_WIDTH);
+          if (x < 0 || x > SONOGRAM_WIDTH) return null;
+          const color = m.isCurrent ? 'var(--teal)' : 'rgba(255,255,255,0.4)';
+          return h('div', { key: m.partNumber, style: { position: 'absolute', left: x, top: 0, height: SPEC_HEIGHT, borderLeft: `1px ${m.isCurrent ? 'solid' : 'dashed'} ${color}`, pointerEvents: 'none' } },
+            h('span', {
+              style: {
+                position: 'absolute', left: 3, top: 2, fontSize: 9, color, fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap',
+                background: m.isCurrent ? 'rgba(79,184,168,0.15)' : 'transparent', padding: '1px 3px', borderRadius: 3,
+              },
+            }, `part ${m.partNumber}: ${m.label}`));
         }),
         dragRect && h('div', {
           style: {
@@ -1142,7 +1317,11 @@ function WavFolderPicker({ wavFileMap, setWavFileMap }) {
   );
 }
 
-const DEFAULT_QA_PROFILE = { samplePercent: 10, probabilityThreshold: 50, speciesRequiring100Percent: [], alwaysReviewNoId: true };
+const DEFAULT_QA_PROFILE = {
+  samplePercent: 10, probabilityThreshold: 50,
+  speciesThresholds: [{ species: 'Common Pipistrelle', threshold: 60 }, { species: 'Soprano Pipistrelle', threshold: 60 }],
+  speciesRequiring100Percent: [], alwaysReviewNoId: true,
+};
 const QA_REASON_LABELS = {
   'no-id': 'Queued - No ID (always reviewed)',
   'below-threshold': 'Queued - below probability threshold',
@@ -1151,7 +1330,7 @@ const QA_REASON_LABELS = {
   'not-selected': 'Not in queue',
 };
 
-function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
+function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, customLabels, onAddCustomLabel }) {
   const allEvents = deployment.detectionEvents || [];
   const profile = deployment.qaProfile || DEFAULT_QA_PROFILE;
   const [sortMode, setSortMode] = useState('primaryId'); // 'primaryId' | 'chronological'
@@ -1172,6 +1351,18 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
 
   const currentIndex = list.findIndex((e) => e.id === currentId);
   const currentEvent = currentIndex >= 0 ? list[currentIndex] : null;
+
+  // BTO often splits one physical recording into several parts (e.g. a call bout that changes
+  // species partway through) - all sharing the same original WAV. Since the sonogram always shows
+  // the whole file, mark where each sibling part actually sits so it's clear which segment is
+  // which, instead of silently displaying several species' calls with no indication of the split.
+  const partMarkers = useMemo(() => {
+    if (!currentEvent) return [];
+    return allEvents
+      .filter((e) => e.originalWav === currentEvent.originalWav)
+      .map((e) => ({ partNumber: e.partNumber, offsetSec: estimateOffsetSec(e), label: primaryIdLabel(e), isCurrent: e.id === currentEvent.id }))
+      .filter((m) => m.offsetSec != null);
+  }, [currentEvent, allEvents]);
 
   const wavCacheRef = useRef(new Map());
   const [decodedWav, setDecodedWav] = useState(null);
@@ -1241,8 +1432,16 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
   }, [measurement, finalShape]);
 
   const speciesCounts = useMemo(() => computeSpeciesCounts(allEvents), [allEvents]);
-  const quickSpecies = Object.entries(speciesCounts).filter(([label]) => label !== 'Noise / No ID')
+  const btoQuickSpecies = Object.entries(speciesCounts).filter(([label]) => label !== 'Noise / No ID')
     .sort((a, b) => b[1] - a[1]).slice(0, 8).map(([label]) => label);
+  // Custom labels (species BTO never flagged at all, e.g. "Myotis sp") persist project-wide and
+  // always show up alongside the BTO-derived quick buttons, not just as a one-off text entry.
+  const quickSpecies = Array.from(new Set([...btoQuickSpecies, ...(customLabels || [])]));
+
+  function setFinalIdWithCustomTracking(label, isCustom) {
+    if (isCustom) onAddCustomLabel(label);
+    setFinalId(label);
+  }
 
   function goTo(index) {
     if (index < 0 || index >= list.length) return;
@@ -1347,7 +1546,7 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
               },
             })
           ),
-          h(Sonogram, { spec, samples: decodedWav.samples, sampleRate: decodedWav.sampleRate, floorDb, rangeDb, saturation, box, onBoxChange: setBox, guidelines }),
+          h(Sonogram, { spec, samples: decodedWav.samples, sampleRate: decodedWav.sampleRate, floorDb, rangeDb, saturation, box, onBoxChange: setBox, guidelines, partMarkers }),
           h('div', { className: 'card-sub', style: { marginTop: 6 } }, 'Drag to box a call and measure it - scroll to zoom the time axis.'),
           spec.truncated && h('div', { className: 'card-sub', style: { marginTop: 4, color: 'var(--accent)' } },
             `This recording is longer than ${Dsp.MAX_ANALYSIS_DURATION_SEC || 30}s - showing the first ${Math.round(spec.durationSec)}s only.`),
@@ -1415,7 +1614,7 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
             quickSpecies.map((label) => h('button', { key: label, className: 'btn btn-secondary btn-small', onClick: () => setFinalId(label) }, label)),
             h('button', { className: 'btn btn-danger btn-small', onClick: () => setFinalId('Noise / No ID') }, 'Noise / No ID')
           ),
-          h(CustomLabelInput, { onSubmit: setFinalId })
+          h(CustomLabelInput, { onSubmit: (label) => setFinalIdWithCustomTracking(label, true) })
         )
       )
     ),
@@ -1537,6 +1736,17 @@ function App() {
     S.saveProject(project).then(() => openProjectById(project.id));
   }
 
+  // Opens a project that lives as project.json in a folder someone shared with Clara (or that she
+  // linked earlier on another machine) - reads it in, links the folder so future edits keep
+  // writing back to it, and adds it to this browser's project list.
+  async function openProjectFromFolder() {
+    const handle = await S.pickProjectFolder(); // throws AbortError if cancelled - caller displays it
+    const project = await S.readProjectJsonFromFolder(handle); // throws if no project.json in there
+    await S.saveFolderHandle(project.id, handle);
+    await S.saveProject(project);
+    openProjectById(project.id);
+  }
+
   function deleteProject(id) {
     S.deleteProject(id).then(() => {
       setProjects((prev) => prev.filter((p) => p.id !== id));
@@ -1569,6 +1779,7 @@ function App() {
       onOpen: openProjectById,
       onCreate: createProject,
       onImport: importProjectFromJson,
+      onOpenFromFolder: S.supportsFolderStorage ? openProjectFromFolder : null,
       onDelete: deleteProject,
     });
   }

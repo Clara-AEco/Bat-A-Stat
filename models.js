@@ -21,6 +21,9 @@ window.BatID = window.BatID || {};
       siteName,
       notes,
       locations: [],
+      // Species labels the analyst has typed in manually (e.g. "Myotis sp") that BTO never
+      // flagged at all - once added here they show up as quick-label buttons project-wide.
+      customLabels: [],
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };
@@ -68,6 +71,12 @@ window.BatID = window.BatID || {};
       qaProfile: {
         samplePercent: 10,
         probabilityThreshold: 50,
+        // Per-species overrides where the automated model is known to be reliable, so those
+        // species don't get pulled into "below threshold" review as readily as the rest.
+        speciesThresholds: [
+          { species: 'Common Pipistrelle', threshold: 60 },
+          { species: 'Soprano Pipistrelle', threshold: 60 },
+        ],
         speciesRequiring100Percent: [],
         alwaysReviewNoId: true,
       },
