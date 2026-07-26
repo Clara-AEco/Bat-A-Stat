@@ -651,7 +651,13 @@ function QaTab({ deployment, onPatch, wavFileMap, setWavFileMap, onGoToReview })
             h('div', { style: { color: 'var(--teal)', fontWeight: 600 } }, `✓ QA complete - all ${summary.queued} queued calls have been reviewed.`))
     ),
 
-    h('button', { className: 'btn btn-primary', style: { marginTop: 16 }, onClick: onGoToReview }, 'Go to Manual Review →')
+    h('div', { style: { display: 'flex', gap: 10, marginTop: 16 } },
+      h('button', { className: 'btn btn-primary', onClick: onGoToReview }, 'Go to Manual Review →'),
+      h('button', {
+        className: 'btn btn-secondary',
+        onClick: () => downloadTextFile(`${(deployment.name || 'deployment').replace(/[^A-Za-z0-9_-]+/g, '_')}_detections.csv`, detectionEventsToCsv(deployment), 'text/csv'),
+      }, 'Export CSV (old ID vs new ID)')
+    )
   );
 }
 
@@ -684,6 +690,47 @@ function CustomLabelInput({ onSubmit }) {
     h('datalist', { id: 'all-species-names' }, ALL_SPECIES_NAMES.map((n) => h('option', { key: n, value: n }))),
     h('button', { className: 'btn btn-secondary btn-small', disabled: !value.trim(), onClick: submit }, 'Set label')
   );
+}
+
+function csvEscape(v) {
+  const s = v == null ? '' : String(v);
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+function downloadTextFile(filename, text, mimeType) {
+  const blob = new Blob([text], { type: mimeType || 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// One row per Detection Event, with the automated (BTO) ID and Clara's manual review outcome
+// as clearly separate columns, so it's obvious from the file alone which calls were checked.
+function detectionEventsToCsv(deployment) {
+  const profile = deployment.qaProfile || DEFAULT_QA_PROFILE;
+  const header = [
+    'Original WAV', 'Part', 'Survey Date', 'Time', 'Latitude', 'Longitude',
+    'Old ID (BTO)', 'Old ID Probability', 'Old ID Warnings', 'All BTO Candidates',
+    'Manually Reviewed', 'Reviewed At', 'New ID (Final)', 'QA Queue Reason',
+  ];
+  const rows = (deployment.detectionEvents || []).map((ev) => {
+    const reason = QaProfiles ? QaProfiles.computeQaInclusion(ev, profile).reason : '';
+    const resolved = M.resolveFinalId(ev);
+    const oldId = ev.primaryBtoId ? (ev.primaryBtoId.englishName || ev.primaryBtoId.species) : 'No ID';
+    const oldProb = ev.primaryBtoId && ev.primaryBtoId.probability != null ? ev.primaryBtoId.probability : '';
+    const oldWarnings = ev.primaryBtoId ? ev.primaryBtoId.warnings : '';
+    const allCandidates = ev.candidateSpecies
+      .map((c) => `${c.englishName || c.species} (${c.probability != null ? (c.probability * 100).toFixed(0) + '%' : '?'})`)
+      .join('; ');
+    return [
+      ev.originalWav, ev.partNumber, ev.surveyDate, ev.time, ev.latitude, ev.longitude,
+      oldId, oldProb, oldWarnings, allCandidates,
+      ev.manualReview.reviewed ? 'Yes' : 'No', ev.manualReview.reviewedAt || '', resolved.finalId, QA_REASON_LABELS[reason] || '',
+    ];
+  });
+  return [header, ...rows].map((r) => r.map(csvEscape).join(',')).join('\n') + '\n';
 }
 
 function computeSpeciesCounts(events) {
@@ -756,7 +803,9 @@ function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box
     const ctx = canvas.getContext('2d');
     ctx.fillStyle = '#14171a';
     ctx.fillRect(0, 0, SONOGRAM_WIDTH, OSC_HEIGHT);
-    const duration = samples.length / sampleRate;
+    // Match whatever duration the spectrogram is actually showing (it may be truncated for a
+    // very long recording) so the two canvases stay aligned on the same time axis.
+    const duration = spec ? spec.durationSec : (samples.length / sampleRate);
     const { mins, maxs } = Dsp.computeOscillogramColumns(samples, sampleRate, 0, duration, SONOGRAM_WIDTH);
     ctx.strokeStyle = '#4fb8a8';
     ctx.beginPath();
@@ -767,7 +816,7 @@ function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box
       ctx.lineTo(x + 0.5, yMax);
     }
     ctx.stroke();
-  }, [samples, sampleRate]);
+  }, [samples, sampleRate, spec]);
 
   function pixelToTime(x) {
     const duration = spec ? spec.durationSec : (samples.length / sampleRate);
@@ -846,10 +895,10 @@ function WavFolderPicker({ wavFileMap, setWavFileMap }) {
   }
   return h('div', null,
     h('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
-      h('button', { className: 'btn btn-secondary btn-small', onClick: () => inputRef.current.click() },
+      h('button', { className: 'btn btn-secondary btn-small', onClick: () => { if (inputRef.current) inputRef.current.click(); } },
         wavFileMap.size ? `WAV folder loaded (${wavFileMap.size} files) - change` : '+ Load WAV folder'),
       h('input', {
-        ref: (el) => { if (el) { el.webkitdirectory = true; el.directory = true; } },
+        ref: (el) => { inputRef.current = el; if (el) { el.webkitdirectory = true; el.directory = true; } },
         type: 'file', multiple: true, style: { display: 'none' }, onChange: handleChange,
       })
     ),
@@ -966,8 +1015,28 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
     goTo(currentIndex + 1);
   }
 
+  const toolbar = h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, flexWrap: 'wrap', gap: 10 } },
+    h(WavFolderPicker, { wavFileMap, setWavFileMap }),
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
+      h('label', { style: { fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6 } },
+        h('input', { type: 'checkbox', checked: queueOnly, onChange: (e) => setQueueOnly(e.target.checked) }),
+        'QA queue only'
+      ),
+      h('label', { style: { fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6 } },
+        h('input', { type: 'checkbox', checked: unreviewedOnly, onChange: (e) => setUnreviewedOnly(e.target.checked) }),
+        'Unreviewed only'
+      ),
+      list.length > 0 && h(React.Fragment, null,
+        h('button', { className: 'btn btn-secondary btn-small', onClick: () => goTo(currentIndex - 1), disabled: currentIndex <= 0 }, '← Prev'),
+        h('span', { className: 'card-sub', style: { fontFamily: 'var(--font-mono)' } }, `${currentIndex + 1} / ${list.length}`),
+        h('button', { className: 'btn btn-secondary btn-small', onClick: () => goTo(currentIndex + 1), disabled: currentIndex >= list.length - 1 }, 'Next →')
+      )
+    )
+  );
+
   if (list.length === 0) {
-    return h('div', { className: 'content' },
+    return h('div', { className: 'content', style: { maxWidth: 'none' } },
+      toolbar,
       h('div', { className: 'empty-state' },
         h('div', { className: 'empty-title' }, 'No detection events to review'),
         h('div', { className: 'empty-text' },
@@ -981,22 +1050,7 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
   }
 
   return h('div', { className: 'content', style: { maxWidth: 'none' } },
-    h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, flexWrap: 'wrap', gap: 10 } },
-      h(WavFolderPicker, { wavFileMap, setWavFileMap }),
-      h('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
-        h('label', { style: { fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6 } },
-          h('input', { type: 'checkbox', checked: queueOnly, onChange: (e) => setQueueOnly(e.target.checked) }),
-          'QA queue only'
-        ),
-        h('label', { style: { fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6 } },
-          h('input', { type: 'checkbox', checked: unreviewedOnly, onChange: (e) => setUnreviewedOnly(e.target.checked) }),
-          'Unreviewed only'
-        ),
-        h('button', { className: 'btn btn-secondary btn-small', onClick: () => goTo(currentIndex - 1), disabled: currentIndex <= 0 }, '← Prev'),
-        h('span', { className: 'card-sub', style: { fontFamily: 'var(--font-mono)' } }, `${currentIndex + 1} / ${list.length}`),
-        h('button', { className: 'btn btn-secondary btn-small', onClick: () => goTo(currentIndex + 1), disabled: currentIndex >= list.length - 1 }, 'Next →')
-      )
-    ),
+    toolbar,
 
     currentEvent && h('div', { style: { display: 'grid', gridTemplateColumns: 'minmax(0, 2fr) minmax(260px, 1fr)', gap: 16 } },
       // Left: sonogram + controls + quick labels
@@ -1022,7 +1076,9 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
               h('input', { type: 'range', min: 0, max: 1, step: 0.05, value: saturation, onChange: (e) => setSaturation(Number(e.target.value)), style: { flex: 1 } }))
           ),
           h(Sonogram, { spec, samples: decodedWav.samples, sampleRate: decodedWav.sampleRate, floorDb, rangeDb, saturation, box, onBoxChange: setBox }),
-          h('div', { className: 'card-sub', style: { marginTop: 6 } }, 'Drag on the sonogram to box a call and measure it.')
+          h('div', { className: 'card-sub', style: { marginTop: 6 } }, 'Drag on the sonogram to box a call and measure it.'),
+          spec.truncated && h('div', { className: 'card-sub', style: { marginTop: 4, color: 'var(--accent)' } },
+            `This recording is longer than ${Dsp.MAX_ANALYSIS_DURATION_SEC || 30}s - showing the first ${Math.round(spec.durationSec)}s only.`)
         ),
 
         measurement && h('div', { className: 'card', style: { marginTop: 14 } },
