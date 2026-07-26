@@ -129,6 +129,15 @@ window.BatID = window.BatID || {};
         reviewerNotes: '',
         reviewedAt: null,
         sonogramAnalysis: null, // { measurements, shape, decisionTreeResult }
+        // Extra species confirmed present in this SAME 5-second Detection Event (e.g. a mixed
+        // recording where BTO's primary result only reflects the most prominent species) - each
+        // one becomes its own Species Detection Record alongside finalId, per Clara's ecological
+        // model: one Detection Event may resolve to several Species Detection Records. This is
+        // the preferred way to record "BTO missed a species here" now, in place of the earlier
+        // pattern of spawning a whole separate Detection Event for it (addedManually above) -
+        // that older pattern is still read/counted for backward compatibility with data created
+        // before this distinction existed, just no longer offered as the way to add one.
+        additionalTaxa: [],
       },
       qaStatus: null, // computed by qa-profiles.js against the deployment's active QA profile
       createdAt: nowIso(),
@@ -166,6 +175,23 @@ window.BatID = window.BatID || {};
     return { finalId: 'No ID', source: 'none' };
   }
 
+  // A Detection Event (one 5-second BTO analysis window) may resolve to more than one species -
+  // e.g. a mixed recording where BTO's primary result only reflects the most prominent call.
+  // Returns one entry per Species Detection Record: the primary resolution (resolveFinalId, above)
+  // plus any additionalTaxa confirmed during manual review. Deduplicated so confirming the same
+  // species twice (as primary and separately as "additional") never double-counts it.
+  function resolveSpeciesRecords(detectionEvent) {
+    const primary = resolveFinalId(detectionEvent);
+    const additional = (detectionEvent.manualReview && detectionEvent.manualReview.additionalTaxa) || [];
+    const records = [primary, ...additional.map((finalId) => ({ finalId, source: 'manual-additional' }))];
+    const seen = new Set();
+    return records.filter((r) => {
+      if (!r.finalId || seen.has(r.finalId)) return false;
+      seen.add(r.finalId);
+      return true;
+    });
+  }
+
   function findLocation(project, locationId) {
     return (project.locations || []).find((l) => l.id === locationId) || null;
   }
@@ -190,6 +216,7 @@ window.BatID = window.BatID || {};
     createDetectionEvent,
     pickPrimaryCandidate,
     resolveFinalId,
+    resolveSpeciesRecords,
     findLocation,
     findDeployment,
     touch,

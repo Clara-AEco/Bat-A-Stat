@@ -306,32 +306,6 @@ function Workspace({ project, onChange, onBackToProjects, onExport }) {
     });
   }
 
-  // For a species BTO's classifier missed entirely within a call/part (never gave it a candidate
-  // row at all, as opposed to flagging it with low probability) - adds a brand new Detection Event
-  // for the same original WAV/part rather than overwriting the existing one's Final ID, and flags
-  // it addedManually so it can be counted and (eventually) factored into the Statistics error
-  // estimate as a known gap in BTO's automated coverage.
-  function addManualDetectionEvent(deploymentId, sourceEvent, label) {
-    updateProject((p) => {
-      const found = M.findDeployment(p, deploymentId);
-      if (!found) return;
-      const ev = M.createDetectionEvent({
-        originalWav: sourceEvent.originalWav,
-        partNumber: sourceEvent.partNumber,
-        candidateSpecies: [],
-        sourceBtoImportId: sourceEvent.sourceBtoImportId,
-        actualDate: sourceEvent.actualDate,
-        surveyDate: sourceEvent.surveyDate,
-        time: sourceEvent.time,
-        latitude: sourceEvent.latitude,
-        longitude: sourceEvent.longitude,
-      });
-      ev.addedManually = true;
-      ev.manualReview = { ...ev.manualReview, reviewed: true, finalId: label, reviewedAt: new Date().toISOString() };
-      found.deployment.detectionEvents = [...(found.deployment.detectionEvents || []), ev];
-    });
-  }
-
   function importBtoFile(deploymentId, csvText, fileName) {
     let result = null;
     let error = null;
@@ -394,7 +368,6 @@ function Workspace({ project, onChange, onBackToProjects, onExport }) {
       onDelete: () => setModal({ kind: 'deleteDeployment', locationId: selectedLocation.id, deploymentId: selectedDeployment.id }),
       onImportBto: (csvText, fileName) => importBtoFile(selectedDeployment.id, csvText, fileName),
       onPatchEvent: (eventId, patch) => patchDetectionEvent(selectedDeployment.id, eventId, patch),
-      onAddManualEvent: (sourceEvent, label) => addManualDetectionEvent(selectedDeployment.id, sourceEvent, label),
       customLabels: project.customLabels || [],
       onAddCustomLabel: addCustomLabel,
     });
@@ -526,17 +499,17 @@ function LocationOverview({ location, onPatch, onDelete, onAddDeployment }) {
   );
 }
 
-function DeploymentPanel({ location, deployment, activeTab, setActiveTab, onPatch, onDelete, onImportBto, onPatchEvent, onAddManualEvent, customLabels, onAddCustomLabel }) {
+function DeploymentPanel({ location, deployment, activeTab, setActiveTab, onPatch, onDelete, onImportBto, onPatchEvent, customLabels, onAddCustomLabel }) {
   const [wavFileMap, setWavFileMap] = useState(new Map());
   let tabContent;
   if (activeTab === 'overview') {
-    tabContent = h(DeploymentOverviewTab, { deployment, onPatch, wavFileMap });
+    tabContent = h(DeploymentOverviewTab, { deployment, onPatch, wavFileMap, location });
   } else if (activeTab === 'detections') {
     tabContent = h(DetectionsTab, { deployment, onImportBto });
   } else if (activeTab === 'qa') {
     tabContent = h(QaTab, { deployment, onPatch, wavFileMap, setWavFileMap, onGoToReview: () => setActiveTab('review') });
   } else if (activeTab === 'review') {
-    tabContent = h(ReviewTab, { deployment, onPatchEvent, onAddManualEvent, wavFileMap, setWavFileMap, customLabels, onAddCustomLabel });
+    tabContent = h(ReviewTab, { deployment, onPatchEvent, wavFileMap, setWavFileMap, customLabels, onAddCustomLabel });
   } else if (activeTab === 'stats') {
     tabContent = h(StatisticsTab, { deployment, location });
   } else {
@@ -579,6 +552,7 @@ function DetectionsTab({ deployment, onImportBto }) {
   }
   const speciesRows = Object.entries(speciesCounts).sort((a, b) => b[1] - a[1]);
   const previewEvents = events.slice(0, 150);
+  const resolvedRecordCount = events.reduce((s, ev) => s + M.resolveSpeciesRecords(ev).length, 0);
 
   function handleFile(e) {
     const file = e.target.files[0];
@@ -612,6 +586,7 @@ function DetectionsTab({ deployment, onImportBto }) {
     h('div', { className: 'section-title' }, 'Detection Events'),
     h('div', { className: 'stat-grid' },
       h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Total events'), h('div', { className: 'stat-box-value' }, String(events.length))),
+      h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Resolved species records'), h('div', { className: 'stat-box-value' }, String(resolvedRecordCount))),
       Object.entries(groupCounts).map(([g, c]) => h('div', { className: 'stat-box', key: g },
         h('div', { className: 'stat-box-label' }, g), h('div', { className: 'stat-box-value' }, String(c))
       ))
@@ -683,9 +658,9 @@ function fmtDateTime(d) {
 
 function StatisticsTab({ deployment, location }) {
   const stats = useMemo(() => Stats.computeAllStats(deployment, location), [deployment, location]);
-  const { effort, activity, species, timing } = stats;
+  const { effort, activity, species, timing, reliability, totalDetectionEvents, totalSpeciesRecords } = stats;
 
-  if (activity.totalDetections === 0) {
+  if (totalDetectionEvents === 0) {
     return h('div', { className: 'content' },
       h('div', { className: 'empty-state' },
         h('div', { className: 'empty-title' }, 'No detections to analyse yet'),
@@ -695,12 +670,27 @@ function StatisticsTab({ deployment, location }) {
   }
 
   return h('div', { className: 'content' },
+    totalSpeciesRecords !== totalDetectionEvents && h('div', { className: 'card', style: { marginBottom: 16, color: 'var(--text-muted)', fontSize: 12 } },
+      `${totalDetectionEvents} Detection Events resolved to ${totalSpeciesRecords} Species Detection Records - the difference is calls where manual review confirmed more than one species in the same recording.`),
+
+    h('div', { className: 'section-title' }, 'QA reliability (observed, this deployment)'),
+    h('div', { className: 'card-sub', style: { marginBottom: 8 } },
+      "Based on manually reviewed calls that had a BTO primary result to check against. Describes what was observed under this deployment's own recording conditions, not a general BTO accuracy figure - and does not yet include confidence intervals or a small-sample fallback (that's follow-on work)."),
+    reliability.reviewedSampleSize === 0
+      ? h('div', { className: 'card-sub' }, 'No reviewed calls with a BTO primary result yet - reliability will appear here once some QA has been done.')
+      : h('div', { className: 'stat-grid' },
+          h(StatBox, { label: 'Primary-ID reliability', value: fmtNum(reliability.primaryIdReliabilityPct) + '%' }),
+          h(StatBox, { label: 'Complete-event reliability', value: fmtNum(reliability.completeEventReliabilityPct) + '%' }),
+          h(StatBox, { label: 'Additional-species rate', value: fmtNum(reliability.additionalSpeciesRatePct) + '%' }),
+          h(StatBox, { label: 'Reviewed sample (n)', value: reliability.reviewedSampleSize })
+        ),
+
     h('div', { className: 'section-title' }, 'Survey effort'),
     h('div', { className: 'stat-grid' },
       h(StatBox, { label: 'Nights (entered)', value: effort.nights ?? '-' }),
       h(StatBox, { label: 'Nights in data', value: effort.nightsInData }),
       h(StatBox, { label: 'Valid recording hours', value: effort.validRecordingHours ?? '-' }),
-      h(StatBox, { label: 'QA completion %', value: effort.qaCompletionPct != null ? effort.qaCompletionPct + '%' : '-' })
+      h(StatBox, { label: 'QA completion % (computed)', value: fmtNum(effort.qaCompletionPct) + '%' })
     ),
     effort.nights != null && effort.nights !== effort.nightsInData && h('div', { className: 'card-sub', style: { marginTop: 8 } },
       `Note: ${effort.nightsInData} distinct survey night(s) appear in the data, vs ${effort.nights} entered on the Overview tab - detections-per-night below uses the entered figure.`),
@@ -769,11 +759,18 @@ function StatisticsTab({ deployment, location }) {
   );
 }
 
-function DeploymentOverviewTab({ deployment, onPatch, wavFileMap }) {
+function DeploymentOverviewTab({ deployment, onPatch, wavFileMap, location }) {
   const effort = deployment.surveyEffort || {};
   function patchEffort(patch) {
     onPatch({ surveyEffort: { ...effort, ...patch } });
   }
+
+  // Suggests total Valid Recording Hours from the deployment's own date range and the Location's
+  // coordinates (sunset-30min to sunrise+30min, summed across every night) - the same "suggestion,
+  // always editable" pattern as nights/dates, since detector failures/exclusions are real reasons
+  // the true figure can come in lower than this theoretical maximum.
+  const suggestedHours = useMemo(() => Stats.suggestValidRecordingHours(deployment, location), [deployment.startDate, deployment.endDate, location && location.latitude, location && location.longitude]);
+  const hoursRounded = suggestedHours ? Math.round(suggestedHours.totalHours * 10) / 10 : null;
 
   const events = deployment.detectionEvents || [];
   const distinctSurveyDates = useMemo(
@@ -825,11 +822,15 @@ function DeploymentOverviewTab({ deployment, onPatch, wavFileMap }) {
       h('div', { className: 'card-sub' }, `BTO data suggests ${suggestedNights} night${suggestedNights === 1 ? '' : 's'} (${distinctSurveyDates.size} distinct survey date${distinctSurveyDates.size === 1 ? '' : 's'} across ${events.length} detection events). This is a suggestion only - always editable below.`),
       h('button', { className: 'btn btn-secondary btn-small', style: { flexShrink: 0 }, onClick: () => patchEffort({ nights: suggestedNights }) }, `Use ${suggestedNights}`)
     ),
+    hoursRounded != null && hoursRounded !== effort.validRecordingHours && h('div', { className: 'card', style: { marginBottom: 12, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 } },
+      h('div', { className: 'card-sub' }, `This Location's coordinates suggest ${hoursRounded} total valid recording hours (sunset−30min to sunrise+30min, across ${suggestedHours.nights} night(s) from Start to End date). A suggestion only - lower it to account for detector failures or excluded periods.`),
+      h('button', { className: 'btn btn-secondary btn-small', style: { flexShrink: 0 }, onClick: () => patchEffort({ validRecordingHours: hoursRounded }) }, `Use ${hoursRounded}`)
+    ),
     h('div', { className: 'field-row' },
       h(Field, { label: 'Nights' }, h('input', { type: 'number', value: effort.nights ?? '', onChange: (e) => patchEffort({ nights: e.target.value === '' ? null : Number(e.target.value) }) })),
-      h(Field, { label: 'Valid recording hours' }, h('input', { type: 'number', value: effort.validRecordingHours ?? '', onChange: (e) => patchEffort({ validRecordingHours: e.target.value === '' ? null : Number(e.target.value) }) })),
-      h(Field, { label: 'QA completion %' }, h('input', { type: 'number', value: effort.qaCompletionPct ?? '', onChange: (e) => patchEffort({ qaCompletionPct: e.target.value === '' ? null : Number(e.target.value) }) }))
+      h(Field, { label: 'Valid recording hours' }, h('input', { type: 'number', value: effort.validRecordingHours ?? '', onChange: (e) => patchEffort({ validRecordingHours: e.target.value === '' ? null : Number(e.target.value) }) }))
     ),
+    h('div', { className: 'card-sub', style: { marginTop: -8, marginBottom: 14 } }, 'QA completion % is no longer entered here - see the Statistics tab, where it\'s computed directly from the QA queue.'),
     h(Field, { label: 'Detector failures' }, h('textarea', { rows: 2, value: effort.detectorFailures, onChange: (e) => patchEffort({ detectorFailures: e.target.value }), placeholder: 'e.g. flat battery night 3, no recordings 19-20 June' })),
     h(Field, { label: 'Excluded periods' }, h('textarea', { rows: 2, value: effort.excludedPeriods, onChange: (e) => patchEffort({ excludedPeriods: e.target.value }), placeholder: 'e.g. 21 June excluded - detector knocked down' })),
 
@@ -1049,9 +1050,8 @@ function CustomLabelInput({ onSubmit }) {
 }
 
 // For a species BTO's classifier never gave a candidate row at all (as opposed to a low-probability
-// one) - adds a brand new Detection Event alongside the current one, rather than overwriting its
-// Final ID. Shares the existing species datalist (#all-species-names) rendered by CustomLabelInput.
-function AddMissedSpeciesInput({ onAdd }) {
+// one). Shares the existing species datalist (#all-species-names) rendered by CustomLabelInput.
+function AddMissedSpeciesInput({ onAdd, buttonLabel, placeholder }) {
   const [value, setValue] = useState('');
   function submit() {
     const v = value.trim();
@@ -1061,7 +1061,7 @@ function AddMissedSpeciesInput({ onAdd }) {
   }
   return h('div', { style: { display: 'flex', gap: 8, marginTop: 8 } },
     h('input', {
-      value, list: 'all-species-names', placeholder: 'Species BTO missed entirely...',
+      value, list: 'all-species-names', placeholder: placeholder || 'Species BTO missed entirely...',
       style: {
         flex: 1, maxWidth: 260, background: 'var(--bg-card)', border: '1px solid var(--border)',
         borderRadius: 8, color: 'var(--text)', padding: '7px 10px', fontSize: 13, fontFamily: 'var(--font-body)',
@@ -1069,7 +1069,7 @@ function AddMissedSpeciesInput({ onAdd }) {
       onChange: (e) => setValue(e.target.value),
       onKeyDown: (e) => { if (e.key === 'Enter') submit(); },
     }),
-    h('button', { className: 'btn btn-secondary btn-small', disabled: !value.trim(), onClick: submit }, '+ Add as new detection')
+    h('button', { className: 'btn btn-secondary btn-small', disabled: !value.trim(), onClick: submit }, buttonLabel || '+ Add')
   );
 }
 
@@ -1168,6 +1168,13 @@ function toDateInputValue(date) {
 
 function primaryIdLabel(ev) {
   return ev.primaryBtoId ? (ev.primaryBtoId.englishName || ev.primaryBtoId.species) : 'No ID';
+}
+
+// Resolved label for display: just the primary species for a single-species event, or every
+// species joined together when manual review found more than one in the same Detection Event.
+function formatResolvedLabel(ev) {
+  const records = M.resolveSpeciesRecords(ev);
+  return records.map((r) => r.finalId).join(' + ');
 }
 
 // Groups every call by BTO's Primary ID (chronological within each species) - much faster to
@@ -1756,7 +1763,7 @@ function MeasureField({ label, value, unit, onChange, tool, active, onToggleTool
   );
 }
 
-function ReviewTab({ deployment, onPatchEvent, onAddManualEvent, wavFileMap, setWavFileMap, customLabels, onAddCustomLabel }) {
+function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, customLabels, onAddCustomLabel }) {
   const allEvents = deployment.detectionEvents || [];
   const profile = deployment.qaProfile || DEFAULT_QA_PROFILE;
   const [sortMode, setSortMode] = useState('primaryId'); // 'primaryId' | 'finalId' | 'chronological'
@@ -1770,13 +1777,17 @@ function ReviewTab({ deployment, onPatchEvent, onAddManualEvent, wavFileMap, set
   // Lets the whole list be narrowed to just one resolved Final ID - e.g. to check every call
   // currently labelled "Myotis sp" together, independent of QA queue/unreviewed status.
   const [finalIdFilter, setFinalIdFilter] = useState('');
+  // Every resolved species across every event, not just each event's primary - so filtering by
+  // "Myotis sp" also finds it when it was only added as a second Species Detection Record.
   const finalIdOptions = useMemo(
-    () => Array.from(new Set(allEvents.map((e) => M.resolveFinalId(e).finalId))).sort(),
+    () => Array.from(new Set(allEvents.flatMap((e) => M.resolveSpeciesRecords(e).map((r) => r.finalId)))).sort(),
     [allEvents]
   );
 
   const queueFiltered = queueOnly ? sorted.filter((e) => QaProfiles.computeQaInclusion(e, profile).included) : sorted;
-  const idFiltered = finalIdFilter ? queueFiltered.filter((e) => M.resolveFinalId(e).finalId === finalIdFilter) : queueFiltered;
+  const idFiltered = finalIdFilter
+    ? queueFiltered.filter((e) => M.resolveSpeciesRecords(e).some((r) => r.finalId === finalIdFilter))
+    : queueFiltered;
   const list = unreviewedOnly ? idFiltered.filter((e) => !e.manualReview.reviewed) : idFiltered;
 
   const [currentId, setCurrentId] = useState(list[0] ? list[0].id : null);
@@ -1803,9 +1814,10 @@ function ReviewTab({ deployment, onPatchEvent, onAddManualEvent, wavFileMap, set
       .filter((e) => e.originalWav === currentEvent.originalWav)
       .map((e) => ({
         eventId: e.id, partNumber: e.partNumber, offsetSec: estimateOffsetSec(e),
-        // Resolved Final ID, not the raw BTO guess - a manually-added event has no BTO candidate
-        // at all, so primaryIdLabel would always show "No ID" for it even once labelled.
-        label: M.resolveFinalId(e).finalId, isCurrent: e.id === currentEvent.id, addedManually: !!e.addedManually,
+        // Resolved label(s), not the raw BTO guess - a manually-added event has no BTO candidate
+        // at all, so primaryIdLabel would always show "No ID" for it even once labelled, and a
+        // multi-species event should show every species, not just the primary.
+        label: formatResolvedLabel(e), isCurrent: e.id === currentEvent.id, addedManually: !!e.addedManually,
       }))
       .filter((m) => m.offsetSec != null)
       .sort((a, b) => a.offsetSec - b.offsetSec);
@@ -1966,6 +1978,24 @@ function ReviewTab({ deployment, onPatchEvent, onAddManualEvent, wavFileMap, set
       },
     });
     goTo(currentIndex + 1);
+  }
+
+  // A second (or third...) species confirmed present in this SAME Detection Event - stays on the
+  // one event as an extra Species Detection Record, rather than spawning a whole separate event.
+  // Does not advance to the next call, since the analyst is still working on this one.
+  function addAdditionalSpecies(label) {
+    if (!currentEvent) return;
+    const existing = currentEvent.manualReview.additionalTaxa || [];
+    if (existing.includes(label) || label === currentEvent.manualReview.finalId) return;
+    onPatchEvent(currentEvent.id, {
+      manualReview: { ...currentEvent.manualReview, additionalTaxa: [...existing, label] },
+    });
+  }
+  function removeAdditionalTaxon(label) {
+    if (!currentEvent) return;
+    onPatchEvent(currentEvent.id, {
+      manualReview: { ...currentEvent.manualReview, additionalTaxa: (currentEvent.manualReview.additionalTaxa || []).filter((t) => t !== label) },
+    });
   }
 
   const toolbar = h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, flexWrap: 'wrap', gap: 10 } },
@@ -2152,11 +2182,23 @@ function ReviewTab({ deployment, onPatchEvent, onAddManualEvent, wavFileMap, set
               )
             : h('div', { className: 'card-sub' }, 'No ID (BTO could not classify this segment)'),
           currentEvent.manualReview.reviewed && h('div', { style: { marginTop: 8, color: 'var(--teal)', fontSize: 13 } }, `New ID: ${currentEvent.manualReview.finalId} (reviewed)`),
+          (currentEvent.manualReview.additionalTaxa || []).length > 0 && h('div', { style: { marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: 6 } },
+            currentEvent.manualReview.additionalTaxa.map((taxon) => h('span', {
+              key: taxon, className: 'pill', style: { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '4px 8px', color: 'var(--teal)' },
+            }, `+ ${taxon}`, h('button', {
+              onClick: () => removeAdditionalTaxon(taxon),
+              style: { background: 'none', border: 'none', color: 'inherit', cursor: 'pointer', padding: 0, fontSize: 13, lineHeight: 1 },
+            }, '×')))
+          ),
           h('div', { style: { marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--border)' } },
-            h('div', { className: 'card-sub', style: { marginBottom: 4 } }, 'See a species here BTO missed entirely (not just low-probability)? Add it as its own detection, without changing this call\'s own ID:'),
-            h(AddMissedSpeciesInput, { onAdd: (label) => onAddManualEvent(currentEvent, label) }),
-            fileAddedCount > 0 && h('div', { className: 'card-sub', style: { marginTop: 6, color: 'var(--accent)' } },
-              `${fileAddedCount} manually added in this file - ${deploymentAddedCount} total in this deployment.`)
+            h('div', { className: 'card-sub', style: { marginBottom: 4 } },
+              'This same call also contains another species (a mixed recording BTO only gave one result for)? Add it here - it stays part of this same Detection Event, not a separate one:'),
+            h(AddMissedSpeciesInput, {
+              onAdd: addAdditionalSpecies, buttonLabel: '+ Add to this event',
+              placeholder: 'Other species in this same call...',
+            }),
+            fileAddedCount > 0 && h('div', { className: 'card-sub', style: { marginTop: 6, color: 'var(--text-faint)' } },
+              `Also: ${fileAddedCount} species added as separate Detection Events in this file under the older pattern (${deploymentAddedCount} total in this deployment) - still counted, but no longer how new ones are added.`)
           )
         ),
 
@@ -2261,7 +2303,7 @@ function EventsTable({ list, currentId, onSelect }) {
                 ? h('span', { style: { color: 'var(--accent)' }, title: 'Added manually - BTO never gave this call a candidate row at all' }, '+ manually added')
                 : (ev.primaryBtoId ? (ev.primaryBtoId.englishName || ev.primaryBtoId.species) : 'No ID')),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, ev.primaryBtoId && ev.primaryBtoId.probability != null ? ev.primaryBtoId.probability.toFixed(2) : ''),
-            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', color: 'var(--teal)' } }, ev.manualReview.finalId || ''),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', color: 'var(--teal)' } }, ev.manualReview.finalId ? formatResolvedLabel(ev) : ''),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, ev.manualReview.reviewed ? '✓' : '')
           );
         }))

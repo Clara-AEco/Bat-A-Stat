@@ -30,27 +30,37 @@ window.BatID = window.BatID || {};
     return isNaN(dt.getTime()) ? null : dt;
   }
 
-  // One row per Detection Event, resolved to what it now counts as for every stat/figure:
-  // - category: 'bat' (a real bat species, whether from BTO or manual review),
-  //             'noise' (manually confirmed as not a bat call),
-  //             'other-taxon' (BTO identified a non-bat species - e.g. dormouse, bush-cricket -
-  //                            kept visible per Clara's own instruction, never folded into "noise"),
-  //             'unidentified' (BTO could not classify it at all, and nobody's reviewed it yet -
-  //                            may or may not be a real bat pass, so it counts toward total
-  //                            activity but never toward species-level stats).
+  // One row per Species Detection Record - a single 5-second Detection Event may resolve to
+  // more than one (e.g. a mixed recording where manual review confirms a species BTO's primary
+  // result didn't reflect), via Models.resolveSpeciesRecords. Each row's category:
+  // - 'bat' (a real bat species, whether from BTO or manual review),
+  // - 'noise' (manually confirmed as not a bat call),
+  // - 'other-taxon' (BTO identified a non-bat species - e.g. dormouse, bush-cricket - kept
+  //                  visible per Clara's own instruction, never folded into "noise"),
+  // - 'unidentified' (BTO could not classify it at all, and nobody's reviewed it yet - may or may
+  //                   not be a real bat pass, so it counts toward total activity but never toward
+  //                   species-level stats).
+  // Activity/species stats deliberately just iterate this dataset without special-casing multi-
+  // record events - a 2-species event naturally contributes twice, once per resolved species,
+  // which is what "both species carried into activity totals" requires.
   function buildAnalysisDataset(events) {
-    return (events || []).map((ev) => {
-      const { finalId, source } = M.resolveFinalId(ev);
-      let category;
-      if (source === 'manual') {
-        category = finalId === 'Noise / No ID' ? 'noise' : 'bat';
-      } else if (ev.primaryBtoId) {
-        category = (ev.primaryBtoId.group || 'bat').toLowerCase() === 'bat' ? 'bat' : 'other-taxon';
-      } else {
-        category = 'unidentified';
+    const rows = [];
+    for (const ev of events || []) {
+      const dateTime = eventDateTime(ev);
+      const surveyDate = ev.surveyDate || ev.actualDate || null;
+      for (const { finalId, source } of M.resolveSpeciesRecords(ev)) {
+        let category;
+        if (source === 'manual' || source === 'manual-additional') {
+          category = finalId === 'Noise / No ID' ? 'noise' : 'bat';
+        } else if (ev.primaryBtoId) {
+          category = (ev.primaryBtoId.group || 'bat').toLowerCase() === 'bat' ? 'bat' : 'other-taxon';
+        } else {
+          category = 'unidentified';
+        }
+        rows.push({ event: ev, eventId: ev.id, finalId, source, category, dateTime, surveyDate, isAdditional: source === 'manual-additional' });
       }
-      return { event: ev, finalId, source, category, dateTime: eventDateTime(ev), surveyDate: ev.surveyDate || ev.actualDate || null };
-    });
+    }
+    return rows;
   }
 
   function mean(values) {
@@ -79,18 +89,49 @@ window.BatID = window.BatID || {};
 
   // Pass-through of the manually-entered effort fields, plus a cross-check against what the data
   // itself suggests (same "suggestion, never silently substituted" pattern as the Overview tab's
-  // nights/dates banners).
+  // nights/dates banners). QA completion % is the one exception - it's fully derivable from the
+  // QA profile and detection events with no judgement call involved, so it's always computed
+  // directly rather than relying on a manual field nobody remembers to keep updated.
   function computeEffortStats(deployment, dataset) {
     const effort = deployment.surveyEffort || {};
     const surveyNights = new Set(dataset.map((d) => d.surveyDate).filter(Boolean));
+    const qaSummary = ns.QaProfiles.computeQaSummary(deployment.detectionEvents || [], deployment.qaProfile || {});
     return {
       nights: effort.nights,
       validRecordingHours: effort.validRecordingHours,
-      qaCompletionPct: effort.qaCompletionPct,
+      qaCompletionPct: qaSummary.queued > 0 ? (qaSummary.queuedReviewed / qaSummary.queued) * 100 : 100,
       detectorFailures: effort.detectorFailures,
       excludedPeriods: effort.excludedPeriods,
       nightsInData: surveyNights.size,
     };
+  }
+
+  // Suggests total Valid Recording Hours for the whole deployment from its own date range and the
+  // Location's coordinates: for each calendar night from Start Date to End Date, the recording
+  // window is assumed to run from 30 minutes before sunset to 30 minutes after the following
+  // sunrise (a standard emergence/return survey convention), summed across every night. A
+  // suggestion only, same as nights/dates elsewhere - detector failures/exclusions are real-world
+  // reasons the actual figure can come in lower, and are why this stays manually editable.
+  function suggestValidRecordingHours(deployment, location) {
+    if (!location || location.latitude == null || location.longitude == null) return null;
+    if (!deployment.startDate || !deployment.endDate) return null;
+    const [sy, sm, sd] = deployment.startDate.split('-').map(Number);
+    const [ey, em, ed] = deployment.endDate.split('-').map(Number);
+    const start = new Date(sy, sm - 1, sd);
+    const end = new Date(ey, em - 1, ed);
+    if (isNaN(start.getTime()) || isNaN(end.getTime()) || end < start) return null;
+
+    let totalHours = 0, nights = 0;
+    const PAD_MS = 30 * 60 * 1000;
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      const nextDay = new Date(d); nextDay.setDate(nextDay.getDate() + 1);
+      const { sunset } = ns.Sun.sunTimes(d, location.latitude, location.longitude);
+      const { sunrise } = ns.Sun.sunTimes(nextDay, location.latitude, location.longitude);
+      if (!sunset || !sunrise) continue; // polar day/night - not a UK concern, but don't crash
+      const hours = (sunrise.getTime() + PAD_MS - (sunset.getTime() - PAD_MS)) / (1000 * 60 * 60);
+      if (hours > 0) { totalHours += hours; nights++; }
+    }
+    return nights > 0 ? { totalHours, nights } : null;
   }
 
   // Total activity, nightly breakdown, and the summary statistics of that nightly breakdown -
@@ -213,21 +254,62 @@ window.BatID = window.BatID || {};
   function computeAllStats(deployment, location) {
     const dataset = buildAnalysisDataset(deployment.detectionEvents || []);
     const effort = computeEffortStats(deployment, dataset);
+    const events = deployment.detectionEvents || [];
     return {
       dataset,
+      totalDetectionEvents: events.length,
+      totalSpeciesRecords: dataset.length,
       effort,
       activity: computeActivityStats(dataset, effort),
       species: computeSpeciesStats(dataset),
       timing: computeTimingStats(dataset, location),
+      reliability: computeReliabilityStats(events),
+    };
+  }
+
+  // First cut at "how good is BTO's own primary identification, given what manual review actually
+  // found" - the three headline measures from Clara's QA-reliability spec (Stage 1 of that work;
+  // stratifying by species/probability band/recording-condition, confidence intervals and a
+  // fallback hierarchy for small samples are follow-on work, not done here yet). Only counts
+  // reviewed events that had a BTO primary result at all - there's no "was the primary correct"
+  // question to ask of an event BTO never proposed anything for.
+  //
+  // A. Primary-ID reliability: was BTO's primary species kept as (one of) the resolved species?
+  //    A "correct but incomplete" event (primary kept, but another species also added) still
+  //    counts as correct here - the primary identification itself wasn't wrong.
+  // B. Complete-event reliability: did the event need no change at all - no reassignment, no
+  //    added species? Stricter than (A): a "correct but incomplete" event fails this one.
+  // C. Additional-species rate: how often did manual review find a species BTO's primary result
+  //    didn't represent - most relevant where field conditions may mask weaker/overlapping calls.
+  function computeReliabilityStats(events) {
+    const reviewed = (events || []).filter((ev) => ev.manualReview && ev.manualReview.reviewed && ev.primaryBtoId);
+    const n = reviewed.length;
+    let primaryCorrect = 0, complete = 0, withAdditional = 0;
+    for (const ev of reviewed) {
+      const primaryLabel = ev.primaryBtoId.englishName || ev.primaryBtoId.species;
+      const finalId = ev.manualReview.finalId;
+      const additional = ev.manualReview.additionalTaxa || [];
+      const primaryRetained = finalId === primaryLabel;
+      if (primaryRetained) primaryCorrect++;
+      if (primaryRetained && additional.length === 0) complete++;
+      if (additional.length > 0) withAdditional++;
+    }
+    return {
+      reviewedSampleSize: n,
+      primaryIdReliabilityPct: n > 0 ? (primaryCorrect / n) * 100 : null,
+      completeEventReliabilityPct: n > 0 ? (complete / n) * 100 : null,
+      additionalSpeciesRatePct: n > 0 ? (withAdditional / n) * 100 : null,
     };
   }
 
   ns.Stats = {
     buildAnalysisDataset,
     computeEffortStats,
+    suggestValidRecordingHours,
     computeActivityStats,
     computeSpeciesStats,
     computeTimingStats,
+    computeReliabilityStats,
     computeAllStats,
     mean, median, stdDev, percentile,
   };
