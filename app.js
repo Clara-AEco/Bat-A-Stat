@@ -993,17 +993,32 @@ function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box
 
 const TE_FACTORS = [5, 10, 20];
 
+function normalizeToPeak(x, targetPeak) {
+  let peak = 0;
+  for (let i = 0; i < x.length; i++) { const a = Math.abs(x[i]); if (a > peak) peak = a; }
+  if (peak <= 0) return x;
+  const g = targetPeak / peak;
+  const out = new Float32Array(x.length);
+  for (let i = 0; i < x.length; i++) out[i] = x[i] * g;
+  return out;
+}
+
 // Plays the currently boxed region (or the whole visible recording if nothing's boxed) either as
 // a simulated heterodyne detector (mix + lowpass, tunable) or time-expanded (slowed + pitched
 // down by a fixed factor) - both audible ways of listening to an otherwise ultrasonic call.
+// Real detector recordings are often recorded with a lot of headroom (quiet relative to full
+// scale), so both modes are peak-normalized before playback and there's an extra gain control -
+// otherwise "silence" can just mean "too quiet to notice", not that nothing is happening.
 function AudioPlayback({ samples, sampleRate, box }) {
   const [mode, setMode] = useState('heterodyne');
   const [tuneKHz, setTuneKHz] = useState(45);
   const [teFactor, setTeFactor] = useState(10);
+  const [gain, setGain] = useState(2);
   const [playing, setPlaying] = useState(false);
   const [error, setError] = useState(null);
   const ctxRef = useRef(null);
   const sourceRef = useRef(null);
+  const gainNodeRef = useRef(null);
 
   function stop() {
     if (sourceRef.current) {
@@ -1015,6 +1030,11 @@ function AudioPlayback({ samples, sampleRate, box }) {
 
   // Stop if the underlying recording changes (e.g. moved to the next call) or on unmount.
   useEffect(() => stop, [samples]);
+
+  // Live volume changes while something is already playing.
+  useEffect(() => {
+    if (gainNodeRef.current) gainNodeRef.current.gain.value = gain;
+  }, [gain]);
 
   function play() {
     stop();
@@ -1033,26 +1053,38 @@ function AudioPlayback({ samples, sampleRate, box }) {
 
       if (!ctxRef.current) ctxRef.current = new (window.AudioContext || window.webkitAudioContext)();
       const ctx = ctxRef.current;
-      if (ctx.state === 'suspended') ctx.resume();
 
       let data, outRate;
       if (mode === 'heterodyne') {
         const mixed = Dsp.heterodyneMix(slice, sampleRate, tuneKHz * 1000, 8000);
         outRate = Math.min(48000, sampleRate);
-        data = Dsp.resampleLinear(mixed, sampleRate, outRate);
+        data = normalizeToPeak(Dsp.resampleLinear(mixed, sampleRate, outRate), 0.85);
       } else {
         outRate = Math.max(8000, Math.min(192000, Math.round(sampleRate / teFactor)));
-        data = slice;
+        data = normalizeToPeak(slice, 0.85);
       }
       const buffer = ctx.createBuffer(1, data.length, outRate);
-      buffer.copyToChannel(data instanceof Float32Array ? data : new Float32Array(data), 0);
-      const src = ctx.createBufferSource();
-      src.buffer = buffer;
-      src.connect(ctx.destination);
-      src.onended = () => { setPlaying(false); sourceRef.current = null; };
-      src.start();
-      sourceRef.current = src;
-      setPlaying(true);
+      buffer.copyToChannel(data, 0);
+
+      const startPlayback = () => {
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        const gainNode = ctx.createGain();
+        gainNode.gain.value = gain;
+        src.connect(gainNode);
+        gainNode.connect(ctx.destination);
+        src.onended = () => { setPlaying(false); sourceRef.current = null; gainNodeRef.current = null; };
+        src.start();
+        sourceRef.current = src;
+        gainNodeRef.current = gainNode;
+        setPlaying(true);
+      };
+
+      if (ctx.state === 'suspended') {
+        ctx.resume().then(startPlayback).catch((e) => setError('Could not start audio: ' + e.message));
+      } else {
+        startPlayback();
+      }
     } catch (e) {
       setError('Could not play audio: ' + (e && e.message ? e.message : e));
     }
@@ -1071,6 +1103,9 @@ function AudioPlayback({ samples, sampleRate, box }) {
     mode === 'timeExpansion' && h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, 'Factor',
       h('select', { value: teFactor, onChange: (e) => setTeFactor(Number(e.target.value)), style: selectStyle },
         TE_FACTORS.map((f) => h('option', { key: f, value: f }, `${f}x`)))),
+    h('label', { style: { display: 'flex', alignItems: 'center', gap: 6 } }, 'Volume',
+      h('input', { type: 'range', min: 0.5, max: 5, step: 0.5, value: gain, onChange: (e) => setGain(Number(e.target.value)), style: { width: 70 } }),
+      h('span', { style: { fontFamily: 'var(--font-mono)', color: 'var(--text-faint)' } }, `${gain}x`)),
     h('button', { className: 'btn btn-secondary btn-small', onClick: playing ? stop : play }, playing ? '■ Stop' : '▶ Play'),
     box && h('span', { className: 'card-sub' }, '(boxed region)'),
     error && h('span', { style: { color: 'var(--danger)' } }, error)
@@ -1336,26 +1371,11 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
             }, SpeciesData.SHAPE_LABELS.map((s) => h('option', { key: s, value: s }, s))),
             shapeAuto && !shapeOverride && h('span', { className: 'pill' }, `auto-suggested (${Math.round(shapeAuto.confidence * 100)}%)`)
           )
-        ),
-
-        speciesResults.length > 0 && h('div', { className: 'card', style: { marginTop: 14, padding: 0, overflow: 'hidden' } },
-          h('div', { style: { padding: '10px 14px', borderBottom: '1px solid var(--border)', fontWeight: 600, fontSize: 13 } }, 'Decision-tree candidates (top 6, weighted: shape & peak > duration > start/end)'),
-          h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
-            h('thead', null, h('tr', null,
-              ['Species', 'Score', 'Shape', 'Peak', 'Duration', 'Start', 'End'].map((c) => h('th', { key: c, style: { textAlign: 'left', padding: '5px 10px', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' } }, c))
-            )),
-            h('tbody', null, speciesResults.slice(0, 6).map((res) => h('tr', { key: res.species.name },
-              h('td', { style: { padding: '5px 10px', borderTop: '1px solid var(--border)' } }, res.species.name),
-              h('td', { style: { padding: '5px 10px', borderTop: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, `${Math.round(res.score * 100)}%`),
-              ...['shape', 'peak', 'duration', 'start', 'end'].map((k) => h('td', {
-                key: k, style: { padding: '5px 10px', borderTop: '1px solid var(--border)', color: res.checks[k] === true ? 'var(--teal)' : res.checks[k] === false ? 'var(--danger)' : 'var(--text-faint)' },
-              }, res.checks[k] === true ? '✓' : res.checks[k] === false ? '✗' : '-'))
-            )))
-          )
         )
       ),
 
-      // Right: identification panel, next to the sonogram - old ID, quick labels, custom label
+      // Right: identification panel, next to the sonogram - old ID, decision tree, quick labels,
+      // custom label. Kept here (not the left column) so it's visible without scrolling.
       h('div', null,
         h('div', { className: 'card' },
           h('div', { style: { fontWeight: 600, fontSize: 13, marginBottom: 8 } }, 'Old ID (BTO)'),
@@ -1369,6 +1389,24 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap }) {
               )
             : h('div', { className: 'card-sub' }, 'No ID (BTO could not classify this segment)'),
           currentEvent.manualReview.reviewed && h('div', { style: { marginTop: 8, color: 'var(--teal)', fontSize: 13 } }, `New ID: ${currentEvent.manualReview.finalId} (reviewed)`)
+        ),
+
+        speciesResults.length > 0 && h('div', { className: 'card', style: { marginTop: 14, padding: 0, overflow: 'hidden' } },
+          h('div', { style: { padding: '10px 12px', borderBottom: '1px solid var(--border)', fontWeight: 600, fontSize: 12 } }, 'Decision-tree candidates (weighted: shape & peak > duration > start/end)'),
+          h('div', { style: { overflowX: 'auto' } },
+            h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 11 } },
+              h('thead', null, h('tr', null,
+                ['Species', 'Score', 'Shape', 'Peak', 'Dur.', 'Start', 'End'].map((c) => h('th', { key: c, style: { textAlign: 'left', padding: '4px 8px', color: 'var(--text-faint)', fontSize: 9, textTransform: 'uppercase', whiteSpace: 'nowrap' } }, c))
+              )),
+              h('tbody', null, speciesResults.slice(0, 6).map((res) => h('tr', { key: res.species.name },
+                h('td', { style: { padding: '4px 8px', borderTop: '1px solid var(--border)', whiteSpace: 'nowrap' } }, res.species.name),
+                h('td', { style: { padding: '4px 8px', borderTop: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, `${Math.round(res.score * 100)}%`),
+                ...['shape', 'peak', 'duration', 'start', 'end'].map((k) => h('td', {
+                  key: k, style: { padding: '4px 8px', borderTop: '1px solid var(--border)', color: res.checks[k] === true ? 'var(--teal)' : res.checks[k] === false ? 'var(--danger)' : 'var(--text-faint)' },
+                }, res.checks[k] === true ? '✓' : res.checks[k] === false ? '✗' : '-'))
+              )))
+            )
+          )
         ),
 
         h('div', { style: { marginTop: 14 } },
@@ -1411,18 +1449,29 @@ const TABLE_WINDOW_RADIUS = 60;
 
 function EventsTable({ list, currentId, onSelect }) {
   const rowRef = useRef(null);
+  const containerRef = useRef(null);
   const currentIndex = list.findIndex((e) => e.id === currentId);
   const from = Math.max(0, currentIndex - TABLE_WINDOW_RADIUS);
   const to = Math.min(list.length, currentIndex + TABLE_WINDOW_RADIUS + 1);
   const windowRows = list.slice(from, to);
 
+  // Scroll only the table's own scroll container to reveal the current row - never the page.
+  // (Element.scrollIntoView() walks every scrollable ancestor, including the page itself, which
+  // was yanking the sonogram out of view every time the selection changed.)
   useEffect(() => {
-    if (rowRef.current) rowRef.current.scrollIntoView({ block: 'nearest' });
+    const row = rowRef.current, container = containerRef.current;
+    if (!row || !container) return;
+    const rowRect = row.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
+    const rowTop = rowRect.top - containerRect.top + container.scrollTop;
+    const rowBottom = rowTop + rowRect.height;
+    if (rowTop < container.scrollTop) container.scrollTop = rowTop;
+    else if (rowBottom > container.scrollTop + container.clientHeight) container.scrollTop = rowBottom - container.clientHeight;
   }, [currentId]);
 
   return h('div', { style: { marginTop: 18 } },
     h('div', { className: 'section-title' }, `Calls list (showing ${from + 1}-${to} of ${list.length})`),
-    h('div', { className: 'card', style: { padding: 0, maxHeight: 320, overflowY: 'auto' } },
+    h('div', { ref: containerRef, className: 'card', style: { padding: 0, maxHeight: 320, overflowY: 'auto', overscrollBehavior: 'contain' } },
       h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
         h('thead', null, h('tr', null,
           ['WAV', 'Part', 'Time', 'Primary ID', 'Prob.', 'Final ID', 'Reviewed'].map((c) => h('th', {
