@@ -6,6 +6,7 @@ const Bto = window.BatID.Bto;
 const Wav = window.BatID.Wav;
 const Dsp = window.BatID.Dsp;
 const SpeciesData = window.BatID.SpeciesData;
+const EmergenceData = window.BatID.EmergenceData;
 const QaProfiles = window.BatID.QaProfiles;
 const Sun = window.BatID.Sun;
 const Stats = window.BatID.Stats;
@@ -522,7 +523,7 @@ function DeploymentPanel({ location, deployment, activeTab, setActiveTab, onPatc
   } else if (activeTab === 'review') {
     tabContent = h(ReviewTab, { deployment, onPatchEvent, wavFileMap, setWavFileMap, customLabels, onAddCustomLabel });
   } else if (activeTab === 'stats') {
-    tabContent = h(StatisticsTab, { deployment, location });
+    tabContent = h(StatisticsTab, { deployment, location, onPatch });
   } else if (activeTab === 'comparisons') {
     tabContent = h(ComparisonsTab, { location, deployment });
   } else {
@@ -668,8 +669,116 @@ function fmtHour(h) {
 function fmtDateTime(d) {
   return d ? d.toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '-';
 }
+// surveyDate/actualDate are stored dd/mm/yyyy (BTO's own convention, see stats.js's
+// parseDdMmYyyy) - NOT the yyyy-mm-dd it might look like at a glance.
+function parseSurveyDate(s) {
+  if (!s) return null;
+  const [d, m, y] = s.split('/').map(Number);
+  if (!y || !m || !d) return null;
+  return new Date(y, m - 1, d);
+}
 
-function StatisticsTab({ deployment, location }) {
+// Bar chart of the mean hourly activity profile (the same numbers as the table's "Mean" row),
+// with an optional overlay of typical emergence/return reference times when a single named
+// species is selected. The overlay only appears in sunset-relative mode: clock-hour bins wrap at
+// midnight and aren't a continuous scale (see computeHourlyActivity's own bin-ordering comment),
+// so there's no single consistent x position to draw a reference line at. Return times in the
+// source data are reported as minutes before SUNRISE, not sunset, so they're converted onto this
+// chart's sunset-relative axis using one representative night from the current view (the middle
+// night by date) - an approximation, since day length shifts slightly across a real deployment,
+// but reference lines are inherently "typical", not exact.
+function HourlyActivityChart({ hourly, filter, location }) {
+  const bins = hourly.bins;
+  if (!bins.length) return null;
+  const width = 720, height = 220;
+  const padding = { top: 14, right: 16, bottom: 32, left: 42 };
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const maxVal = Math.max(1, ...hourly.binMeans);
+  const slotWidth = plotWidth / bins.length;
+  const barGap = 2;
+
+  function xForIndex(i) { return padding.left + i * slotWidth; }
+  function yForValue(v) { return padding.top + plotHeight - (v / maxVal) * plotHeight; }
+  function binLabel(b) {
+    return hourly.sunsetRelative ? `${b >= 0 ? '+' : ''}${b}h` : `${String(((b % 24) + 24) % 24).padStart(2, '0')}:00`;
+  }
+
+  let overlay = null;
+  if (hourly.sunsetRelative && filter.type === 'species' && filter.value) {
+    const ref = EmergenceData.lookup(filter.value);
+    if (ref) {
+      const xForSunsetHour = (hVal) => padding.left + ((hVal - bins[0]) / hourly.binSizeHours) * slotWidth + slotWidth / 2;
+      const emergenceHour = ref.emergence && ref.emergence.meanMinutes != null ? ref.emergence.meanMinutes / 60 : null;
+      const emergenceRange = ref.emergence && ref.emergence.rangeMinutes ? ref.emergence.rangeMinutes.map((m) => m / 60) : null;
+
+      let returnHour = null, returnRange = null;
+      if (ref.return && ref.return.meanMinutes != null && location && location.latitude != null && location.longitude != null) {
+        const midNight = hourly.rows[Math.floor(hourly.rows.length / 2)];
+        const d = midNight ? parseSurveyDate(midNight.surveyDate) : null;
+        if (d) {
+          const nextDay = new Date(d); nextDay.setDate(nextDay.getDate() + 1);
+          const { sunset } = Sun.sunTimes(d, location.latitude, location.longitude);
+          const { sunrise } = Sun.sunTimes(nextDay, location.latitude, location.longitude);
+          if (sunset && sunrise) {
+            const durationHours = (sunrise.getTime() - sunset.getTime()) / (1000 * 60 * 60);
+            returnHour = durationHours - ref.return.meanMinutes / 60;
+            if (ref.return.rangeMinutes) returnRange = ref.return.rangeMinutes.map((m) => durationHours - m / 60).sort((a, b) => a - b);
+          }
+        }
+      }
+      overlay = { ref, emergenceHour, emergenceRange, returnHour, returnRange, xForSunsetHour };
+    }
+  }
+
+  return h('div', { style: { marginTop: 10 } },
+    h('svg', { viewBox: `0 0 ${width} ${height}`, style: { width: '100%', height: 'auto', display: 'block' } },
+      [0, 0.5, 1].map((f) => h('line', {
+        key: 'grid' + f, x1: padding.left, x2: width - padding.right, y1: yForValue(maxVal * f), y2: yForValue(maxVal * f),
+        stroke: 'var(--border)', strokeWidth: 1,
+      })),
+      [0, 0.5, 1].map((f) => h('text', {
+        key: 'lbl' + f, x: padding.left - 6, y: yForValue(maxVal * f) + 3, textAnchor: 'end', fontSize: 9, fill: 'var(--text-faint)',
+      }, fmtNum(maxVal * f, 0))),
+      overlay && overlay.emergenceRange && h('rect', {
+        key: 'erange', x: overlay.xForSunsetHour(overlay.emergenceRange[0]),
+        width: Math.max(0, overlay.xForSunsetHour(overlay.emergenceRange[1]) - overlay.xForSunsetHour(overlay.emergenceRange[0])),
+        y: padding.top, height: plotHeight, fill: '#4da3ff', opacity: 0.12,
+      }),
+      overlay && overlay.returnRange && h('rect', {
+        key: 'rrange', x: overlay.xForSunsetHour(overlay.returnRange[0]),
+        width: Math.max(0, overlay.xForSunsetHour(overlay.returnRange[1]) - overlay.xForSunsetHour(overlay.returnRange[0])),
+        y: padding.top, height: plotHeight, fill: '#c77dff', opacity: 0.12,
+      }),
+      hourly.binMeans.map((v, i) => h('rect', {
+        key: i, x: xForIndex(i) + barGap / 2, y: yForValue(v), width: Math.max(1, slotWidth - barGap), height: Math.max(0, yForValue(0) - yForValue(v)),
+        fill: '#e6923a', opacity: 0.9,
+      })),
+      overlay && overlay.emergenceHour != null && h('line', {
+        key: 'eline', x1: overlay.xForSunsetHour(overlay.emergenceHour), x2: overlay.xForSunsetHour(overlay.emergenceHour),
+        y1: padding.top, y2: height - padding.bottom, stroke: '#4da3ff', strokeWidth: 1.5, strokeDasharray: '4 2',
+      }),
+      overlay && overlay.returnHour != null && h('line', {
+        key: 'rline', x1: overlay.xForSunsetHour(overlay.returnHour), x2: overlay.xForSunsetHour(overlay.returnHour),
+        y1: padding.top, y2: height - padding.bottom, stroke: '#c77dff', strokeWidth: 1.5, strokeDasharray: '4 2',
+      }),
+      bins.map((b, i) => h('text', {
+        key: 'x' + i, x: xForIndex(i) + slotWidth / 2, y: height - padding.bottom + 14, textAnchor: 'middle', fontSize: 9, fill: 'var(--text-faint)',
+      }, binLabel(b)))
+    ),
+    h('div', { style: { display: 'flex', gap: 16, fontSize: 11, marginTop: 4, color: 'var(--text-muted)', flexWrap: 'wrap' } },
+      h('span', null, '■ Mean activity'),
+      overlay && overlay.emergenceHour != null && h('span', { style: { color: '#4da3ff' } }, `┊ Typical emergence (${overlay.ref.emergence.source})`),
+      overlay && overlay.returnHour != null && h('span', { style: { color: '#c77dff' } }, `┊ Typical return (${overlay.ref.return.source})`)
+    ),
+    !overlay && filter.type === 'species' && filter.value && !hourly.sunsetRelative && h('div', { className: 'card-sub', style: { marginTop: 4 } },
+      "Set this Location's Latitude/Longitude (on its Details tab) to overlay typical emergence/return times for this species."),
+    !overlay && filter.type === 'species' && filter.value && hourly.sunsetRelative && !EmergenceData.lookup(filter.value) && h('div', { className: 'card-sub', style: { marginTop: 4 } },
+      'No emergence/return reference data available for this species.')
+  );
+}
+
+function StatisticsTab({ deployment, location, onPatch }) {
   const stats = useMemo(() => Stats.computeAllStats(deployment, location, ALL_SPECIES_NAMES), [deployment, location]);
   const { effort, activity, species, speciesQaAdjusted, nightly, timing, reliability, reliabilityByProbabilityBand, reliabilityBySpecies, confusionBreakdown, totalDetectionEvents, totalSpeciesRecords } = stats;
   const [expandedSpecies, setExpandedSpecies] = useState(() => new Set());
@@ -683,6 +792,21 @@ function StatisticsTab({ deployment, location }) {
     () => Stats.computeHourlyActivity(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }),
     [stats.dataset, location, hourlyFilterType, hourlyFilterValue]
   );
+
+  // Export selections: each ticked chart/table view is remembered as {key, label} on the
+  // deployment itself (not local state) so it survives navigating away and persists to storage -
+  // this is the "mark this specific view for the PDF" mechanism Clara asked for. The full-dump
+  // Excel/CSV export is unrelated to this list and always includes everything (Stage 8 work, not
+  // built yet) - this is just the selection bookkeeping the PDF step will read from later.
+  const exportSelections = deployment.exportSelections || [];
+  const hourlyExportKey = `hourly-activity:${hourlyFilterType}:${hourlyFilterValue || 'all'}`;
+  const hourlyExportLabel = `Hourly activity - ${hourlyFilterType === 'all' ? 'All bats' : hourlyFilterType === 'species' ? hourlyFilterValue : `${hourlyFilterValue} (genus)`}`;
+  const isHourlySelected = exportSelections.some((s) => s.key === hourlyExportKey);
+  function toggleExportSelection(key, label) {
+    const exists = exportSelections.some((s) => s.key === key);
+    const next = exists ? exportSelections.filter((s) => s.key !== key) : [...exportSelections, { key, label, addedAt: new Date().toISOString() }];
+    onPatch({ exportSelections: next });
+  }
 
   function toggleExpanded(sp) {
     setExpandedSpecies((prev) => {
@@ -890,6 +1014,11 @@ function StatisticsTab({ deployment, location }) {
             )
           )
         ),
+    hourly.rows.length > 0 && h(HourlyActivityChart, { hourly, filter: { type: hourlyFilterType, value: hourlyFilterValue }, location }),
+    hourly.rows.length > 0 && h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, fontSize: 12, color: 'var(--text-muted)', cursor: 'pointer' } },
+      h('input', { type: 'checkbox', checked: isHourlySelected, onChange: () => toggleExportSelection(hourlyExportKey, hourlyExportLabel) }),
+      'Include this view in the PDF export'
+    ),
 
     h('div', { className: 'section-title', style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
       h('span', null, 'Species'),
