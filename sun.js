@@ -6,8 +6,19 @@ window.BatID = window.BatID || {};
 (function (ns) {
   const DEG = Math.PI / 180;
 
+  // Uses the date's LOCAL calendar day, not its UTC one - deliberately. Every caller in this app
+  // builds these Date objects via `new Date(y, m-1, d, ...)`, which is local-time construction, so
+  // the local getters are the only ones guaranteed to give back the calendar date the caller
+  // actually meant. Using the UTC getters instead is a real bug this project shipped with and only
+  // surfaced in British Summer Time (UTC+1): a local time in the first hour after midnight (e.g.
+  // 00:28 BST) is still the PREVIOUS day in UTC, so getUTCDate() silently returns one day earlier
+  // than intended - which then throws every sunset-relative hour computed from it off by a full 24
+  // hours for any detection in that window (the "+27h" values Clara spotted on the activity chart).
+  // Only the y/m/d matter here - the sunrise equation below re-derives its own time-of-day from the
+  // date's fractional Julian day component, so the hour/minute/second on the input date are never
+  // read at all, in UTC or local.
   function toJulianDay(date) {
-    const y = date.getUTCFullYear(), m = date.getUTCMonth() + 1, d = date.getUTCDate();
+    const y = date.getFullYear(), m = date.getMonth() + 1, d = date.getDate();
     const a = Math.floor((14 - m) / 12);
     const y2 = y + 4800 - a;
     const m2 = m + 12 * a - 3;
