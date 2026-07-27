@@ -89,12 +89,24 @@ window.BatID = window.BatID || {};
     return out;
   }
 
+  // The stable identity of one physical call segment - the same key Detection Events are grouped
+  // by below, so "does this segment already exist in the deployment" and "which rows belong
+  // together" always agree with each other.
+  function segmentKey(originalFileName, originalFilePart) {
+    return `${originalFileName}::${originalFilePart}`;
+  }
+
   // Group parsed rows into Detection Events. "No ID" rows (blank species name/group) still
-  // become their own single-candidate event - they are not discarded.
-  function groupIntoDetectionEvents(parsedRows, sourceBtoImportId) {
+  // become their own single-candidate event - they are not discarded. `existingKeys` (optional Set
+  // of segmentKey values already present in the target deployment) lets a re-import of the same
+  // BTO export skip segments already imported, rather than duplicating every event and Species
+  // Detection Record - see importBtoIntoDeployment, which is what actually populates this.
+  function groupIntoDetectionEvents(parsedRows, sourceBtoImportId, existingKeys) {
     const groups = new Map(); // key: originalFileName + '::' + originalFilePart
+    let duplicateRowCount = 0;
     for (const row of parsedRows) {
-      const key = `${row.originalFileName}::${row.originalFilePart}`;
+      const key = segmentKey(row.originalFileName, row.originalFilePart);
+      if (existingKeys && existingKeys.has(key)) { duplicateRowCount++; continue; }
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(row);
     }
@@ -123,31 +135,39 @@ window.BatID = window.BatID || {};
       });
       events.push(event);
     }
-    return events;
+    return { events, duplicateRowCount };
   }
 
   // Mutates `deployment` in place: adds a btoImports entry and appends the new Detection Events.
+  // Segments (file+part) already present in this deployment - from an earlier import of the same
+  // or an overlapping BTO export - are skipped rather than re-added, so re-importing the same CSV
+  // (or a re-export that includes previously-imported segments) can't duplicate events or Species
+  // Detection Records. Reports what actually happened so the analyst can see it, not just trust it.
   function importBtoIntoDeployment(deployment, csvText, fileName) {
     const parsedRows = parseBtoCsv(csvText);
     const importId = M.uid();
-    const events = groupIntoDetectionEvents(parsedRows, importId);
-    deployment.btoImports = deployment.btoImports || [];
     deployment.detectionEvents = deployment.detectionEvents || [];
+    const existingKeys = new Set(deployment.detectionEvents.map((e) => segmentKey(e.originalWav, e.partNumber)));
+    const { events, duplicateRowCount } = groupIntoDetectionEvents(parsedRows, importId, existingKeys);
+    const recordCount = events.reduce((sum, e) => sum + M.resolveSpeciesRecords(e).length, 0);
+    deployment.btoImports = deployment.btoImports || [];
     deployment.btoImports.push({
       id: importId,
       fileName,
       importedAt: new Date().toISOString(),
       rowCount: parsedRows.length,
       eventCount: events.length,
+      duplicateRowCount,
       eventIds: events.map((e) => e.id),
     });
     deployment.detectionEvents.push(...events);
-    return { rowCount: parsedRows.length, eventCount: events.length };
+    return { rowCount: parsedRows.length, eventCount: events.length, duplicateRowCount, recordCount };
   }
 
   ns.Bto = {
     parseCsv,
     parseBtoCsv,
+    segmentKey,
     groupIntoDetectionEvents,
     importBtoIntoDeployment,
   };

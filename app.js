@@ -598,7 +598,10 @@ function DetectionsTab({ deployment, onImportBto }) {
     reader.onload = () => {
       const { result, error } = onImportBto(reader.result, file.name);
       if (error) setImportMsg({ ok: false, text: error });
-      else setImportMsg({ ok: true, text: `Imported ${file.name}: ${result.rowCount} rows -> ${result.eventCount} detection events.` });
+      else {
+        const dupText = result.duplicateRowCount > 0 ? ` (${result.duplicateRowCount} row(s) skipped - already imported for this deployment)` : '';
+        setImportMsg({ ok: true, text: `Imported ${file.name}: ${result.rowCount} rows -> ${result.eventCount} detection events, ${result.recordCount} species detection records${dupText}.` });
+      }
     };
     reader.readAsText(file);
     e.target.value = '';
@@ -616,7 +619,7 @@ function DetectionsTab({ deployment, onImportBto }) {
       : h('div', { className: 'card-list' },
           (deployment.btoImports || []).map((imp) => h('div', { key: imp.id, className: 'card' },
             h('div', { className: 'card-title' }, imp.fileName),
-            h('div', { className: 'card-sub' }, `${imp.rowCount} rows -> ${imp.eventCount} detection events · imported ${new Date(imp.importedAt).toLocaleString()}`)
+            h('div', { className: 'card-sub' }, `${imp.rowCount} rows -> ${imp.eventCount} detection events${imp.duplicateRowCount ? ` (${imp.duplicateRowCount} skipped as duplicates)` : ''} · imported ${new Date(imp.importedAt).toLocaleString()}`)
           ))
         ),
 
@@ -1328,10 +1331,34 @@ function SiteComparisonPage({ project }) {
   );
 }
 
+const SURVEY_NIGHT_STATUS_LABELS = {
+  valid: 'Valid',
+  partial: 'Partial',
+  failed: 'Failed',
+  excluded: 'Excluded',
+  'unknown-effort': 'Unknown effort',
+};
+
 function DeploymentOverviewTab({ deployment, onPatch, wavFileMap, location }) {
   const effort = deployment.surveyEffort || {};
   function patchEffort(patch) {
     onPatch({ surveyEffort: { ...effort, ...patch } });
+  }
+
+  // Survey Nights are the canonical per-night record (one per calendar date in Start/End range,
+  // including nights with truly zero bat activity) - generated/kept in sync with the date range
+  // here, on every load, so a deployment saved before this entity existed gets backfilled the same
+  // way a date-range edit regenerates it. Existing nights are preserved by date (see
+  // Models.ensureSurveyNights) so a status an analyst already set (failed/excluded/etc) never gets
+  // silently reset just because this ran again.
+  useEffect(() => {
+    if (!deployment.startDate || !deployment.endDate) return;
+    const ensured = M.ensureSurveyNights(deployment, location);
+    if (ensured !== deployment.surveyNights) onPatch({ surveyNights: ensured });
+  }, [deployment.startDate, deployment.endDate, location && location.latitude, location && location.longitude]);
+
+  function patchSurveyNight(nightId, patch) {
+    onPatch({ surveyNights: (deployment.surveyNights || []).map((n) => (n.id === nightId ? { ...n, ...patch } : n)) });
   }
 
   // Suggests total Valid Recording Hours from the deployment's own date range and the Location's
@@ -1403,11 +1430,42 @@ function DeploymentOverviewTab({ deployment, onPatch, wavFileMap, location }) {
     h(Field, { label: 'Detector failures' }, h('textarea', { rows: 2, value: effort.detectorFailures, onChange: (e) => patchEffort({ detectorFailures: e.target.value }), placeholder: 'e.g. flat battery night 3, no recordings 19-20 June' })),
     h(Field, { label: 'Excluded periods' }, h('textarea', { rows: 2, value: effort.excludedPeriods, onChange: (e) => patchEffort({ excludedPeriods: e.target.value }), placeholder: 'e.g. 21 June excluded - detector knocked down' })),
 
+    h('div', { className: 'section-title' }, 'Survey Nights'),
+    !deployment.startDate || !deployment.endDate
+      ? h('div', { className: 'card-sub' }, 'Set Start and End date above to generate one row per calendar night.')
+      : h('div', { className: 'card', style: { padding: 0, overflow: 'hidden' } },
+          h('div', { className: 'card-sub', style: { padding: '8px 12px 0' } },
+            'One row per calendar night in the deployment\'s date range, including nights with no detections at all - this is the denominator every nightly statistic uses, not just the nights that happen to appear in imported data. Mark a night Partial/Failed/Excluded if the detector didn\'t run cleanly all night.'),
+          h('div', { style: { overflowX: 'auto' } },
+            h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
+              h('thead', null, h('tr', null,
+                ['Night', 'Status', 'Valid hours', 'Notes'].map((c) => h('th', {
+                  key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
+                }, c))
+              )),
+              h('tbody', null,
+                (deployment.surveyNights || []).map((n) => h('tr', { key: n.id },
+                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, n.surveyDate),
+                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } },
+                    h('select', { value: n.status, onChange: (e) => patchSurveyNight(n.id, { status: e.target.value }) },
+                      Object.entries(SURVEY_NIGHT_STATUS_LABELS).map(([v, label]) => h('option', { key: v, value: v }, label)))),
+                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } },
+                    h('input', {
+                      type: 'number', style: { width: 80 }, value: n.validHours ?? '',
+                      onChange: (e) => patchSurveyNight(n.id, { validHours: e.target.value === '' ? null : Number(e.target.value) }),
+                    })),
+                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } },
+                    h('input', { style: { width: '100%' }, value: n.notes || '', onChange: (e) => patchSurveyNight(n.id, { notes: e.target.value }) }))
+                ))
+              )
+            )
+          )
+        ),
+
     h('div', { className: 'section-title' }, 'Detection Events'),
     h('div', { className: 'stat-grid' },
       h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Total'), h('div', { className: 'stat-box-value' }, String((deployment.detectionEvents || []).length))),
-      h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'BTO imports'), h('div', { className: 'stat-box-value' }, String((deployment.btoImports || []).length))),
-      h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'Manually added'), h('div', { className: 'stat-box-value' }, String(events.filter((e) => e.addedManually).length)))
+      h('div', { className: 'stat-box' }, h('div', { className: 'stat-box-label' }, 'BTO imports'), h('div', { className: 'stat-box-value' }, String((deployment.btoImports || []).length)))
     ),
     (deployment.detectionEvents || []).length === 0 && h('div', { className: 'card-sub', style: { marginTop: 10 } }, 'Import a BTO CSV on the Detections tab to get started.'),
 
@@ -2113,8 +2171,8 @@ function Sonogram({ spec, samples, sampleRate, floorDb, rangeDb, saturation, box
         (partMarkers || []).map((m) => {
           const x = timeToPixel(m.offsetSec, view, SONOGRAM_WIDTH);
           if (x < 0 || x > SONOGRAM_WIDTH) return null;
-          const color = m.addedManually ? 'var(--accent)' : m.isCurrent ? 'var(--teal)' : 'rgba(255,255,255,0.4)';
-          const text = `${m.addedManually ? '+ added: ' : `part ${m.partNumber}: `}${m.label}`;
+          const color = m.isCurrent ? 'var(--teal)' : 'rgba(255,255,255,0.4)';
+          const text = `part ${m.partNumber}: ${m.label}`;
           const clickable = !m.isCurrent && !!onSelectPart;
           return h('div', { key: m.eventId, style: { position: 'absolute', left: x, top: 0, height: SPEC_HEIGHT, borderLeft: `1px ${m.isCurrent ? 'solid' : 'dashed'} ${color}`, pointerEvents: 'none' } },
             h('span', {
@@ -2489,15 +2547,14 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, custom
       .filter((e) => e.originalWav === currentEvent.originalWav)
       .map((e) => ({
         eventId: e.id, partNumber: e.partNumber, offsetSec: estimateOffsetSec(e),
-        // Resolved label(s), not the raw BTO guess - a manually-added event has no BTO candidate
-        // at all, so primaryIdLabel would always show "No ID" for it even once labelled, and a
-        // multi-species event should show every species, not just the primary.
-        label: formatResolvedLabel(e), isCurrent: e.id === currentEvent.id, addedManually: !!e.addedManually,
+        // Resolved label(s), not the raw BTO guess - a multi-species event should show every
+        // species, not just the primary.
+        label: formatResolvedLabel(e), isCurrent: e.id === currentEvent.id,
       }))
       .filter((m) => m.offsetSec != null)
       .sort((a, b) => a.offsetSec - b.offsetSec);
-    // Stack labels that land at (almost) the same offset - typically a manually-added event
-    // sharing its source event's time - so they don't render on top of each other illegibly.
+    // Stack labels that land at (almost) the same offset so they don't render on top of each
+    // other illegibly.
     let stackIndex = 0, lastOffset = null;
     for (const m of siblings) {
       stackIndex = lastOffset != null && Math.abs(m.offsetSec - lastOffset) < 0.05 ? stackIndex + 1 : 0;
@@ -2506,11 +2563,6 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, custom
     }
     return siblings;
   }, [currentEvent, allEvents]);
-
-  const deploymentAddedCount = useMemo(() => allEvents.filter((e) => e.addedManually).length, [allEvents]);
-  const fileAddedCount = currentEvent
-    ? allEvents.filter((e) => e.addedManually && e.originalWav === currentEvent.originalWav).length
-    : 0;
 
   const wavCacheRef = useRef(new Map());
   const [decodedWav, setDecodedWav] = useState(null);
@@ -2646,10 +2698,14 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, custom
 
   function setFinalId(label) {
     if (!currentEvent) return;
+    const primaryLabel = currentEvent.primaryBtoId ? (currentEvent.primaryBtoId.englishName || currentEvent.primaryBtoId.species) : null;
+    const previousFinalId = currentEvent.manualReview.finalId;
+    const action = label === 'Noise / No ID' ? 'reject' : (label === primaryLabel ? 'accept' : 'modify');
     onPatchEvent(currentEvent.id, {
       manualReview: {
         ...currentEvent.manualReview, reviewed: true, finalId: label, reviewedAt: new Date().toISOString(),
         sonogramAnalysis: { measurements: effective, shape: finalShape },
+        history: M.appendReviewHistory(currentEvent.manualReview, { action, previousFinalId, newFinalId: label }),
       },
     });
     goTo(currentIndex + 1);
@@ -2662,14 +2718,23 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, custom
     if (!currentEvent) return;
     const existing = currentEvent.manualReview.additionalTaxa || [];
     if (existing.includes(label) || label === currentEvent.manualReview.finalId) return;
+    const next = [...existing, label];
     onPatchEvent(currentEvent.id, {
-      manualReview: { ...currentEvent.manualReview, additionalTaxa: [...existing, label] },
+      manualReview: {
+        ...currentEvent.manualReview, additionalTaxa: next,
+        history: M.appendReviewHistory(currentEvent.manualReview, { action: 'add-additional', previousAdditionalTaxa: existing, newAdditionalTaxa: next }),
+      },
     });
   }
   function removeAdditionalTaxon(label) {
     if (!currentEvent) return;
+    const existing = currentEvent.manualReview.additionalTaxa || [];
+    const next = existing.filter((t) => t !== label);
     onPatchEvent(currentEvent.id, {
-      manualReview: { ...currentEvent.manualReview, additionalTaxa: (currentEvent.manualReview.additionalTaxa || []).filter((t) => t !== label) },
+      manualReview: {
+        ...currentEvent.manualReview, additionalTaxa: next,
+        history: M.appendReviewHistory(currentEvent.manualReview, { action: 'remove-additional', previousAdditionalTaxa: existing, newAdditionalTaxa: next }),
+      },
     });
   }
 
@@ -2871,9 +2936,7 @@ function ReviewTab({ deployment, onPatchEvent, wavFileMap, setWavFileMap, custom
             h(AddMissedSpeciesInput, {
               onAdd: addAdditionalSpecies, buttonLabel: '+ Add to this event',
               placeholder: 'Other species in this same call...',
-            }),
-            fileAddedCount > 0 && h('div', { className: 'card-sub', style: { marginTop: 6, color: 'var(--text-faint)' } },
-              `Also: ${fileAddedCount} species added as separate Detection Events in this file under the older pattern (${deploymentAddedCount} total in this deployment) - still counted, but no longer how new ones are added.`)
+            })
           )
         ),
 
@@ -2975,9 +3038,7 @@ function EventsTable({ list, currentId, onSelect }) {
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, ev.partNumber),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, ev.time),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } },
-              ev.addedManually
-                ? h('span', { style: { color: 'var(--accent)' }, title: 'Added manually - BTO never gave this call a candidate row at all' }, '+ manually added')
-                : (ev.primaryBtoId ? (ev.primaryBtoId.englishName || ev.primaryBtoId.species) : 'No ID')),
+              ev.primaryBtoId ? (ev.primaryBtoId.englishName || ev.primaryBtoId.species) : 'No ID'),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, ev.primaryBtoId && ev.primaryBtoId.probability != null ? ev.primaryBtoId.probability.toFixed(2) : ''),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', color: 'var(--teal)' } }, ev.manualReview.finalId ? formatResolvedLabel(ev) : ''),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, ev.manualReview.reviewed ? '✓' : '')

@@ -87,6 +87,11 @@ window.BatID = window.BatID || {};
       },
       btoImports: [], // [{ id, fileName, importedAt, rowCount, eventIds: [...] }]
       detectionEvents: [],
+      // One entry per calendar night the deployment ran, generated from Start/End date (see
+      // generateSurveyNights) - the canonical denominator for nightly stats, so a night with truly
+      // zero bat activity (no BTO rows at all for it) still exists and isn't silently invisible to
+      // means/medians/Detection Frequency the way "nights inferred from detections" would leave it.
+      surveyNights: [],
       // Real-world detector placement isn't always acoustically ideal (theft/vandalism risk,
       // concealment, low mounting) - recording this alongside results means QA-derived
       // reliability reads as "observed performance under THIS deployment's conditions", not a
@@ -149,11 +154,6 @@ window.BatID = window.BatID || {};
       time,
       latitude,
       longitude,
-      // True for a species the analyst spotted in the sonogram that BTO's classifier missed
-      // entirely (no candidate row at all) - a distinct Detection Event added alongside the
-      // BTO-derived one for the same call/part, tracked separately so it can be counted and later
-      // factored into the Statistics error estimate as a known gap in BTO's automated coverage.
-      addedManually: false,
       manualReview: {
         reviewed: false,
         finalId: null,
@@ -163,16 +163,138 @@ window.BatID = window.BatID || {};
         // Extra species confirmed present in this SAME 5-second Detection Event (e.g. a mixed
         // recording where BTO's primary result only reflects the most prominent species) - each
         // one becomes its own Species Detection Record alongside finalId, per Clara's ecological
-        // model: one Detection Event may resolve to several Species Detection Records. This is
-        // the preferred way to record "BTO missed a species here" now, in place of the earlier
-        // pattern of spawning a whole separate Detection Event for it (addedManually above) -
-        // that older pattern is still read/counted for backward compatibility with data created
-        // before this distinction existed, just no longer offered as the way to add one.
+        // model: one Detection Event may resolve to several Species Detection Records.
         additionalTaxa: [],
+        // Append-only audit trail of every review decision on this event - never overwritten, so
+        // the original BTO classification and every prior reviewer decision stay reconstructable
+        // even after a later re-review changes the resolved result. See Models.appendReviewHistory.
+        history: [],
       },
       qaStatus: null, // computed by qa-profiles.js against the deployment's active QA profile
       createdAt: nowIso(),
     };
+  }
+
+  // One calendar night of survey effort - the canonical denominator for nightly stats (means,
+  // medians, Detection Frequency, etc). Deliberately NOT inferred from Detection Events: a night
+  // with truly zero bat activity produces zero BTO rows, so a "nights seen in the data" approach
+  // would never know that night existed at all. status defaults to 'valid' since most nights in a
+  // normal deployment are; the analyst downgrades individual nights (detector failure, excluded
+  // period) rather than the software ever guessing a failure from absence of data.
+  function createSurveyNight({
+    surveyDate = '',
+    recordingStart = null,
+    recordingEnd = null,
+    sunset = null,
+    sunrise = null,
+    nominalDurationHours = null,
+    validDurationHours = null,
+    excludedDurationHours = null,
+    failureDurationHours = null,
+    validHours = null,
+    status = 'valid', // 'valid' | 'partial' | 'failed' | 'excluded' | 'unknown-effort'
+    recordingConditions = '',
+    notes = '',
+  } = {}) {
+    return {
+      id: uid(),
+      type: 'surveyNight',
+      surveyDate,
+      recordingStart,
+      recordingEnd,
+      sunset,
+      sunrise,
+      nominalDurationHours,
+      validDurationHours,
+      excludedDurationHours,
+      failureDurationHours,
+      validHours,
+      status,
+      recordingConditions,
+      notes,
+    };
+  }
+
+  // Parses a deployment's own dd-mm-yyyy-agnostic Start/End date inputs (HTML <input type="date">
+  // gives yyyy-mm-dd) into a plain {y,m,d}, or null if absent/invalid.
+  function parseIsoDate(str) {
+    if (!str) return null;
+    const [y, m, d] = str.split('-').map(Number);
+    if (!y || !m || !d) return null;
+    return { y, m, d };
+  }
+
+  function toDdMmYyyy(y, m, d) {
+    return `${String(d).padStart(2, '0')}/${String(m).padStart(2, '0')}/${y}`;
+  }
+
+  // Builds one Survey Night per calendar date from deployment.startDate to deployment.endDate
+  // (inclusive), preserving any already-generated night's status/hours/notes by surveyDate so
+  // re-running this after an analyst has downgraded a night (detector failure, excluded period)
+  // never clobbers that decision - only the date range changes what set of nights exists at all.
+  // Returns the new surveyNights array; does not mutate the deployment (caller persists it).
+  function generateSurveyNights(deployment, location) {
+    const start = parseIsoDate(deployment.startDate);
+    const end = parseIsoDate(deployment.endDate);
+    if (!start || !end) return deployment.surveyNights || [];
+    const existingByDate = new Map((deployment.surveyNights || []).map((n) => [n.surveyDate, n]));
+    const hasLocation = location && location.latitude != null && location.longitude != null;
+    const Sun = window.BatID.Sun;
+
+    const nights = [];
+    const d = new Date(start.y, start.m - 1, start.d);
+    const endDate = new Date(end.y, end.m - 1, end.d);
+    while (d <= endDate) {
+      const surveyDate = toDdMmYyyy(d.getFullYear(), d.getMonth() + 1, d.getDate());
+      const existing = existingByDate.get(surveyDate);
+      if (existing) {
+        nights.push(existing);
+      } else {
+        let sunset = null, sunrise = null;
+        if (hasLocation && Sun) {
+          const nextDay = new Date(d); nextDay.setDate(nextDay.getDate() + 1);
+          const times = Sun.sunTimes(d, location.latitude, location.longitude);
+          const nextTimes = Sun.sunTimes(nextDay, location.latitude, location.longitude);
+          sunset = times.sunset ? times.sunset.toISOString() : null;
+          sunrise = nextTimes.sunrise ? nextTimes.sunrise.toISOString() : null;
+        }
+        nights.push(createSurveyNight({ surveyDate, sunset, sunrise, status: 'valid' }));
+      }
+      d.setDate(d.getDate() + 1);
+    }
+    return nights;
+  }
+
+  // Backfills surveyNights for a deployment that predates this entity (e.g. Clara's real live
+  // Victoria Pleasure Ground data), or regenerates it after Start/End date changes. Safe to call on
+  // every deployment load - a no-op if the night set already matches the current date range.
+  function ensureSurveyNights(deployment, location) {
+    if (!deployment.startDate || !deployment.endDate) return deployment.surveyNights || [];
+    const generated = generateSurveyNights(deployment, location);
+    const current = deployment.surveyNights || [];
+    const sameLength = current.length === generated.length;
+    const sameDates = sameLength && current.every((n, i) => n.surveyDate === generated[i].surveyDate);
+    return sameDates ? current : generated;
+  }
+
+  // Appends one entry to a Detection Event's manualReview.history - never overwrites a prior entry,
+  // so the original BTO classification and every earlier reviewer decision stay reconstructable
+  // even after a later re-review changes the resolved result. `reviewer` is free text (this app has
+  // no login/auth concept - single local user), blank if not supplied.
+  function appendReviewHistory(manualReview, { action, previousFinalId, newFinalId, previousAdditionalTaxa, newAdditionalTaxa, reviewer, comments } = {}) {
+    const history = manualReview.history || [];
+    const entry = {
+      version: history.length + 1,
+      reviewer: reviewer || '',
+      timestamp: nowIso(),
+      action, // 'accept' | 'modify' | 'reject' | 'add-additional' | 'remove-additional'
+      previousFinalId: previousFinalId != null ? previousFinalId : null,
+      newFinalId: newFinalId != null ? newFinalId : null,
+      previousAdditionalTaxa: previousAdditionalTaxa || [],
+      newAdditionalTaxa: newAdditionalTaxa || [],
+      comments: comments || '',
+    };
+    return [...history, entry];
   }
 
   // Highest-probability candidate is the Primary BTO ID. "No ID" rows have no candidates.
@@ -245,6 +367,10 @@ window.BatID = window.BatID || {};
     createLocation,
     createDeployment,
     createDetectionEvent,
+    createSurveyNight,
+    generateSurveyNights,
+    ensureSurveyNights,
+    appendReviewHistory,
     pickPrimaryCandidate,
     resolveFinalId,
     resolveSpeciesRecords,

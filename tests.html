@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Bat-A-Stat — regression tests</title>
+<style>
+  body { font-family: 'Inter', system-ui, sans-serif; background: #14171a; color: #eef1f4; padding: 24px; }
+  h1 { font-size: 18px; }
+  .summary { font-family: monospace; font-size: 14px; margin-bottom: 16px; }
+  .pass { color: #4fb8a8; }
+  .fail { color: #e85a6a; }
+  ul { list-style: none; padding: 0; }
+  li { padding: 6px 10px; border-bottom: 1px solid #353c45; font-family: monospace; font-size: 13px; }
+  .error { color: #e85a6a; margin-top: 4px; padding-left: 16px; }
+</style>
+</head>
+<body>
+<h1>Bat-A-Stat — regression tests</h1>
+<div id="summary" class="summary">Running...</div>
+<ul id="results"></ul>
+
+<script src="models.js"></script>
+<script src="storage.js"></script>
+<script src="bto.js"></script>
+<script src="wav.js"></script>
+<script src="dsp.js"></script>
+<script src="species-data.js"></script>
+<script src="emergence-data.js"></script>
+<script src="qa-profiles.js"></script>
+<script src="sun.js"></script>
+<script src="stats.js"></script>
+<script src="tests.js"></script>
+<script>
+  const { passed, failed, total, results } = window.BatID.Tests.runTests();
+  const summary = document.getElementById('summary');
+  summary.innerHTML = `<span class="${failed ? 'fail' : 'pass'}">${passed}/${total} passed${failed ? `, ${failed} FAILED` : ''}</span>`;
+  const list = document.getElementById('results');
+  for (const r of results) {
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="${r.ok ? 'pass' : 'fail'}">${r.ok ? '✓' : '✗'} ${r.name}</span>` + (r.error ? `<div class="error">${r.error}</div>` : '');
+    list.appendChild(li);
+  }
+</script>
+</body>
+</html>
