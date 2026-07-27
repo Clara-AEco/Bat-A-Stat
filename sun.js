@@ -94,5 +94,21 @@ window.BatID = window.BatID || {};
     return (instant.getTime() - sunset.getTime()) / (1000 * 60 * 60);
   }
 
-  ns.Sun = { toJulianDay, fromJulianDay, sunTimes, hoursRelativeToSunset };
+  // Hours before the FOLLOWING sunrise (negative = after that sunrise) for a given instant, using
+  // the same "which night does this instant belong to" rule as hoursRelativeToSunset - a small-
+  // hours detection belongs to the sunrise that ends that same night, not the previous one.
+  // Corrective brief section 10.4: a second reference system alongside sunset-relative, for pre-
+  // dawn/return-timing analysis (e.g. "how many minutes before sunrise did the last call happen").
+  function hoursRelativeToSunrise(instant, lat, lon) {
+    const hour = instant.getHours();
+    const nightDate = new Date(instant);
+    if (hour < 12) nightDate.setDate(nightDate.getDate() - 1);
+    const nextDay = new Date(nightDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+    const { sunrise } = sunTimes(nextDay, lat, lon);
+    if (!sunrise) return null;
+    return (sunrise.getTime() - instant.getTime()) / (1000 * 60 * 60);
+  }
+
+  ns.Sun = { toJulianDay, fromJulianDay, sunTimes, hoursRelativeToSunset, hoursRelativeToSunrise };
 })(window.BatID);

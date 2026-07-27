@@ -337,6 +337,67 @@ window.BatID = window.BatID || {};
     assert(!adjusted.unadjustedLowSampleSpeciesNames.includes('Common Pipistrelle'), 'n=20 at 100% retained is precise enough to trust');
   });
 
+  // ---- Phase 4: UI/figures/comparisons (stats-layer coverage) ----
+
+  test('computeBinAggregates: pooled/median profiles and peak consistency across nights', () => {
+    const rows = [];
+    let fileCounter = 0;
+    function addRows(date, hour, count) {
+      for (let i = 0; i < count; i++) {
+        rows.push(makeRow({ originalFileName: `agg${fileCounter++}.wav`, originalFilePart: '1', actualDate: date, surveyDate: date, time: `${hour}:00:00` }));
+      }
+    }
+    addRows('16/06/2026', 21, 2); addRows('16/06/2026', 22, 5);
+    addRows('17/06/2026', 21, 3); addRows('17/06/2026', 22, 1);
+    addRows('18/06/2026', 21, 1); addRows('18/06/2026', 22, 4);
+    const { events } = Bto.groupIntoDetectionEvents(rows, 'imp');
+    const dataset = window.BatID.Stats.buildAnalysisDataset(events);
+    const hourly = window.BatID.Stats.computeHourlyActivity(dataset, null, { type: 'all', value: null });
+    assertEqual(hourly.bins.length, 2, 'two bins (21:00, 22:00)');
+    assertEqual(hourly.binTotals[0], 6, 'pooled bin0 = 2+3+1');
+    assertEqual(hourly.binTotals[1], 10, 'pooled bin1 = 5+1+4');
+    assertEqual(hourly.binMedians[0], 2, 'median bin0 across [2,3,1]');
+    assertEqual(hourly.binMedians[1], 4, 'median bin1 across [5,1,4]');
+    assertEqual(hourly.peakConsistency.overallPeakBinIndex, 1, 'pooled peak is bin1 (22:00)');
+    assertEqual(hourly.peakConsistency.nightsWithActivity, 3);
+    assertEqual(hourly.peakConsistency.nightsMatchingOverallPeak, 2, 'nights 16/06 and 18/06 share the pooled peak bin, 17/06 does not');
+  });
+
+  test('computeTimingStats sunrise-relative mode uses a different reference than sunset-relative', () => {
+    const rows = [makeRow({ actualDate: '16/06/2026', surveyDate: '16/06/2026', time: '04:00:00' })];
+    const { events } = Bto.groupIntoDetectionEvents(rows, 'imp');
+    const dataset = window.BatID.Stats.buildAnalysisDataset(events);
+    const location = { latitude: 50.9, longitude: 0.1 };
+    const sunset = window.BatID.Stats.computeTimingStats(dataset, location, 'sunset');
+    const sunrise = window.BatID.Stats.computeTimingStats(dataset, location, 'sunrise');
+    assert(sunset.sunsetRelative && !sunset.sunriseRelative, 'sunset mode flags sunsetRelative only');
+    assert(sunrise.sunriseRelative && !sunrise.sunsetRelative, 'sunrise mode flags sunriseRelative only');
+    assertEqual(sunrise.reference, 'sunrise');
+    assert(sunrise.medianHour !== sunset.medianHour, 'the two reference systems give different hour values for the same detection');
+  });
+
+  test('computeJaccardIndex and computeSorensenIndex match known values', () => {
+    const a = ['x', 'y', 'z'], b = ['y', 'z', 'w'];
+    assertEqual(window.BatID.Stats.computeJaccardIndex(a, b), 0.5, 'intersection 2 / union 4');
+    assertEqual(Math.round(window.BatID.Stats.computeSorensenIndex(a, b) * 10000) / 10000, 0.6667, '2*2 / (3+3)');
+  });
+
+  test('computeBrayCurtisDissimilarity matches a known abundance example', () => {
+    const a = { x: 10, y: 5 };
+    const b = { x: 6, y: 5, z: 4 };
+    const result = window.BatID.Stats.computeBrayCurtisDissimilarity(a, b);
+    assertEqual(Math.round(result * 10000) / 10000, 0.2667, '(|10-6|+|5-5|+|0-4|) / (16+10+4)');
+  });
+
+  test('computeComparisonWarnings flags unmatched period and effort mismatch independently', () => {
+    const matched = { startDate: '2026-06-01', endDate: '2026-06-07', nights: 7 };
+    const unmatchedPeriod = { startDate: '2026-07-01', endDate: '2026-07-07', nights: 7 };
+    const bigEffortMismatch = { startDate: '2026-06-01', endDate: '2026-06-07', nights: 3 };
+    assertEqual(window.BatID.Stats.computeComparisonWarnings(matched, unmatchedPeriod).join(','), 'unmatched-period');
+    assertEqual(window.BatID.Stats.computeComparisonWarnings(matched, bigEffortMismatch).join(','), 'effort-mismatch-nights');
+    assertEqual(window.BatID.Stats.computeComparisonWarnings(matched, matched).join(','), '', 'identical descriptors raise no warnings');
+  });
+
   // ---- Runner ----
 
   function runTests() {

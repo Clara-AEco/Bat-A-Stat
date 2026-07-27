@@ -364,22 +364,29 @@ window.BatID = window.BatID || {};
   // sunset-relative hours when a Location's lat/lon is available (Sun.hoursRelativeToSunset),
   // falling back to raw clock time otherwise - sunset-relative is what actually makes activity
   // comparable across nights of different length, per the project's original R-script design.
-  function computeTimingStats(dataset, location) {
+  // `reference` ('sunset' | 'sunrise', default 'sunset') switches to Sun.hoursRelativeToSunrise
+  // instead (corrective brief section 10.4) - a second reference system for pre-dawn/return-timing
+  // questions ("how many minutes before sunrise did the last call happen"), never mixed with
+  // sunset-relative values in the same computation (brief section 10.5).
+  function computeTimingStats(dataset, location, reference) {
+    reference = reference === 'sunrise' ? 'sunrise' : 'sunset';
     const batRows = dataset.filter((d) => d.category === 'bat' && d.dateTime);
     if (!batRows.length) {
-      return { firstDetection: null, lastDetection: null, sunsetRelative: false, peakHalfHour: null, peakRollingHour: null, percentiles: {} };
+      return { firstDetection: null, lastDetection: null, sunsetRelative: false, sunriseRelative: false, reference, peakHalfHour: null, peakRollingHour: null, percentiles: {} };
     }
     const hasLocation = location && location.latitude != null && location.longitude != null;
     const values = batRows.map((d) => {
       if (hasLocation) {
-        const rel = ns.Sun.hoursRelativeToSunset(d.dateTime, location.latitude, location.longitude);
+        const rel = reference === 'sunrise'
+          ? ns.Sun.hoursRelativeToSunrise(d.dateTime, location.latitude, location.longitude)
+          : ns.Sun.hoursRelativeToSunset(d.dateTime, location.latitude, location.longitude);
         if (rel != null) return rel;
       }
       return d.dateTime.getHours() + d.dateTime.getMinutes() / 60;
     }).sort((a, b) => a - b);
 
     // Peak 30-minute window and peak 60-minute rolling window, both found by sliding over the
-    // sorted values (values are already hours - either sunset-relative or clock hours).
+    // sorted values (values are already hours - either sunset/sunrise-relative or clock hours).
     function peakWindow(windowHours) {
       let bestStart = values[0], bestCount = 0;
       for (const v of values) {
@@ -395,7 +402,9 @@ window.BatID = window.BatID || {};
     return {
       firstDetection: batRows.reduce((min, d) => (min == null || d.dateTime < min ? d.dateTime : min), null),
       lastDetection: batRows.reduce((max, d) => (max == null || d.dateTime > max ? d.dateTime : max), null),
-      sunsetRelative: hasLocation,
+      sunsetRelative: hasLocation && reference === 'sunset',
+      sunriseRelative: hasLocation && reference === 'sunrise',
+      reference,
       medianHour: median(values),
       peakHalfHour: peakWindow(0.5),
       peakRollingHour: peakWindow(1),
@@ -452,6 +461,41 @@ window.BatID = window.BatID || {};
     return { hasLocation, bin, hourValueOf, binStartOf, bins, nights };
   }
 
+  // Shared aggregate-profile computation across nights, for both raw and QA-adjusted hourly
+  // activity (corrective brief section 11: pooled/mean/median profiles, plus a "peak consistency"
+  // diagnostic - does the peak stay at roughly the same point in the night, or does it shift?).
+  // binTotals is the pooled profile (straight sum across nights); binMeans/binMedians are per-bin
+  // central tendency across nights, same denominator (nights.length) as everywhere else in this
+  // file - a night contributes its real 0 to these where it had no activity in that bin, it isn't
+  // dropped from the average.
+  function computeBinAggregates(bins, rows) {
+    const n = rows.length;
+    const binMeans = bins.map((b, i) => (n ? rows.reduce((sum, r) => sum + r.counts[i], 0) / n : 0));
+    const binMedians = bins.map((b, i) => median(rows.map((r) => r.counts[i])));
+    const binTotals = bins.map((b, i) => rows.reduce((sum, r) => sum + r.counts[i], 0));
+
+    let overallPeakIndex = bins.length ? 0 : -1;
+    for (let i = 1; i < binTotals.length; i++) if (binTotals[i] > binTotals[overallPeakIndex]) overallPeakIndex = i;
+    const nightsWithActivity = rows.filter((r) => r.total > 0);
+    const nightsMatchingOverallPeak = nightsWithActivity.filter((r) => {
+      let peakIdx = 0;
+      for (let i = 1; i < r.counts.length; i++) if (r.counts[i] > r.counts[peakIdx]) peakIdx = i;
+      return peakIdx === overallPeakIndex;
+    }).length;
+
+    return {
+      binMeans,
+      binMedians,
+      binTotals,
+      peakConsistency: {
+        overallPeakBinIndex: overallPeakIndex >= 0 ? overallPeakIndex : null,
+        nightsWithActivity: nightsWithActivity.length,
+        nightsMatchingOverallPeak,
+        matchingSharePct: nightsWithActivity.length ? (nightsMatchingOverallPeak / nightsWithActivity.length) * 100 : null,
+      },
+    };
+  }
+
   // Hourly activity pattern (raw) - how activity is distributed across the night, per survey
   // night, so nights can be compared against each other directly (does the peak stay at the same
   // time each night, or does it shift?) rather than only seeing each night's single total
@@ -482,9 +526,9 @@ window.BatID = window.BatID || {};
       const counts = bins.map((b) => nightMap.get(b) || 0);
       return { surveyDate: night, counts, total: counts.reduce((a, b) => a + b, 0) };
     });
-    const binMeans = bins.map((b, i) => (nights.length ? rows.reduce((sum, r) => sum + r.counts[i], 0) / nights.length : 0));
+    const { binMeans, binMedians, binTotals, peakConsistency } = computeBinAggregates(bins, rows);
 
-    return { sunsetRelative: hasLocation, binSizeHours: bin, bins, rows, binMeans };
+    return { sunsetRelative: hasLocation, binSizeHours: bin, bins, rows, binMeans, binMedians, binTotals, peakConsistency };
   }
 
   // Hourly activity pattern (QA-adjusted) - same shape as computeHourlyActivity above, but each
@@ -537,9 +581,9 @@ window.BatID = window.BatID || {};
       const counts = bins.map((b) => nightMap.get(b) || 0);
       return { surveyDate: night, counts, total: counts.reduce((a, b) => a + b, 0) };
     });
-    const binMeans = bins.map((b, i) => (nights.length ? rows.reduce((sum, r) => sum + r.counts[i], 0) / nights.length : 0));
+    const { binMeans, binMedians, binTotals, peakConsistency } = computeBinAggregates(bins, rows);
 
-    return { sunsetRelative: hasLocation, binSizeHours: bin, bins, rows, binMeans };
+    return { sunsetRelative: hasLocation, binSizeHours: bin, bins, rows, binMeans, binMedians, binTotals, peakConsistency };
   }
 
   const DEFAULT_ANALYTICAL_CONFIDENCE_THRESHOLD = 50;
@@ -727,11 +771,66 @@ window.BatID = window.BatID || {};
     };
   }
 
+  // Corrective brief section 13: similarity/dissimilarity metrics for comparing two species
+  // assemblages. Jaccard/Sørensen are presence/absence only (do the two share the same species,
+  // regardless of how common each is); Bray-Curtis is abundance-based (the brief flags this as
+  // likely the primary ecological metric, since two assemblages sharing every species can still
+  // look very different if one is 90% one species and the other is an even spread).
+  function computeJaccardIndex(speciesA, speciesB) {
+    const a = new Set(speciesA || []), b = new Set(speciesB || []);
+    const union = new Set([...a, ...b]);
+    if (union.size === 0) return null;
+    const intersectionSize = Array.from(a).filter((s) => b.has(s)).length;
+    return intersectionSize / union.size;
+  }
+
+  function computeSorensenIndex(speciesA, speciesB) {
+    const a = new Set(speciesA || []), b = new Set(speciesB || []);
+    if (a.size + b.size === 0) return null;
+    const intersectionSize = Array.from(a).filter((s) => b.has(s)).length;
+    return (2 * intersectionSize) / (a.size + b.size);
+  }
+
+  // Returns DISSIMILARITY (0 = identical composition, 1 = completely disjoint), the conventional
+  // direction for this index. `abundanceA`/`abundanceB` are {species: count} maps.
+  function computeBrayCurtisDissimilarity(abundanceA, abundanceB) {
+    abundanceA = abundanceA || {}; abundanceB = abundanceB || {};
+    const speciesKeys = new Set([...Object.keys(abundanceA), ...Object.keys(abundanceB)]);
+    let diffSum = 0, totalSum = 0;
+    for (const species of speciesKeys) {
+      const a = abundanceA[species] || 0;
+      const b = abundanceB[species] || 0;
+      diffSum += Math.abs(a - b);
+      totalSum += a + b;
+    }
+    return totalSum === 0 ? null : diffSum / totalSum;
+  }
+
+  // Corrective brief sections 13.4/13.5: flag when two things being compared don't actually cover
+  // the same survey period or comparable effort - a raw activity/richness difference between two
+  // periods can be more about WHEN or HOW MUCH was surveyed than a real ecological difference.
+  // `a`/`b` are plain {startDate, endDate, nights} descriptors (a deployment or a location's own
+  // aggregate date range). Effort mismatch uses a >=1.5x nights ratio as the working threshold -
+  // arbitrary but documented, easy to tighten/loosen if a stricter bar is wanted.
+  function computeComparisonWarnings(a, b) {
+    const warnings = [];
+    if (a.startDate && a.endDate && b.startDate && b.endDate && (a.startDate !== b.startDate || a.endDate !== b.endDate)) {
+      warnings.push('unmatched-period');
+    }
+    if (a.nights != null && b.nights != null && a.nights > 0 && b.nights > 0) {
+      const ratio = Math.max(a.nights, b.nights) / Math.min(a.nights, b.nights);
+      if (ratio >= 1.5) warnings.push('effort-mismatch-nights');
+    }
+    return warnings;
+  }
+
   // Stage 6 (Level 1B): compares every Deployment at the same Location, in chronological order, to
   // see how activity/richness/dominance shift through the year. Each row's species turnover
   // (gained/lost) is against the immediately preceding deployment only - a simple presence/absence
-  // diff, not a similarity index (Jaccard/Sørensen/Bray-Curtis are separate, later work - not
-  // duplicated here). Deliberately reads each deployment through the same building blocks as
+  // diff; jaccardIndex/sorensenIndex/brayCurtisDissimilarity (corrective brief section 13) give the
+  // same comparison as an actual similarity/dissimilarity score rather than just a raw list, and
+  // comparisonWarnings flags when the two deployments being compared don't share a matched period
+  // or comparable effort. Deliberately reads each deployment through the same building blocks as
   // computeAllStats (buildAnalysisDataset -> computeActivityStats/computeSpeciesStats) rather than
   // a parallel calculation, so a deployment's numbers here always match what its own Statistics tab
   // shows.
@@ -741,6 +840,8 @@ window.BatID = window.BatID || {};
       .sort((a, b) => (a.startDate || '').localeCompare(b.startDate || ''));
 
     let previousSpeciesSet = null;
+    let previousAbundance = null;
+    let previousDescriptor = null;
     const rows = deployments.map((dep) => {
       const dataset = buildAnalysisDataset(dep.detectionEvents || []);
       const surveyNights = validSurveyNights(dep, location);
@@ -748,9 +849,18 @@ window.BatID = window.BatID || {};
       const activity = computeActivityStats(dataset, effort);
       const species = computeSpeciesStats(dataset, surveyNights);
       const speciesSet = new Set(species.composition.map((s) => s.species));
+      const abundance = {};
+      for (const c of species.composition) abundance[c.species] = c.count;
       const speciesGained = previousSpeciesSet ? Array.from(speciesSet).filter((s) => !previousSpeciesSet.has(s)) : [];
       const speciesLost = previousSpeciesSet ? Array.from(previousSpeciesSet).filter((s) => !speciesSet.has(s)) : [];
+      const jaccardIndex = previousSpeciesSet ? computeJaccardIndex(Array.from(speciesSet), Array.from(previousSpeciesSet)) : null;
+      const sorensenIndex = previousSpeciesSet ? computeSorensenIndex(Array.from(speciesSet), Array.from(previousSpeciesSet)) : null;
+      const brayCurtisDissimilarity = previousAbundance ? computeBrayCurtisDissimilarity(abundance, previousAbundance) : null;
+      const descriptor = { startDate: dep.startDate, endDate: dep.endDate, nights: effort.nightsInData };
+      const comparisonWarnings = previousDescriptor ? computeComparisonWarnings(descriptor, previousDescriptor) : [];
       previousSpeciesSet = speciesSet;
+      previousAbundance = abundance;
+      previousDescriptor = descriptor;
       return {
         deploymentId: dep.id,
         deploymentName: dep.name,
@@ -766,6 +876,12 @@ window.BatID = window.BatID || {};
         dominantPct: species.dominantSpecies ? species.dominantSpecies.pct : null,
         speciesGained,
         speciesLost,
+        // vs the immediately preceding deployment only - null for the first deployment (nothing to
+        // compare against yet).
+        jaccardIndex,
+        sorensenIndex,
+        brayCurtisDissimilarity,
+        comparisonWarnings,
       };
     });
 
@@ -794,11 +910,15 @@ window.BatID = window.BatID || {};
       const species = computeSpeciesStats(dataset, surveyNights);
       const confusionBreakdown = computeConfusionBreakdown(allEvents);
       const speciesQaAdjusted = computeSpeciesStatsQaAdjusted(dataset, confusionBreakdown, minSample, surveyNights);
+      const startDates = (loc.deployments || []).map((d) => d.startDate).filter(Boolean).sort();
+      const endDates = (loc.deployments || []).map((d) => d.endDate).filter(Boolean).sort();
       return {
         locationId: loc.id,
         locationName: loc.name,
         deploymentCount: (loc.deployments || []).length,
         nights: nightsInData,
+        startDate: startDates[0] || null,
+        endDate: endDates[endDates.length - 1] || null,
         totalDetections: activity.totalDetections,
         detectionsPerNight: activity.detectionsPerNight,
         richness: species.richnessMinimumTaxa,
@@ -811,7 +931,31 @@ window.BatID = window.BatID || {};
         compositionQaAdjusted: speciesQaAdjusted.composition,
       };
     });
-    return { locations };
+
+    // Pairwise similarity/dissimilarity between every pair of Locations (corrective brief section
+    // 13) - "is the bat community similar between locations" as an actual score, not just each
+    // Location's own numbers side by side. Uses raw (not QA-adjusted) composition, consistent with
+    // every other similarity calculation in this file.
+    const pairwiseSimilarity = [];
+    for (let i = 0; i < locations.length; i++) {
+      for (let j = i + 1; j < locations.length; j++) {
+        const a = locations[i], b = locations[j];
+        const speciesA = a.composition.map((c) => c.species);
+        const speciesB = b.composition.map((c) => c.species);
+        const abundanceA = {}; for (const c of a.composition) abundanceA[c.species] = c.count;
+        const abundanceB = {}; for (const c of b.composition) abundanceB[c.species] = c.count;
+        pairwiseSimilarity.push({
+          locationAId: a.locationId, locationAName: a.locationName,
+          locationBId: b.locationId, locationBName: b.locationName,
+          jaccardIndex: computeJaccardIndex(speciesA, speciesB),
+          sorensenIndex: computeSorensenIndex(speciesA, speciesB),
+          brayCurtisDissimilarity: computeBrayCurtisDissimilarity(abundanceA, abundanceB),
+          comparisonWarnings: computeComparisonWarnings(a, b),
+        });
+      }
+    }
+
+    return { locations, pairwiseSimilarity };
   }
 
   // Below this many judged calls, a reliability percentage swings too wildly on one or two more
@@ -1211,6 +1355,10 @@ window.BatID = window.BatID || {};
     computeAllStats,
     computeLocationComparison,
     computeSiteComparison,
+    computeJaccardIndex,
+    computeSorensenIndex,
+    computeBrayCurtisDissimilarity,
+    computeComparisonWarnings,
     isPrecisionSufficient,
     mean, median, stdDev, percentile, wilsonInterval, compareSurveyDates,
   };

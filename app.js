@@ -549,6 +549,8 @@ function DeploymentPanel({ location, deployment, activeTab, setActiveTab, onPatc
     tabContent = h(GeneralStatisticsTab, { deployment, location });
   } else if (activeTab === 'night-stats') {
     tabContent = h(NightActivityStatisticsTab, { deployment, location, onPatch });
+  } else if (activeTab === 'figures') {
+    tabContent = h(FigureWorkspaceTab, { deployment, location, onPatch });
   } else {
     tabContent = h(ComingSoonTab, { tab: DEPLOYMENT_TABS.find((t) => t.id === activeTab) });
   }
@@ -848,9 +850,14 @@ function ActivityLineChart({ hourly, filter, location, selectedNights, onToggleN
 
 function GeneralStatisticsTab({ deployment, location }) {
   const stats = useMemo(() => Stats.computeAllStats(deployment, location, ALL_SPECIES_NAMES), [deployment, location]);
-  const { effort, activity, species, speciesQaAdjusted, timing, reliability, reliabilityByProbabilityBand, reliabilityBySpecies, confusionBreakdown, totalDetectionEvents, totalSpeciesRecords } = stats;
+  const { effort, activity, species, speciesQaAdjusted, reliability, reliabilityByProbabilityBand, reliabilityBySpecies, confusionBreakdown, totalDetectionEvents, totalSpeciesRecords } = stats;
   const [expandedSpecies, setExpandedSpecies] = useState(() => new Set());
   const [speciesView, setSpeciesView] = useState('raw'); // 'raw' | 'qa-adjusted'
+  // Sunset-relative is the default (matches the rest of the app's convention); sunrise-relative
+  // (corrective brief section 10.4) is a separate reference system for pre-dawn/return-timing
+  // questions - recomputed on demand rather than baked into computeAllStats' one default.
+  const [timingReference, setTimingReference] = useState('sunset'); // 'sunset' | 'sunrise'
+  const timing = useMemo(() => Stats.computeTimingStats(stats.dataset, location, timingReference), [stats.dataset, location, timingReference]);
   const confusionBySpecies = useMemo(() => new Map((confusionBreakdown || []).map((c) => [c.species, c])), [confusionBreakdown]);
 
   function toggleExpanded(sp) {
@@ -973,12 +980,32 @@ function GeneralStatisticsTab({ deployment, location }) {
     h('div', { className: 'section-title' }, 'Survey effort'),
     h('div', { className: 'stat-grid' },
       h(StatBox, { label: 'Nights (entered)', value: effort.nights ?? '-' }),
-      h(StatBox, { label: 'Nights in data', value: effort.nightsInData }),
+      h(StatBox, { label: 'Valid Survey Nights', value: effort.nightsInData, sub: 'Status: valid or partial' }),
+      h(StatBox, { label: 'Zero-activity nights', value: activity.nightlyBreakdown.filter((n) => n.count === 0).length, sub: 'Of the valid Survey Nights above' }),
       h(StatBox, { label: 'Valid recording hours', value: effort.validRecordingHours ?? '-' }),
       h(StatBox, { label: 'QA completion % (computed)', value: fmtNum(effort.qaCompletionPct) + '%' })
     ),
     effort.nights != null && effort.nights !== effort.nightsInData && h('div', { className: 'card-sub', style: { marginTop: 8 } },
-      `Note: ${effort.nightsInData} distinct survey night(s) appear in the data, vs ${effort.nights} entered on the Overview tab - detections-per-night below uses the entered figure.`),
+      `Note: ${effort.nightsInData} valid Survey Night(s), vs ${effort.nights} entered on the Overview tab - detections-per-night above uses the entered figure.`),
+    (() => {
+      const allNights = deployment.surveyNights || [];
+      if (!allNights.length) return null;
+      const byStatus = {};
+      for (const n of allNights) byStatus[n.status] = (byStatus[n.status] || 0) + 1;
+      return h('div', { className: 'card-sub', style: { marginTop: 8 } },
+        `Survey Nights by status: ${Object.entries(byStatus).map(([status, count]) => `${SURVEY_NIGHT_STATUS_LABELS[status] || status} ${count}`).join(' · ')}.`);
+    })(),
+
+    h('div', { className: 'section-title' }, 'Recording conditions'),
+    (() => {
+      const mic = deployment.microphonePlacement || {};
+      const ac = deployment.acousticConditions || {};
+      const highNoiseFlags = Object.entries(ac).filter(([k, v]) => k !== 'notes' && v === 'high').map(([k]) => k);
+      return h('div', { className: 'card-sub' },
+        `Placement: ${mic.placementQuality ? PLACEMENT_QUALITY_LABELS[mic.placementQuality] : 'Not yet assessed'}.`,
+        highNoiseFlags.length > 0 ? ` High noise flagged: ${highNoiseFlags.join(', ')} - a reliability/richness gap vs another deployment or location may partly reflect this, not just biology.` : ''
+      );
+    })(),
 
     h('div', { className: 'section-title' }, 'Activity'),
     h('div', { className: 'card-sub', style: { marginBottom: 8 } },
@@ -1001,11 +1028,11 @@ function GeneralStatisticsTab({ deployment, location }) {
         h('button', {
           className: 'btn btn-small ' + (speciesView === 'raw' ? 'btn-primary' : 'btn-secondary'),
           onClick: () => setSpeciesView('raw'),
-        }, 'Raw'),
+        }, 'Resolved observed'),
         h('button', {
           className: 'btn btn-small ' + (speciesView === 'qa-adjusted' ? 'btn-primary' : 'btn-secondary'),
           onClick: () => setSpeciesView('qa-adjusted'),
-        }, 'QA-adjusted')
+        }, 'QA-adjusted estimate')
       )
     ),
     speciesView === 'qa-adjusted' && h('div', { className: 'card-sub', style: { marginBottom: 8 } },
@@ -1013,10 +1040,10 @@ function GeneralStatisticsTab({ deployment, location }) {
     (() => {
       const activeSpecies = speciesView === 'qa-adjusted' ? speciesQaAdjusted : species;
       const rows = activeSpecies.composition;
-      const valueLabel = speciesView === 'qa-adjusted' ? 'Est. count' : 'Count';
+      const valueLabel = speciesView === 'qa-adjusted' ? 'Estimated count' : 'Count';
       return h(React.Fragment, null,
         h('div', { className: 'stat-grid' },
-          h(StatBox, { label: 'Richness', value: activeSpecies.richnessMinimumTaxa, sub: activeSpecies.richnessMinimumTaxa !== activeSpecies.richness ? `${activeSpecies.richness} distinct labels; a genus-level label collapses into an already-present species of that genus` : null }),
+          h(StatBox, { label: 'Observed richness', value: activeSpecies.richnessMinimumTaxa, sub: activeSpecies.richnessMinimumTaxa !== activeSpecies.richness ? `${activeSpecies.richness} distinct labels; a genus-level label collapses into an already-present species of that genus` : null }),
           h(StatBox, { label: 'Dominant species', value: activeSpecies.dominantSpecies ? activeSpecies.dominantSpecies.species : '-' }),
           h(StatBox, { label: 'Dominant %', value: activeSpecies.dominantSpecies ? fmtNum(activeSpecies.dominantSpecies.pct) + '%' : '-' })
         ),
@@ -1048,28 +1075,36 @@ function GeneralStatisticsTab({ deployment, location }) {
       );
     })(),
 
-    h('div', { className: 'section-title' }, 'Timing'),
+    h('div', { className: 'section-title', style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
+      h('span', null, 'Timing'),
+      location && location.latitude != null && location.longitude != null && h('div', { style: { display: 'flex', gap: 4 } },
+        h('button', { className: 'btn btn-small ' + (timingReference === 'sunset' ? 'btn-primary' : 'btn-secondary'), onClick: () => setTimingReference('sunset') }, 'Relative to sunset'),
+        h('button', { className: 'btn btn-small ' + (timingReference === 'sunrise' ? 'btn-primary' : 'btn-secondary'), onClick: () => setTimingReference('sunrise') }, 'Relative to sunrise')
+      )
+    ),
     h('div', { className: 'card-sub', style: { marginBottom: 8 } },
       timing.sunsetRelative
         ? "Times below are hours relative to sunset (negative = before sunset) - uses this Location's coordinates."
-        : "Times below are raw clock time - set this Location's Latitude/Longitude (on its Details tab) to switch to sunset-relative timing."),
+        : timing.sunriseRelative
+        ? "Times below are hours relative to the following sunrise (positive = before sunrise, negative = after) - useful for return/pre-dawn timing questions."
+        : "Times below are raw clock time - set this Location's Latitude/Longitude (on its Details tab) to switch to sunset/sunrise-relative timing."),
     h('div', { className: 'stat-grid' },
       h(StatBox, { label: 'First detection', value: fmtDateTime(timing.firstDetection) }),
       h(StatBox, { label: 'Last detection', value: fmtDateTime(timing.lastDetection) }),
-      h(StatBox, { label: timing.sunsetRelative ? 'Median (rel. sunset)' : 'Median hour', value: timing.sunsetRelative ? fmtHour(timing.medianHour) : fmtNum(timing.medianHour) }),
+      h(StatBox, { label: (timing.sunsetRelative || timing.sunriseRelative) ? `Median (rel. ${timingReference})` : 'Median hour', value: (timing.sunsetRelative || timing.sunriseRelative) ? fmtHour(timing.medianHour) : fmtNum(timing.medianHour) }),
       h(StatBox, {
         label: 'Peak 30-min window',
-        value: timing.peakHalfHour ? `${timing.sunsetRelative ? fmtHour(timing.peakHalfHour.startHour) : fmtNum(timing.peakHalfHour.startHour)} (${timing.peakHalfHour.count})` : '-',
+        value: timing.peakHalfHour ? `${(timing.sunsetRelative || timing.sunriseRelative) ? fmtHour(timing.peakHalfHour.startHour) : fmtNum(timing.peakHalfHour.startHour)} (${timing.peakHalfHour.count})` : '-',
       }),
       h(StatBox, {
         label: 'Peak rolling hour',
-        value: timing.peakRollingHour ? `${timing.sunsetRelative ? fmtHour(timing.peakRollingHour.startHour) : fmtNum(timing.peakRollingHour.startHour)} (${timing.peakRollingHour.count})` : '-',
+        value: timing.peakRollingHour ? `${(timing.sunsetRelative || timing.sunriseRelative) ? fmtHour(timing.peakRollingHour.startHour) : fmtNum(timing.peakRollingHour.startHour)} (${timing.peakRollingHour.count})` : '-',
       })
     ),
     Object.keys(timing.percentiles || {}).length > 0 && h('div', { style: { marginTop: 12 } },
       h('div', { className: 'card-sub', style: { marginBottom: 6 } }, 'Cumulative activity percentiles:'),
       h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '6px 18px', fontSize: 12, fontFamily: 'var(--font-mono)' } },
-        [10, 25, 50, 75, 90].map((p) => h('span', { key: p }, `${p}%: ${timing.sunsetRelative ? fmtHour(timing.percentiles[p]) : fmtNum(timing.percentiles[p])}`))
+        [10, 25, 50, 75, 90].map((p) => h('span', { key: p }, `${p}%: ${(timing.sunsetRelative || timing.sunriseRelative) ? fmtHour(timing.percentiles[p]) : fmtNum(timing.percentiles[p])}`))
       )
     )
   );
@@ -1174,11 +1209,11 @@ function NightActivityStatisticsTab({ deployment, location, onPatch }) {
         h('button', {
           className: 'btn btn-small ' + (hourlyView === 'raw' ? 'btn-primary' : 'btn-secondary'),
           onClick: () => setHourlyView('raw'),
-        }, 'Raw'),
+        }, 'Resolved observed'),
         h('button', {
           className: 'btn btn-small ' + (hourlyView === 'qa-adjusted' ? 'btn-primary' : 'btn-secondary'),
           onClick: () => setHourlyView('qa-adjusted'),
-        }, 'QA-adjusted')
+        }, 'QA-adjusted estimate')
       )
     ),
     hourlyView === 'qa-adjusted' && h('div', { className: 'card-sub', style: { marginBottom: 8 } },
@@ -1205,9 +1240,12 @@ function NightActivityStatisticsTab({ deployment, location, onPatch }) {
         groupNames.map((g) => h('option', { key: g, value: g }, g))
       )
     ),
+    hourly.peakConsistency && hourly.peakConsistency.nightsWithActivity > 0 && h('div', { className: 'card-sub', style: { marginBottom: 8 } },
+      `Peak consistency: ${hourly.peakConsistency.nightsMatchingOverallPeak} of ${hourly.peakConsistency.nightsWithActivity} night(s) with activity had their own busiest bin at the same point as the deployment's overall busiest bin (${fmtNum(hourly.peakConsistency.matchingSharePct, 0)}%) - a high share means the peak reliably lands at the same time each night, a low share means it moves around.`),
     hourly.rows.length === 0
       ? h('div', { className: 'card-sub' }, 'No detections match this filter yet.')
       : h('div', { className: 'card', style: { padding: 0, overflow: 'hidden' } },
+          h('div', { className: 'card-sub', style: { padding: '8px 12px 0' } }, 'Cell shading is a heatmap of activity intensity within this table - darker means busier, same numbers either way.'),
           h('div', { style: { overflowX: 'auto' } },
             h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
               h('thead', null, h('tr', null,
@@ -1217,15 +1255,36 @@ function NightActivityStatisticsTab({ deployment, location, onPatch }) {
                   }, hourly.sunsetRelative ? `${b >= 0 ? '+' : ''}${b}h` : `${String(((b % 24) + 24) % 24).padStart(2, '0')}:00`)))
               )),
               h('tbody', null,
-                hourly.rows.map((r) => h('tr', { key: r.surveyDate },
-                  [h('td', { key: 'night', style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, r.surveyDate)]
-                    .concat(r.counts.map((c, i) => h('td', { key: i, style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)', color: c === 0 ? 'var(--text-faint)' : 'inherit' } }, Number.isInteger(c) ? c : fmtNum(c, 1))))
-                )).concat([
+                (() => {
+                  const maxCount = Math.max(1, ...hourly.rows.flatMap((r) => r.counts));
+                  return hourly.rows.map((r) => h('tr', { key: r.surveyDate },
+                    [h('td', { key: 'night', style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, r.surveyDate)]
+                      .concat(r.counts.map((c, i) => h('td', {
+                        key: i,
+                        style: {
+                          padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)',
+                          color: c === 0 ? 'var(--text-faint)' : 'inherit',
+                          background: c > 0 ? `rgba(232,131,58,${0.08 + 0.62 * (c / maxCount)})` : 'transparent',
+                        },
+                      }, Number.isInteger(c) ? c : fmtNum(c, 1))))
+                  ));
+                })()
+              ),
+              h('tbody', null,
+                [
                   h('tr', { key: '__mean', style: { fontWeight: 600, background: 'rgba(255,255,255,0.03)' } },
                     [h('td', { key: 'night', style: { padding: '5px 10px' } }, 'Mean')]
                       .concat(hourly.binMeans.map((m, i) => h('td', { key: i, style: { padding: '5px 10px', fontFamily: 'var(--font-mono)' } }, fmtNum(m, 1))))
                   ),
-                ])
+                  h('tr', { key: '__median', style: { fontWeight: 600, background: 'rgba(255,255,255,0.03)' } },
+                    [h('td', { key: 'night', style: { padding: '5px 10px' } }, 'Median')]
+                      .concat(hourly.binMedians.map((m, i) => h('td', { key: i, style: { padding: '5px 10px', fontFamily: 'var(--font-mono)' } }, fmtNum(m, 1))))
+                  ),
+                  h('tr', { key: '__pooled', style: { fontWeight: 600, background: 'rgba(255,255,255,0.03)' } },
+                    [h('td', { key: 'night', style: { padding: '5px 10px' } }, 'Pooled (sum)')]
+                      .concat(hourly.binTotals.map((t, i) => h('td', { key: i, style: { padding: '5px 10px', fontFamily: 'var(--font-mono)' } }, t)))
+                  ),
+                ]
               )
             )
           )
@@ -1234,6 +1293,91 @@ function NightActivityStatisticsTab({ deployment, location, onPatch }) {
     hourly.rows.length > 0 && h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, fontSize: 12, color: 'var(--text-muted)', cursor: 'pointer' } },
       h('input', { type: 'checkbox', checked: isHourlySelected, onChange: () => toggleExportSelection(hourlyExportKey, hourlyExportLabel) }),
       'Include this view in the PDF export'
+    )
+  );
+}
+
+// Recovers the filter a "hourly-activity:<type>:<value>" export-selection key was ticked under
+// (see NightActivityStatisticsTab's hourlyExportKey), so the Figure Workspace can re-render the
+// actual chart rather than just showing its saved label. Returns null for any other key shape
+// (nothing else is wired to export-selection yet - see FigureWorkspaceTab).
+function parseHourlyActivityExportKey(key) {
+  const match = /^hourly-activity:(all|species|group):(.*)$/.exec(key);
+  if (!match) return null;
+  const [, type, value] = match;
+  return { type, value: value === 'all' ? null : value };
+}
+
+// Re-renders a selected figure live from the SAME stats the rest of the app uses (Stats.
+// computeHourlyActivity), so a preview here can never silently drift from what Night Activity
+// Statistics itself shows - never a separate/parallel calculation.
+function FigurePreview({ stats, location, parsed }) {
+  const hourlyChart = useMemo(
+    () => Stats.computeHourlyActivity(stats.dataset, location, parsed, 0.25, stats.surveyNights),
+    [stats.dataset, stats.surveyNights, location, parsed.type, parsed.value]
+  );
+  if (!hourlyChart.rows.length) return h('div', { className: 'card-sub' }, 'No detections match this filter.');
+  return h(ActivityLineChart, { hourly: hourlyChart, filter: parsed, location });
+}
+
+// Corrective brief section 19 / Phase 4 item 9: a real Figure Workspace rather than a placeholder
+// - lets the analyst curate which already-built views feed the eventual report/export (Stage 8/
+// Phase 5 work still builds the actual PDF/PNG export itself), with an editable title/caption and
+// manual reordering. Only the hourly activity chart is wired to export-selection so far (see
+// NightActivityStatisticsTab) - other figure types become selectable here as they're built, rather
+// than this page inventing its own separate list.
+function FigureWorkspaceTab({ deployment, location, onPatch }) {
+  const stats = useMemo(() => Stats.computeAllStats(deployment, location, ALL_SPECIES_NAMES), [deployment, location]);
+  const selections = deployment.exportSelections || [];
+
+  function updateSelection(key, patch) {
+    onPatch({ exportSelections: selections.map((s) => (s.key === key ? { ...s, ...patch } : s)) });
+  }
+  function removeSelection(key) {
+    onPatch({ exportSelections: selections.filter((s) => s.key !== key) });
+  }
+  function moveSelection(key, direction) {
+    const idx = selections.findIndex((s) => s.key === key);
+    const swapWith = idx + direction;
+    if (idx < 0 || swapWith < 0 || swapWith >= selections.length) return;
+    const next = selections.slice();
+    const tmp = next[idx]; next[idx] = next[swapWith]; next[swapWith] = tmp;
+    onPatch({ exportSelections: next });
+  }
+
+  if (selections.length === 0) {
+    return h('div', { className: 'content' },
+      h('div', { className: 'empty-state' },
+        h('div', { className: 'empty-title' }, 'No figures selected yet'),
+        h('div', { className: 'empty-text' }, 'On Night Activity Statistics, tick "Include this view in the PDF export" under the hourly activity chart to add it here. More figure types will become selectable as they\'re built.')
+      )
+    );
+  }
+
+  return h('div', { className: 'content' },
+    h('div', { className: 'section-title' }, 'Figure workspace'),
+    h('div', { className: 'card-sub', style: { marginBottom: 12 } },
+      "Figures selected for the eventual report/export, in this order. Add a title/caption for each and reorder with the arrows - the preview below always comes straight from the same statistics the rest of the app shows, so it can never disagree with its source tab."),
+    h('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
+      selections.map((sel, i) => {
+        const parsed = parseHourlyActivityExportKey(sel.key);
+        return h('div', { key: sel.key, className: 'card' },
+          h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10, marginBottom: 10 } },
+            h('div', { style: { flex: 1 } },
+              h(Field, { label: 'Title' }, h('input', { value: sel.title ?? sel.label, onChange: (e) => updateSelection(sel.key, { title: e.target.value }) })),
+              h(Field, { label: 'Caption (optional)' }, h('textarea', { rows: 2, value: sel.caption || '', onChange: (e) => updateSelection(sel.key, { caption: e.target.value }), placeholder: 'e.g. survey context, what to notice' }))
+            ),
+            h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+              h('button', { className: 'btn btn-secondary btn-small', disabled: i === 0, onClick: () => moveSelection(sel.key, -1) }, '↑'),
+              h('button', { className: 'btn btn-secondary btn-small', disabled: i === selections.length - 1, onClick: () => moveSelection(sel.key, 1) }, '↓'),
+              h('button', { className: 'btn btn-danger btn-small', onClick: () => removeSelection(sel.key) }, 'Remove')
+            )
+          ),
+          parsed
+            ? h(FigurePreview, { stats, location, parsed })
+            : h('div', { className: 'card-sub' }, `${sel.label} (no live preview available for this figure type yet)`)
+        );
+      })
     )
   );
 }
@@ -1259,12 +1403,12 @@ function LocationTimeComparison({ location, currentDeploymentId }) {
 
   return h('div', null,
     h('div', { className: 'card-sub', style: { marginBottom: 8 } },
-      "Species gained/lost are against the immediately preceding deployment only (a simple presence/absence difference) - not a similarity index."),
+      "Gained/Lost are against the immediately preceding deployment only (a simple presence/absence difference). Jaccard/Sørensen/Bray-Curtis (also vs the preceding deployment) give that same comparison as an actual similarity/dissimilarity score - Bray-Curtis additionally weighs how dominant each species is, not just whether it's present."),
     h('div', { className: 'card', style: { padding: 0, overflow: 'hidden' } },
       h('div', { style: { overflowX: 'auto' } },
         h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
           h('thead', null, h('tr', null,
-            ['Deployment', 'Dates', 'Nights', 'Detections/night', 'Richness', 'Dominant species', 'Gained', 'Lost'].map((c) => h('th', {
+            ['Deployment', 'Dates', 'Nights', 'Detections/night', 'Observed richness', 'Dominant species', 'Gained', 'Lost', 'Jaccard', 'Sørensen', 'Bray-Curtis dissim.'].map((c) => h('th', {
               key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
             }, c))
           )),
@@ -1272,14 +1416,19 @@ function LocationTimeComparison({ location, currentDeploymentId }) {
             key: r.deploymentId,
             style: r.deploymentId === currentDeploymentId ? { background: 'rgba(255,150,50,0.08)' } : null,
           },
-            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, r.deploymentName || '(untitled)'),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } },
+              r.deploymentName || '(untitled)',
+              h(ComparisonWarnings, { warnings: r.comparisonWarnings })),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, `${r.startDate || '?'} → ${r.endDate || '?'}`),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, r.nights),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(r.detectionsPerNight)),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, r.richness),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, r.dominantSpecies ? `${r.dominantSpecies} (${fmtNum(r.dominantPct)}%)` : '-'),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-muted)' } }, r.speciesGained.length ? r.speciesGained.join(', ') : '-'),
-            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-muted)' } }, r.speciesLost.length ? r.speciesLost.join(', ') : '-')
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-muted)' } }, r.speciesLost.length ? r.speciesLost.join(', ') : '-'),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtIndex(r.jaccardIndex)),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtIndex(r.sorensenIndex)),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtIndex(r.brayCurtisDissimilarity))
           )))
         )
       )
@@ -1302,8 +1451,8 @@ function SiteComparisonPage({ project }) {
         h('div', { className: 'main-subtitle' }, `${project.projectName || 'Project'} · ${rows.length} location(s)`)
       ),
       h('div', { style: { display: 'flex', gap: 4 } },
-        h('button', { className: 'btn btn-small ' + (view === 'raw' ? 'btn-primary' : 'btn-secondary'), onClick: () => setView('raw') }, 'Raw'),
-        h('button', { className: 'btn btn-small ' + (view === 'qa-adjusted' ? 'btn-primary' : 'btn-secondary'), onClick: () => setView('qa-adjusted') }, 'QA-adjusted')
+        h('button', { className: 'btn btn-small ' + (view === 'raw' ? 'btn-primary' : 'btn-secondary'), onClick: () => setView('raw') }, 'Resolved observed'),
+        h('button', { className: 'btn btn-small ' + (view === 'qa-adjusted' ? 'btn-primary' : 'btn-secondary'), onClick: () => setView('qa-adjusted') }, 'QA-adjusted estimate')
       )
     ),
     rows.length < 2
@@ -1318,7 +1467,7 @@ function SiteComparisonPage({ project }) {
             h('div', { style: { overflowX: 'auto' } },
               h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
                 h('thead', null, h('tr', null,
-                  ['Location', 'Deployments', 'Nights', 'Detections/night', 'Richness', 'Dominant species'].map((c) => h('th', {
+                  ['Location', 'Deployments', 'Nights', 'Detections/night', 'Observed richness', 'Dominant species'].map((c) => h('th', {
                     key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
                   }, c))
                 )),
@@ -1335,6 +1484,31 @@ function SiteComparisonPage({ project }) {
                     h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, dominantSpecies ? `${dominantSpecies} (${fmtNum(dominantPct)}%)` : '-')
                   );
                 }))
+              )
+            )
+          ),
+
+          comparison.pairwiseSimilarity.length > 0 && h(React.Fragment, null,
+            h('div', { className: 'section-title' }, 'Pairwise similarity between locations'),
+            h('div', { className: 'card-sub', style: { marginBottom: 8 } },
+              'Jaccard/Sørensen compare which species are present regardless of how common each is; Bray-Curtis dissimilarity also weighs how dominant each species is (0 = identical composition, 1 = completely disjoint) - the more ecologically informative figure when two locations share every species but at very different proportions. Always uses resolved observed composition.'),
+            h('div', { className: 'card', style: { padding: 0, overflow: 'hidden' } },
+              h('div', { style: { overflowX: 'auto' } },
+                h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
+                  h('thead', null, h('tr', null,
+                    ['Locations', 'Jaccard', 'Sørensen', 'Bray-Curtis dissimilarity'].map((c) => h('th', {
+                      key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
+                    }, c))
+                  )),
+                  h('tbody', null, comparison.pairwiseSimilarity.map((p) => h('tr', { key: `${p.locationAId}-${p.locationBId}` },
+                    h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } },
+                      `${p.locationAName || '(untitled)'} vs ${p.locationBName || '(untitled)'}`,
+                      h(ComparisonWarnings, { warnings: p.comparisonWarnings })),
+                    h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtIndex(p.jaccardIndex)),
+                    h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtIndex(p.sorensenIndex)),
+                    h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtIndex(p.brayCurtisDissimilarity))
+                  )))
+                )
               )
             )
           )
@@ -1592,6 +1766,28 @@ function StatBox({ label, value, sub }) {
 function fmtCi(lowerPct, upperPct) {
   if (lowerPct == null || upperPct == null) return null;
   return `95% CI ${fmtNum(lowerPct)}-${fmtNum(upperPct)}%`;
+}
+
+// Corrective brief sections 13.4/13.5: a raw comparison between two periods/effort levels can be
+// more about WHEN or HOW MUCH was surveyed than a real ecological difference - render whatever
+// Stats.computeComparisonWarnings flagged so that context travels with the number, not just in a
+// tooltip somewhere else.
+const COMPARISON_WARNING_LABELS = {
+  'unmatched-period': 'Unmatched survey period',
+  'effort-mismatch-nights': 'Effort differs substantially (nights)',
+};
+function ComparisonWarnings({ warnings }) {
+  if (!warnings || warnings.length === 0) return null;
+  return h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 4 } },
+    warnings.map((w) => h('span', {
+      key: w, className: 'pill', style: { color: 'var(--accent)', borderColor: 'var(--accent-dim)' },
+      title: 'Raw differences between these two may partly reflect this, not just ecology',
+    }, `⚠ ${COMPARISON_WARNING_LABELS[w] || w}`))
+  );
+}
+
+function fmtIndex(v) {
+  return v == null ? '-' : v.toFixed(2);
 }
 
 function QaTab({ deployment, onPatch, wavFileMap, setWavFileMap, onGoToReview }) {
