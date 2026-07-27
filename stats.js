@@ -15,6 +15,16 @@ window.BatID = window.BatID || {};
     return { y, m, d };
   }
 
+  // surveyDate is stored dd/mm/yyyy (BTO's own convention) - a plain string sort gets month
+  // boundaries backwards (e.g. "01/07/2026" sorts before "28/06/2026" lexicographically, even
+  // though July 1st is later). Every place that orders survey nights chronologically goes through
+  // this instead of a bare .sort() or .localeCompare().
+  function compareSurveyDates(a, b) {
+    const pa = parseDdMmYyyy(a), pb = parseDdMmYyyy(b);
+    if (!pa || !pb) return (a || '').localeCompare(b || '');
+    return pa.y - pb.y || pa.m - pb.m || pa.d - pb.d;
+  }
+
   // The real wall-clock instant a Detection Event happened, from its Actual Date (the true
   // calendar date, not the BTO-resolved Survey Date - which deliberately re-attributes a 01:30
   // recording to the *previous* night for grouping purposes, and would otherwise make an
@@ -169,7 +179,7 @@ window.BatID = window.BatID || {};
     const avg = mean(nightlyCounts);
     return {
       totalDetections,
-      nightlyBreakdown: Array.from(byNight.entries()).map(([surveyDate, count]) => ({ surveyDate, count })).sort((a, b) => a.surveyDate.localeCompare(b.surveyDate)),
+      nightlyBreakdown: Array.from(byNight.entries()).map(([surveyDate, count]) => ({ surveyDate, count })).sort((a, b) => compareSurveyDates(a.surveyDate, b.surveyDate)),
       detectionsPerNight: nights ? totalDetections / nights : null,
       detectionsPerHour: effort.validRecordingHours ? totalDetections / effort.validRecordingHours : null,
       nightlyMean: avg,
@@ -209,7 +219,7 @@ window.BatID = window.BatID || {};
     // Accumulation curve: cumulative unique species by survey night, in chronological order -
     // the basis flagged as an assumption in the original build plan; confirm/adjust if a
     // different basis (e.g. by detector-hour) is wanted.
-    const nightsSorted = Array.from(new Set(batRows.map((d) => d.surveyDate).filter(Boolean))).sort();
+    const nightsSorted = Array.from(new Set(batRows.map((d) => d.surveyDate).filter(Boolean))).sort(compareSurveyDates);
     const seenSoFar = new Set();
     const accumulation = nightsSorted.map((night) => {
       for (const d of batRows) if (d.surveyDate === night) seenSoFar.add(d.finalId);
@@ -244,7 +254,7 @@ window.BatID = window.BatID || {};
   function computeNightlyStats(dataset) {
     const activityRows = dataset.filter((d) => d.category === 'bat' || d.category === 'unidentified');
     const batRows = dataset.filter((d) => d.category === 'bat');
-    const nights = Array.from(new Set(dataset.map((d) => d.surveyDate).filter(Boolean))).sort();
+    const nights = Array.from(new Set(dataset.map((d) => d.surveyDate).filter(Boolean))).sort(compareSurveyDates);
 
     const perNight = nights.map((night) => {
       const nightActivity = activityRows.filter((d) => d.surveyDate === night);
@@ -359,7 +369,7 @@ window.BatID = window.BatID || {};
     const allActivityRows = dataset.filter((d) => (d.category === 'bat' || d.category === 'unidentified') && d.dateTime);
     const binsSeen = new Set();
     for (const d of allActivityRows) binsSeen.add(binStartOf(hourValueOf(d)));
-    const nights = Array.from(new Set(allActivityRows.map((d) => d.surveyDate).filter(Boolean))).sort();
+    const nights = Array.from(new Set(allActivityRows.map((d) => d.surveyDate).filter(Boolean))).sort(compareSurveyDates);
 
     const filteredRows = dataset.filter((d) => d.category === 'bat' && d.dateTime).filter((d) => {
       if (filter.type === 'species') return d.finalId === filter.value;
@@ -772,6 +782,6 @@ window.BatID = window.BatID || {};
     computeConfusionBreakdown,
     computeAllStats,
     computeLocationComparison,
-    mean, median, stdDev, percentile, wilsonInterval,
+    mean, median, stdDev, percentile, wilsonInterval, compareSurveyDates,
   };
 })(window.BatID);
