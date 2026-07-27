@@ -715,14 +715,22 @@ function parseSurveyDate(s) {
 // not exact.
 const NIGHT_LINE_COLORS = ['#e6923a', '#4da3ff', '#7dd87d', '#c77dff', '#ff7d9c', '#ffd93d', '#7ddede', '#ff9f7d', '#a3a3ff', '#b3e05c', '#e05cae', '#5cc9e0'];
 
-function ActivityLineChart({ hourly, filter, location }) {
+function ActivityLineChart({ hourly, filter, location, selectedNights, onToggleNight }) {
   const bins = hourly.bins;
   if (!bins.length || !hourly.rows.length) return null;
+  // Ticking a night out of the chart hides its line and rescales the y-axis to whatever's left
+  // visible (rather than keeping the full-dataset scale) - lets a couple of quieter nights be
+  // compared in detail once the busiest night's line stops flattening everything else. The table
+  // above still always shows every night regardless of this selection - only the chart is filtered.
+  const visibleRows = selectedNights ? hourly.rows.filter((r) => selectedNights.has(r.surveyDate)) : hourly.rows;
+  // Colour assignment stays keyed to each night's position in the FULL row list, not the filtered
+  // one - otherwise a night's colour would shift every time a different night gets ticked in/out.
+  const colorForNight = new Map(hourly.rows.map((r, i) => [r.surveyDate, NIGHT_LINE_COLORS[i % NIGHT_LINE_COLORS.length]]));
   const width = 720, height = 240;
   const padding = { top: 14, right: 16, bottom: 32, left: 42 };
   const plotWidth = width - padding.left - padding.right;
   const plotHeight = height - padding.top - padding.bottom;
-  const maxVal = Math.max(1, ...hourly.rows.flatMap((r) => r.counts));
+  const maxVal = Math.max(1, ...(visibleRows.length ? visibleRows : hourly.rows).flatMap((r) => r.counts));
 
   // Positioned by each bin's actual time VALUE, not its array index - bins only include
   // quarter-hours that had activity on at least one night, so a 15-minute slot with zero activity
@@ -797,10 +805,10 @@ function ActivityLineChart({ hourly, filter, location }) {
         width: Math.max(0, overlay.xForSunsetHour(overlay.returnRange[1]) - overlay.xForSunsetHour(overlay.returnRange[0])),
         y: padding.top, height: plotHeight, fill: '#c77dff', opacity: 0.12,
       }),
-      hourly.rows.map((r, ni) => h('polyline', {
+      visibleRows.map((r) => h('polyline', {
         key: r.surveyDate,
         points: r.counts.map((v, i) => `${xForUnwrapped(unwrapped[i])},${yForValue(v)}`).join(' '),
-        fill: 'none', stroke: NIGHT_LINE_COLORS[ni % NIGHT_LINE_COLORS.length], strokeWidth: 1.5, opacity: 0.9,
+        fill: 'none', stroke: colorForNight.get(r.surveyDate), strokeWidth: 1.5, opacity: 0.9,
       })),
       overlay && overlay.emergenceHour != null && h('line', {
         key: 'eline', x1: overlay.xForSunsetHour(overlay.emergenceHour), x2: overlay.xForSunsetHour(overlay.emergenceHour),
@@ -814,8 +822,17 @@ function ActivityLineChart({ hourly, filter, location }) {
         key: 'x' + u, x: xForUnwrapped(u), y: height - padding.bottom + 14, textAnchor: 'middle', fontSize: 9, fill: 'var(--text-faint)',
       }, tickLabel(u)))
     ),
-    h('div', { style: { display: 'flex', gap: '4px 12px', fontSize: 11, marginTop: 4, color: 'var(--text-muted)', flexWrap: 'wrap' } },
-      hourly.rows.map((r, ni) => h('span', { key: r.surveyDate, style: { color: NIGHT_LINE_COLORS[ni % NIGHT_LINE_COLORS.length] } }, `■ ${r.surveyDate}`)),
+    h('div', { style: { display: 'flex', gap: '2px 10px', fontSize: 11, marginTop: 6, flexWrap: 'wrap', alignItems: 'center' } },
+      hourly.rows.map((r) => {
+        const isVisible = !selectedNights || selectedNights.has(r.surveyDate);
+        return h('label', {
+          key: r.surveyDate,
+          style: { display: 'flex', alignItems: 'center', gap: 4, cursor: onToggleNight ? 'pointer' : 'default', color: isVisible ? colorForNight.get(r.surveyDate) : 'var(--text-faint)' },
+        },
+          onToggleNight && h('input', { type: 'checkbox', checked: isVisible, onChange: () => onToggleNight(r.surveyDate), style: { margin: 0 } }),
+          r.surveyDate
+        );
+      }),
       overlay && overlay.emergenceHour != null && h('span', { style: { color: '#4da3ff' } }, `┊ Typical emergence (${overlay.ref.emergence.source})`),
       overlay && overlay.returnHour != null && h('span', { style: { color: '#c77dff' } }, `┊ Typical return (${overlay.ref.return.source})`)
     ),
@@ -1071,6 +1088,20 @@ function NightActivityStatisticsTab({ deployment, location, onPatch }) {
       : Stats.computeHourlyActivity(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, 0.25),
     [stats.dataset, location, hourlyFilterType, hourlyFilterValue, hourlyView, confusionBreakdown]
   );
+  const allNightDates = useMemo(() => new Set(hourlyChart.rows.map((r) => r.surveyDate)), [hourlyChart]);
+  // null = "all nights" (the default) rather than an actual Set, so switching deployments/filters
+  // never carries over a stale selection built from a different night list - toggling always starts
+  // from allNightDates (below) instead of whatever set happened to be in state before.
+  const [selectedNights, setSelectedNights] = useState(null);
+  useEffect(() => { setSelectedNights(null); }, [stats.dataset, location, hourlyFilterType, hourlyFilterValue, hourlyView]);
+  function toggleNight(date) {
+    setSelectedNights((prev) => {
+      const base = prev || allNightDates;
+      const next = new Set(base);
+      if (next.has(date)) next.delete(date); else next.add(date);
+      return next;
+    });
+  }
 
   // Export selections: each ticked chart/table view is remembered as {key, label} on the
   // deployment itself (not local state) so it survives navigating away and persists to storage -
@@ -1185,7 +1216,7 @@ function NightActivityStatisticsTab({ deployment, location, onPatch }) {
             )
           )
         ),
-    hourly.rows.length > 0 && h(ActivityLineChart, { hourly: hourlyChart, filter: { type: hourlyFilterType, value: hourlyFilterValue }, location }),
+    hourly.rows.length > 0 && h(ActivityLineChart, { hourly: hourlyChart, filter: { type: hourlyFilterType, value: hourlyFilterValue }, location, selectedNights: selectedNights || allNightDates, onToggleNight: toggleNight }),
     hourly.rows.length > 0 && h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, fontSize: 12, color: 'var(--text-muted)', cursor: 'pointer' } },
       h('input', { type: 'checkbox', checked: isHourlySelected, onChange: () => toggleExportSelection(hourlyExportKey, hourlyExportLabel) }),
       'Include this view in the PDF export'
