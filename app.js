@@ -701,21 +701,21 @@ function parseSurveyDate(s) {
   return new Date(y, m - 1, d);
 }
 
-// One coloured line per survey night (not an aggregate mean) - Clara's own call after seeing the
-// first version: a mean line hides exactly the night-to-night variation this chart exists to show
-// (does the peak stay at the same time each night, or does it shift?). Each night gets its own
-// colour from a fixed palette, cycling if there are more nights than colours. Also overlays typical
-// emergence/return reference times when a single named species is selected. The overlay only
-// appears in sunset-relative mode: clock-hour bins wrap at midnight and aren't a continuous scale
-// (see computeHourlyActivity's own bin-ordering comment), so there's no single consistent x
-// position to draw a reference line at. Return times in the source data are reported as minutes
-// before SUNRISE, not sunset, so they're converted onto this chart's sunset-relative axis using
-// one representative night from the current view (the middle night by date) - an approximation,
-// since day length shifts slightly across a real deployment, but reference lines are inherently
-// "typical", not exact.
+// One coloured line per survey night, abundance on the y-axis - back to the line-chart shape
+// Clara confirmed she wants, but at finer resolution: 15-minute bins instead of the table's 1-hour
+// bins above, so a peak's actual shape shows rather than being flattened into one hourly total.
+// Only whole-hour bins get an x-axis label - labelling every 15-minute gridline would be unreadable
+// clutter - though the line itself still passes through all four quarter-hour points within each
+// hour. Also overlays typical emergence/return reference times when a single named species is
+// selected. The overlay only appears in sunset-relative mode: clock time has no fixed zero-point to
+// measure emergence/return from. Return times in the source data are reported as minutes before
+// SUNRISE, not sunset, so they're converted onto this chart's sunset-relative axis using one
+// representative night from the current view (the middle night by date) - an approximation, since
+// day length shifts slightly across a real deployment, but reference lines are inherently "typical",
+// not exact.
 const NIGHT_LINE_COLORS = ['#e6923a', '#4da3ff', '#7dd87d', '#c77dff', '#ff7d9c', '#ffd93d', '#7ddede', '#ff9f7d', '#a3a3ff', '#b3e05c', '#e05cae', '#5cc9e0'];
 
-function HourlyActivityChart({ hourly, filter, location }) {
+function ActivityLineChart({ hourly, filter, location }) {
   const bins = hourly.bins;
   if (!bins.length || !hourly.rows.length) return null;
   const width = 720, height = 240;
@@ -723,19 +723,39 @@ function HourlyActivityChart({ hourly, filter, location }) {
   const plotWidth = width - padding.left - padding.right;
   const plotHeight = height - padding.top - padding.bottom;
   const maxVal = Math.max(1, ...hourly.rows.flatMap((r) => r.counts));
-  const slotWidth = plotWidth / bins.length;
 
-  function xForIndex(i) { return padding.left + i * slotWidth + slotWidth / 2; }
-  function yForValue(v) { return padding.top + plotHeight - (v / maxVal) * plotHeight; }
-  function binLabel(b) {
-    return hourly.sunsetRelative ? `${b >= 0 ? '+' : ''}${b}h` : `${String(((b % 24) + 24) % 24).padStart(2, '0')}:00`;
+  // Positioned by each bin's actual time VALUE, not its array index - bins only include
+  // quarter-hours that had activity on at least one night, so a 15-minute slot with zero activity
+  // everywhere is simply absent from the array. Index-based spacing would silently compress that
+  // gap on the x-axis (squeezing the next bin closer than its real time difference warrants).
+  // Clock-hour bins additionally wrap at midnight (sorted rotated around midday, not by raw value -
+  // see computeHourlyActivity's own comment), so "unwrap" them into a continuous increasing
+  // sequence first (adding 24 every time the sequence drops) - sunset-relative bins never wrap, so
+  // this is a no-op for them and unwrapped === raw throughout.
+  const unwrapped = [];
+  let offset = 0;
+  for (let i = 0; i < bins.length; i++) {
+    if (i > 0 && bins[i] < bins[i - 1]) offset += 24;
+    unwrapped[i] = bins[i] + offset;
   }
+  const minUnwrapped = unwrapped[0], maxUnwrapped = unwrapped[unwrapped.length - 1];
+  const span = Math.max(hourly.binSizeHours, maxUnwrapped - minUnwrapped);
+
+  function xForUnwrapped(u) { return padding.left + ((u - minUnwrapped) / span) * plotWidth; }
+  function yForValue(v) { return padding.top + plotHeight - (v / maxVal) * plotHeight; }
+  function tickLabel(tick) {
+    return hourly.sunsetRelative ? `${tick >= 0 ? '+' : ''}${tick}h` : `${String(((tick % 24) + 24) % 24).padStart(2, '0')}:00`;
+  }
+  const tickUnwrapped = [];
+  for (let u = Math.ceil(minUnwrapped); u <= Math.floor(maxUnwrapped); u++) tickUnwrapped.push(u);
 
   let overlay = null;
   if (hourly.sunsetRelative && filter.type === 'species' && filter.value) {
     const ref = EmergenceData.lookup(filter.value);
     if (ref) {
-      const xForSunsetHour = (hVal) => padding.left + ((hVal - bins[0]) / hourly.binSizeHours) * slotWidth + slotWidth / 2;
+      // Sunset-relative bins never wrap, so unwrapped === raw here - safe to position an arbitrary
+      // hour value (not necessarily one of the bins themselves) the same way as a tick.
+      const xForSunsetHour = xForUnwrapped;
       const emergenceHour = ref.emergence && ref.emergence.meanMinutes != null ? ref.emergence.meanMinutes / 60 : null;
       const emergenceRange = ref.emergence && ref.emergence.rangeMinutes ? ref.emergence.rangeMinutes.map((m) => m / 60) : null;
 
@@ -779,8 +799,8 @@ function HourlyActivityChart({ hourly, filter, location }) {
       }),
       hourly.rows.map((r, ni) => h('polyline', {
         key: r.surveyDate,
-        points: r.counts.map((v, i) => `${xForIndex(i)},${yForValue(v)}`).join(' '),
-        fill: 'none', stroke: NIGHT_LINE_COLORS[ni % NIGHT_LINE_COLORS.length], strokeWidth: 1.75, opacity: 0.9,
+        points: r.counts.map((v, i) => `${xForUnwrapped(unwrapped[i])},${yForValue(v)}`).join(' '),
+        fill: 'none', stroke: NIGHT_LINE_COLORS[ni % NIGHT_LINE_COLORS.length], strokeWidth: 1.5, opacity: 0.9,
       })),
       overlay && overlay.emergenceHour != null && h('line', {
         key: 'eline', x1: overlay.xForSunsetHour(overlay.emergenceHour), x2: overlay.xForSunsetHour(overlay.emergenceHour),
@@ -790,9 +810,9 @@ function HourlyActivityChart({ hourly, filter, location }) {
         key: 'rline', x1: overlay.xForSunsetHour(overlay.returnHour), x2: overlay.xForSunsetHour(overlay.returnHour),
         y1: padding.top, y2: height - padding.bottom, stroke: '#c77dff', strokeWidth: 1.5, strokeDasharray: '4 2',
       }),
-      bins.map((b, i) => h('text', {
-        key: 'x' + i, x: xForIndex(i), y: height - padding.bottom + 14, textAnchor: 'middle', fontSize: 9, fill: 'var(--text-faint)',
-      }, binLabel(b)))
+      tickUnwrapped.map((u) => h('text', {
+        key: 'x' + u, x: xForUnwrapped(u), y: height - padding.bottom + 14, textAnchor: 'middle', fontSize: 9, fill: 'var(--text-faint)',
+      }, tickLabel(u)))
     ),
     h('div', { style: { display: 'flex', gap: '4px 12px', fontSize: 11, marginTop: 4, color: 'var(--text-muted)', flexWrap: 'wrap' } },
       hourly.rows.map((r, ni) => h('span', { key: r.surveyDate, style: { color: NIGHT_LINE_COLORS[ni % NIGHT_LINE_COLORS.length] } }, `■ ${r.surveyDate}`)),
@@ -1042,6 +1062,15 @@ function NightActivityStatisticsTab({ deployment, location, onPatch }) {
       : Stats.computeHourlyActivity(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }),
     [stats.dataset, location, hourlyFilterType, hourlyFilterValue, hourlyView, confusionBreakdown]
   );
+  // The chart uses a finer 15-minute bin than the table's 1-hour columns, so a peak's actual shape
+  // shows instead of being flattened into one hourly total - table stays hourly since a 4x-wider
+  // table would be unreadable, but a chart line can happily pass through more points.
+  const hourlyChart = useMemo(
+    () => hourlyView === 'qa-adjusted'
+      ? Stats.computeHourlyActivityQaAdjusted(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, confusionBreakdown, undefined, 0.25)
+      : Stats.computeHourlyActivity(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, 0.25),
+    [stats.dataset, location, hourlyFilterType, hourlyFilterValue, hourlyView, confusionBreakdown]
+  );
 
   // Export selections: each ticked chart/table view is remembered as {key, label} on the
   // deployment itself (not local state) so it survives navigating away and persists to storage -
@@ -1156,7 +1185,7 @@ function NightActivityStatisticsTab({ deployment, location, onPatch }) {
             )
           )
         ),
-    hourly.rows.length > 0 && h(HourlyActivityChart, { hourly, filter: { type: hourlyFilterType, value: hourlyFilterValue }, location }),
+    hourly.rows.length > 0 && h(ActivityLineChart, { hourly: hourlyChart, filter: { type: hourlyFilterType, value: hourlyFilterValue }, location }),
     hourly.rows.length > 0 && h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, fontSize: 12, color: 'var(--text-muted)', cursor: 'pointer' } },
       h('input', { type: 'checkbox', checked: isHourlySelected, onChange: () => toggleExportSelection(hourlyExportKey, hourlyExportLabel) }),
       'Include this view in the PDF export'
