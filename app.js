@@ -678,27 +678,31 @@ function parseSurveyDate(s) {
   return new Date(y, m - 1, d);
 }
 
-// Bar chart of the mean hourly activity profile (the same numbers as the table's "Mean" row),
-// with an optional overlay of typical emergence/return reference times when a single named
-// species is selected. The overlay only appears in sunset-relative mode: clock-hour bins wrap at
-// midnight and aren't a continuous scale (see computeHourlyActivity's own bin-ordering comment),
-// so there's no single consistent x position to draw a reference line at. Return times in the
-// source data are reported as minutes before SUNRISE, not sunset, so they're converted onto this
-// chart's sunset-relative axis using one representative night from the current view (the middle
-// night by date) - an approximation, since day length shifts slightly across a real deployment,
-// but reference lines are inherently "typical", not exact.
+// One coloured line per survey night (not an aggregate mean) - Clara's own call after seeing the
+// first version: a mean line hides exactly the night-to-night variation this chart exists to show
+// (does the peak stay at the same time each night, or does it shift?). Each night gets its own
+// colour from a fixed palette, cycling if there are more nights than colours. Also overlays typical
+// emergence/return reference times when a single named species is selected. The overlay only
+// appears in sunset-relative mode: clock-hour bins wrap at midnight and aren't a continuous scale
+// (see computeHourlyActivity's own bin-ordering comment), so there's no single consistent x
+// position to draw a reference line at. Return times in the source data are reported as minutes
+// before SUNRISE, not sunset, so they're converted onto this chart's sunset-relative axis using
+// one representative night from the current view (the middle night by date) - an approximation,
+// since day length shifts slightly across a real deployment, but reference lines are inherently
+// "typical", not exact.
+const NIGHT_LINE_COLORS = ['#e6923a', '#4da3ff', '#7dd87d', '#c77dff', '#ff7d9c', '#ffd93d', '#7ddede', '#ff9f7d', '#a3a3ff', '#b3e05c', '#e05cae', '#5cc9e0'];
+
 function HourlyActivityChart({ hourly, filter, location }) {
   const bins = hourly.bins;
-  if (!bins.length) return null;
-  const width = 720, height = 220;
+  if (!bins.length || !hourly.rows.length) return null;
+  const width = 720, height = 240;
   const padding = { top: 14, right: 16, bottom: 32, left: 42 };
   const plotWidth = width - padding.left - padding.right;
   const plotHeight = height - padding.top - padding.bottom;
-  const maxVal = Math.max(1, ...hourly.binMeans);
+  const maxVal = Math.max(1, ...hourly.rows.flatMap((r) => r.counts));
   const slotWidth = plotWidth / bins.length;
-  const barGap = 2;
 
-  function xForIndex(i) { return padding.left + i * slotWidth; }
+  function xForIndex(i) { return padding.left + i * slotWidth + slotWidth / 2; }
   function yForValue(v) { return padding.top + plotHeight - (v / maxVal) * plotHeight; }
   function binLabel(b) {
     return hourly.sunsetRelative ? `${b >= 0 ? '+' : ''}${b}h` : `${String(((b % 24) + 24) % 24).padStart(2, '0')}:00`;
@@ -750,9 +754,10 @@ function HourlyActivityChart({ hourly, filter, location }) {
         width: Math.max(0, overlay.xForSunsetHour(overlay.returnRange[1]) - overlay.xForSunsetHour(overlay.returnRange[0])),
         y: padding.top, height: plotHeight, fill: '#c77dff', opacity: 0.12,
       }),
-      hourly.binMeans.map((v, i) => h('rect', {
-        key: i, x: xForIndex(i) + barGap / 2, y: yForValue(v), width: Math.max(1, slotWidth - barGap), height: Math.max(0, yForValue(0) - yForValue(v)),
-        fill: '#e6923a', opacity: 0.9,
+      hourly.rows.map((r, ni) => h('polyline', {
+        key: r.surveyDate,
+        points: r.counts.map((v, i) => `${xForIndex(i)},${yForValue(v)}`).join(' '),
+        fill: 'none', stroke: NIGHT_LINE_COLORS[ni % NIGHT_LINE_COLORS.length], strokeWidth: 1.75, opacity: 0.9,
       })),
       overlay && overlay.emergenceHour != null && h('line', {
         key: 'eline', x1: overlay.xForSunsetHour(overlay.emergenceHour), x2: overlay.xForSunsetHour(overlay.emergenceHour),
@@ -763,11 +768,11 @@ function HourlyActivityChart({ hourly, filter, location }) {
         y1: padding.top, y2: height - padding.bottom, stroke: '#c77dff', strokeWidth: 1.5, strokeDasharray: '4 2',
       }),
       bins.map((b, i) => h('text', {
-        key: 'x' + i, x: xForIndex(i) + slotWidth / 2, y: height - padding.bottom + 14, textAnchor: 'middle', fontSize: 9, fill: 'var(--text-faint)',
+        key: 'x' + i, x: xForIndex(i), y: height - padding.bottom + 14, textAnchor: 'middle', fontSize: 9, fill: 'var(--text-faint)',
       }, binLabel(b)))
     ),
-    h('div', { style: { display: 'flex', gap: 16, fontSize: 11, marginTop: 4, color: 'var(--text-muted)', flexWrap: 'wrap' } },
-      h('span', null, '■ Mean activity'),
+    h('div', { style: { display: 'flex', gap: '4px 12px', fontSize: 11, marginTop: 4, color: 'var(--text-muted)', flexWrap: 'wrap' } },
+      hourly.rows.map((r, ni) => h('span', { key: r.surveyDate, style: { color: NIGHT_LINE_COLORS[ni % NIGHT_LINE_COLORS.length] } }, `■ ${r.surveyDate}`)),
       overlay && overlay.emergenceHour != null && h('span', { style: { color: '#4da3ff' } }, `┊ Typical emergence (${overlay.ref.emergence.source})`),
       overlay && overlay.returnHour != null && h('span', { style: { color: '#c77dff' } }, `┊ Typical return (${overlay.ref.return.source})`)
     ),
@@ -786,11 +791,14 @@ function StatisticsTab({ deployment, location, onPatch }) {
   const confusionBySpecies = useMemo(() => new Map((confusionBreakdown || []).map((c) => [c.species, c])), [confusionBreakdown]);
   const [hourlyFilterType, setHourlyFilterType] = useState('all'); // 'all' | 'species' | 'group'
   const [hourlyFilterValue, setHourlyFilterValue] = useState(null);
+  const [hourlyView, setHourlyView] = useState('raw'); // 'raw' | 'qa-adjusted'
   const speciesNames = useMemo(() => (species.composition || []).map((s) => s.species).sort(), [species]);
   const groupNames = useMemo(() => Array.from(new Set(speciesNames.map((s) => SpeciesData.genusOf(s)).filter(Boolean))).sort(), [speciesNames]);
   const hourly = useMemo(
-    () => Stats.computeHourlyActivity(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }),
-    [stats.dataset, location, hourlyFilterType, hourlyFilterValue]
+    () => hourlyView === 'qa-adjusted'
+      ? Stats.computeHourlyActivityQaAdjusted(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, confusionBreakdown)
+      : Stats.computeHourlyActivity(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }),
+    [stats.dataset, location, hourlyFilterType, hourlyFilterValue, hourlyView, confusionBreakdown]
   );
 
   // Export selections: each ticked chart/table view is remembered as {key, label} on the
@@ -966,7 +974,21 @@ function StatisticsTab({ deployment, location, onPatch }) {
       )
     ),
 
-    h('div', { className: 'section-title' }, 'Hourly activity pattern (within this deployment)'),
+    h('div', { className: 'section-title', style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
+      h('span', null, 'Hourly activity pattern (within this deployment)'),
+      h('div', { style: { display: 'flex', gap: 4 } },
+        h('button', {
+          className: 'btn btn-small ' + (hourlyView === 'raw' ? 'btn-primary' : 'btn-secondary'),
+          onClick: () => setHourlyView('raw'),
+        }, 'Raw'),
+        h('button', {
+          className: 'btn btn-small ' + (hourlyView === 'qa-adjusted' ? 'btn-primary' : 'btn-secondary'),
+          onClick: () => setHourlyView('qa-adjusted'),
+        }, 'QA-adjusted')
+      )
+    ),
+    hourlyView === 'qa-adjusted' && h('div', { className: 'card-sub', style: { marginBottom: 8 } },
+      "Still-unreviewed calls are redistributed using the confusion pattern from reviewed calls of the same BTO primary, same as the Species section's QA-adjusted view - a filtered species/genus only shows the share of activity that actually stayed that species/genus after redistribution."),
     h('div', { className: 'card-sub', style: { marginBottom: 8 } },
       hourly.sunsetRelative
         ? "Bins are hours relative to sunset (negative = before sunset), one row per survey night, so nights can be compared directly - does the peak stay at the same time each night, or does it shift? Uses this Location's coordinates."
@@ -1003,7 +1025,7 @@ function StatisticsTab({ deployment, location, onPatch }) {
               h('tbody', null,
                 hourly.rows.map((r) => h('tr', { key: r.surveyDate },
                   [h('td', { key: 'night', style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, r.surveyDate)]
-                    .concat(r.counts.map((c, i) => h('td', { key: i, style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)', color: c === 0 ? 'var(--text-faint)' : 'inherit' } }, c)))
+                    .concat(r.counts.map((c, i) => h('td', { key: i, style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)', color: c === 0 ? 'var(--text-faint)' : 'inherit' } }, Number.isInteger(c) ? c : fmtNum(c, 1))))
                 )).concat([
                   h('tr', { key: '__mean', style: { fontWeight: 600, background: 'rgba(255,255,255,0.03)' } },
                     [h('td', { key: 'night', style: { padding: '5px 10px' } }, 'Mean')]

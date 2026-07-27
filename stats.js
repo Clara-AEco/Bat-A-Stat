@@ -336,18 +336,13 @@ window.BatID = window.BatID || {};
     };
   }
 
-  // Hourly activity pattern - how activity is distributed across the night, per survey night, so
-  // nights can be compared against each other directly (does the peak stay at the same time each
-  // night, or does it shift?) rather than only seeing each night's single total (computeNightlyStats,
-  // above). Filterable to a single species, a genus ("group of species"), or all bats combined -
-  // filtering changes which detections feed the COUNTS, but not which bins/nights appear (see
-  // below) - a species-filtered view still shows every bin/night the deployment actually covered.
-  // Sunset-relative hours when the Location has coordinates (same convention as computeTimingStats),
-  // clock hours otherwise. binSizeHours defaults to 1 (an "hourly" pattern, per the name) but is a
-  // parameter since a finer/coarser bin may turn out more useful once this is actually in use.
-  function computeHourlyActivity(dataset, location, filter, binSizeHours) {
+  // Shared groundwork for both hourly-activity functions below: which bins/nights to show (always
+  // derived from EVERY bat/unidentified detection in the deployment, unfiltered, so a filtered or
+  // QA-adjusted view still shows a 0 for a bin/night where only something else was active -
+  // absence within the deployment's own recording activity is real data, not something to hide by
+  // omitting the row/column), plus the hour-value/bin-start helpers and the bin ordering.
+  function hourlyActivityFrame(dataset, location, binSizeHours) {
     const bin = binSizeHours || 1;
-    filter = filter || { type: 'all', value: null };
     const hasLocation = location && location.latitude != null && location.longitude != null;
 
     function hourValueOf(d) {
@@ -361,15 +356,36 @@ window.BatID = window.BatID || {};
       return Math.floor(hourValue / bin) * bin;
     }
 
-    // The full set of bins/nights to show comes from EVERY bat/unidentified detection in the
-    // deployment (unfiltered), not just whatever matches the current species/group filter - so a
-    // filtered view (e.g. one species) still shows a 0 for a bin/night where OTHER bats were
-    // active but this one wasn't. Absence within the deployment's own recording activity is real
-    // data, not something to hide by omitting the row/column entirely.
     const allActivityRows = dataset.filter((d) => (d.category === 'bat' || d.category === 'unidentified') && d.dateTime);
     const binsSeen = new Set();
     for (const d of allActivityRows) binsSeen.add(binStartOf(hourValueOf(d)));
     const nights = Array.from(new Set(allActivityRows.map((d) => d.surveyDate).filter(Boolean))).sort(compareSurveyDates);
+
+    // Order bins as one continuous overnight sequence. Sunset-relative bins are already continuous
+    // (negative = before sunset, positive = after) so a plain ascending sort is correct. Clock-hour
+    // bins wrap at midnight, so a raw ascending sort would put "00:00" before "21:00" and split one
+    // continuous night's activity across the two ends of the row - instead they're sorted rotated
+    // around midday (the point bats are least active), which keeps any overnight span contiguous
+    // regardless of what clock hours it actually falls on.
+    const bins = Array.from(binsSeen).sort((a, b) => {
+      if (hasLocation) return a - b;
+      const rotate = (h) => ((h + 12) % 24 + 24) % 24;
+      return rotate(a) - rotate(b);
+    });
+
+    return { hasLocation, bin, hourValueOf, binStartOf, bins, nights };
+  }
+
+  // Hourly activity pattern (raw) - how activity is distributed across the night, per survey
+  // night, so nights can be compared against each other directly (does the peak stay at the same
+  // time each night, or does it shift?) rather than only seeing each night's single total
+  // (computeNightlyStats, above). Filterable to a single species, a genus ("group of species"), or
+  // all bats combined. Sunset-relative hours when the Location has coordinates (same convention as
+  // computeTimingStats), clock hours otherwise. binSizeHours defaults to 1 (an "hourly" pattern,
+  // per the name) but is a parameter since a finer/coarser bin may turn out more useful in practice.
+  function computeHourlyActivity(dataset, location, filter, binSizeHours) {
+    filter = filter || { type: 'all', value: null };
+    const { hasLocation, bin, hourValueOf, binStartOf, bins, nights } = hourlyActivityFrame(dataset, location, binSizeHours);
 
     const filteredRows = dataset.filter((d) => d.category === 'bat' && d.dateTime).filter((d) => {
       if (filter.type === 'species') return d.finalId === filter.value;
@@ -385,17 +401,61 @@ window.BatID = window.BatID || {};
       nightMap.set(b, (nightMap.get(b) || 0) + 1);
     }
 
-    // Order bins as one continuous overnight sequence. Sunset-relative bins are already continuous
-    // (negative = before sunset, positive = after) so a plain ascending sort is correct. Clock-hour
-    // bins wrap at midnight, so a raw ascending sort would put "00:00" before "21:00" and split one
-    // continuous night's activity across the two ends of the row - instead they're sorted rotated
-    // around midday (the point bats are least active), which keeps any overnight span contiguous
-    // regardless of what clock hours it actually falls on.
-    const bins = Array.from(binsSeen).sort((a, b) => {
-      if (hasLocation) return a - b;
-      const rotate = (h) => ((h + 12) % 24 + 24) % 24;
-      return rotate(a) - rotate(b);
+    const rows = nights.map((night) => {
+      const nightMap = byNight.get(night) || new Map();
+      const counts = bins.map((b) => nightMap.get(b) || 0);
+      return { surveyDate: night, counts, total: counts.reduce((a, b) => a + b, 0) };
     });
+    const binMeans = bins.map((b, i) => (nights.length ? rows.reduce((sum, r) => sum + r.counts[i], 0) / nights.length : 0));
+
+    return { sunsetRelative: hasLocation, binSizeHours: bin, bins, rows, binMeans };
+  }
+
+  // Hourly activity pattern (QA-adjusted) - same shape as computeHourlyActivity above, but each
+  // still-unreviewed detection's contribution is redistributed across computeConfusionBreakdown's
+  // targets in the same proportions reviewed calls of that primary actually turned out to be,
+  // exactly like computeSpeciesStatsQaAdjusted - just keeping the per-night/per-bin granularity
+  // instead of collapsing to a single deployment-wide total. Counts become fractional (weights),
+  // and only the fraction that lands on a species/genus matching the current filter is kept - e.g.
+  // filtering to "Leisler's Bat" after finding 90% of its reviewed calls were actually Serotine
+  // shows the 10% that stayed Leisler's, not the 90% that moved elsewhere (that 90% shows up
+  // instead when filtering to Serotine). Species with fewer than minSample reviewed calls are left
+  // as raw counts, same low-frequency-species handling as computeSpeciesStatsQaAdjusted.
+  function computeHourlyActivityQaAdjusted(dataset, location, filter, confusionBreakdown, minSample, binSizeHours) {
+    filter = filter || { type: 'all', value: null };
+    minSample = minSample || MIN_RELIABLE_SAMPLE;
+    const { hasLocation, bin, hourValueOf, binStartOf, bins, nights } = hourlyActivityFrame(dataset, location, binSizeHours);
+    const confusionBySpecies = new Map((confusionBreakdown || []).map((c) => [c.species, c]));
+
+    function matchesFilter(species) {
+      if (filter.type === 'species') return species === filter.value;
+      if (filter.type === 'group') return ns.SpeciesData && ns.SpeciesData.genusOf(species) === filter.value;
+      return true;
+    }
+
+    const byNight = new Map(); // surveyDate -> Map(binStart -> weight)
+    function addWeight(night, b, w) {
+      if (!byNight.has(night)) byNight.set(night, new Map());
+      const m = byNight.get(night);
+      m.set(b, (m.get(b) || 0) + w);
+    }
+
+    for (const row of dataset) {
+      if (row.category !== 'bat' || !row.dateTime || !row.surveyDate) continue;
+      const b = binStartOf(hourValueOf(row));
+      if (row.source !== 'primary-bto') {
+        if (matchesFilter(row.finalId)) addWeight(row.surveyDate, b, 1);
+        continue;
+      }
+      const confusion = confusionBySpecies.get(row.finalId);
+      if (!confusion || confusion.reviewedSampleSize < minSample) {
+        if (matchesFilter(row.finalId)) addWeight(row.surveyDate, b, 1);
+        continue;
+      }
+      for (const target of confusion.breakdown) {
+        if (target.pct > 0 && matchesFilter(target.finalId)) addWeight(row.surveyDate, b, target.pct / 100);
+      }
+    }
 
     const rows = nights.map((night) => {
       const nightMap = byNight.get(night) || new Map();
@@ -775,6 +835,7 @@ window.BatID = window.BatID || {};
     computeSpeciesStatsQaAdjusted,
     computeNightlyStats,
     computeHourlyActivity,
+    computeHourlyActivityQaAdjusted,
     computeTimingStats,
     computeReliabilityStats,
     computeReliabilityByProbabilityBand,
