@@ -531,6 +531,45 @@ window.BatID = window.BatID || {};
     return { deployments: rows };
   }
 
+  // Stage 7 (Level 2): compares every Location in a Project, side by side, at the whole-site scale
+  // - "is activity/richness similar between locations here" - distinct from Stage 6's through-year
+  // view of a single Location's own deployments. Each Location's deployments are merged into one
+  // combined dataset first (a Location may have several deployments across the year; this asks how
+  // the Location as a whole compares to its sibling Locations, not how any one deployment does),
+  // then read through the same building blocks as computeAllStats/computeLocationComparison so the
+  // numbers always match what each Location's own pages show. Both raw and QA-adjusted composition
+  // are computed (the QA-adjusted figures use each Location's OWN confusion breakdown, built from
+  // whatever's been reviewed across all its deployments combined) so the comparison can be read
+  // either way, same as every other raw/QA-adjusted view in the app.
+  function computeSiteComparison(project, minSample) {
+    const locations = (project.locations || []).map((loc) => {
+      const allEvents = (loc.deployments || []).flatMap((d) => d.detectionEvents || []);
+      const dataset = buildAnalysisDataset(allEvents);
+      const nightsInData = new Set(dataset.map((d) => d.surveyDate).filter(Boolean)).size;
+      const activity = computeActivityStats(dataset, { nights: nightsInData, validRecordingHours: null });
+      const species = computeSpeciesStats(dataset);
+      const confusionBreakdown = computeConfusionBreakdown(allEvents);
+      const speciesQaAdjusted = computeSpeciesStatsQaAdjusted(dataset, confusionBreakdown, minSample);
+      return {
+        locationId: loc.id,
+        locationName: loc.name,
+        deploymentCount: (loc.deployments || []).length,
+        nights: nightsInData,
+        totalDetections: activity.totalDetections,
+        detectionsPerNight: activity.detectionsPerNight,
+        richness: species.richness,
+        dominantSpecies: species.dominantSpecies ? species.dominantSpecies.species : null,
+        dominantPct: species.dominantSpecies ? species.dominantSpecies.pct : null,
+        composition: species.composition,
+        richnessQaAdjusted: speciesQaAdjusted.richness,
+        dominantSpeciesQaAdjusted: speciesQaAdjusted.dominantSpecies ? speciesQaAdjusted.dominantSpecies.species : null,
+        dominantPctQaAdjusted: speciesQaAdjusted.dominantSpecies ? speciesQaAdjusted.dominantSpecies.pct : null,
+        compositionQaAdjusted: speciesQaAdjusted.composition,
+      };
+    });
+    return { locations };
+  }
+
   // Below this many judged calls, a reliability percentage swings too wildly on one or two more
   // reviews to stand on its own - Stage 3's fallback hierarchy (computeReliabilityBySpecies, below)
   // and Stage 4's QA-adjusted redistribution (computeSpeciesStatsQaAdjusted) both use this as the
@@ -843,6 +882,7 @@ window.BatID = window.BatID || {};
     computeConfusionBreakdown,
     computeAllStats,
     computeLocationComparison,
+    computeSiteComparison,
     mean, median, stdDev, percentile, wilsonInterval, compareSurveyDates,
   };
 })(window.BatID);

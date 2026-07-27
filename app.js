@@ -22,14 +22,22 @@ const QA_OUTCOME_LABELS = {
   unresolved: 'Unresolved',
 };
 
+// Three-tier navigation, per Clara's own framing: a Deployment answers "what happened" (this
+// list), a Location answers "how did it vary through the year" (LocationOverview's Time
+// comparison section), and the Project/Site answers "how do locations compare to each other"
+// (the sidebar's Compare Locations page). "Statistics" was split into General (effort/activity/
+// species/timing/reliability - the headline numbers) and Night Activity (nightly variation +
+// hourly pattern - the "when, and does it vary night to night" questions) so each tab answers one
+// question rather than mixing both. "Comparisons" moved to the Location level entirely - it never
+// belonged to a single deployment in the first place.
 const DEPLOYMENT_TABS = [
   { id: 'overview', label: 'Overview', phase: 1 },
   { id: 'detections', label: 'Detections', phase: 2 },
   { id: 'qa', label: 'QA', phase: 4 },
   { id: 'review', label: 'Manual Review', phase: 3 },
-  { id: 'stats', label: 'Statistics', phase: 5 },
+  { id: 'general-stats', label: 'General Statistics', phase: 5 },
+  { id: 'night-stats', label: 'Night Activity Statistics', phase: 5 },
   { id: 'figures', label: 'Figures', phase: 6 },
-  { id: 'comparisons', label: 'Comparisons', phase: 7 },
   { id: 'reports', label: 'Reports', phase: 8 },
 ];
 
@@ -172,6 +180,10 @@ function Workspace({ project, onChange, onBackToProjects, onExport }) {
   const [selection, setSelection] = useState({ locationId: null, deploymentId: null });
   const [activeTab, setActiveTab] = useState('overview');
   const [modal, setModal] = useState(null);
+  // Site/Project-level page (Stage 7 - Level 2 location comparisons) - its own nav state, separate
+  // from selection.locationId/deploymentId, since it's a third tier above both: a Location answers
+  // "how did it vary through the year", the Site answers "how do Locations compare to each other".
+  const [showSiteComparison, setShowSiteComparison] = useState(false);
 
   // Folder-linked storage: mirrors the project to a real project.json in a user-chosen folder,
   // so its location is up to the analyst and the whole project is shareable as that one folder.
@@ -338,8 +350,8 @@ function Workspace({ project, onChange, onBackToProjects, onExport }) {
   (project.locations || []).forEach((loc) => {
     treeChildren.push(h('div', {
       key: loc.id,
-      className: 'tree-node tree-node-location' + (selection.locationId === loc.id && !selection.deploymentId ? ' tree-node-active' : ''),
-      onClick: () => { setSelection({ locationId: loc.id, deploymentId: null }); setActiveTab('overview'); },
+      className: 'tree-node tree-node-location' + (selection.locationId === loc.id && !selection.deploymentId && !showSiteComparison ? ' tree-node-active' : ''),
+      onClick: () => { setShowSiteComparison(false); setSelection({ locationId: loc.id, deploymentId: null }); setActiveTab('overview'); },
     },
       h('span', { style: { flex: 1 } }, loc.name || '(untitled location)'),
       h('span', { className: 'badge-count' }, String((loc.deployments || []).length))
@@ -347,8 +359,8 @@ function Workspace({ project, onChange, onBackToProjects, onExport }) {
     (loc.deployments || []).forEach((dep) => {
       treeChildren.push(h('div', {
         key: dep.id,
-        className: 'tree-node tree-indent' + (selection.deploymentId === dep.id ? ' tree-node-active' : ''),
-        onClick: () => { setSelection({ locationId: loc.id, deploymentId: dep.id }); setActiveTab('overview'); },
+        className: 'tree-node tree-indent' + (selection.deploymentId === dep.id && !showSiteComparison ? ' tree-node-active' : ''),
+        onClick: () => { setShowSiteComparison(false); setSelection({ locationId: loc.id, deploymentId: dep.id }); setActiveTab('overview'); },
       }, dep.name || '(untitled deployment)'));
     });
     treeChildren.push(h('button', {
@@ -358,7 +370,9 @@ function Workspace({ project, onChange, onBackToProjects, onExport }) {
   });
 
   let mainContent;
-  if (!selectedLocation) {
+  if (showSiteComparison) {
+    mainContent = h(SiteComparisonPage, { project });
+  } else if (!selectedLocation) {
     mainContent = h('div', { className: 'empty-state' },
       h('div', { className: 'empty-title' }, 'Select or create a Location'),
       h('div', { className: 'empty-text' }, 'Locations are persistent monitoring points (e.g. "East boundary", "Woodland edge") that can receive repeated Deployments over multiple years.')
@@ -394,6 +408,13 @@ function Workspace({ project, onChange, onBackToProjects, onExport }) {
       h('div', { className: 'sidebar-section', style: { display: 'flex', gap: 6 } },
         h('button', { className: 'btn btn-secondary btn-small', style: { flex: 1 }, onClick: onBackToProjects }, '← Projects'),
         h('button', { className: 'btn btn-secondary btn-small', style: { flex: 1 }, onClick: onExport }, 'Export')
+      ),
+      (project.locations || []).length >= 1 && h('div', { className: 'sidebar-section' },
+        h('button', {
+          className: 'btn btn-small' + (showSiteComparison ? ' btn-primary' : ' btn-secondary'),
+          style: { width: '100%' },
+          onClick: () => setShowSiteComparison(true),
+        }, '📊 Compare Locations')
       ),
       S.supportsFolderStorage && h('div', { className: 'sidebar-section' },
         folderStatus === 'none' && h('button', { className: 'btn btn-secondary btn-small', style: { width: '100%' }, onClick: linkFolder }, '📁 Link to a folder'),
@@ -506,7 +527,9 @@ function LocationOverview({ location, onPatch, onDelete, onAddDeployment }) {
           h('div', { className: 'card-title' }, d.name || '(untitled)'),
           h('div', { className: 'card-sub' }, `${d.startDate || '?'} → ${d.endDate || '?'} · ${(d.detectionEvents || []).length} detection event(s)`)
         ))
-      )
+      ),
+      h('div', { className: 'section-title', style: { marginTop: 24 } }, `Time comparison - deployments along the year at ${location.name || 'this location'}`),
+      h(LocationTimeComparison, { location })
     )
   );
 }
@@ -522,10 +545,10 @@ function DeploymentPanel({ location, deployment, activeTab, setActiveTab, onPatc
     tabContent = h(QaTab, { deployment, onPatch, wavFileMap, setWavFileMap, onGoToReview: () => setActiveTab('review') });
   } else if (activeTab === 'review') {
     tabContent = h(ReviewTab, { deployment, onPatchEvent, wavFileMap, setWavFileMap, customLabels, onAddCustomLabel });
-  } else if (activeTab === 'stats') {
-    tabContent = h(StatisticsTab, { deployment, location, onPatch });
-  } else if (activeTab === 'comparisons') {
-    tabContent = h(ComparisonsTab, { location, deployment });
+  } else if (activeTab === 'general-stats') {
+    tabContent = h(GeneralStatisticsTab, { deployment, location });
+  } else if (activeTab === 'night-stats') {
+    tabContent = h(NightActivityStatisticsTab, { deployment, location, onPatch });
   } else {
     tabContent = h(ComingSoonTab, { tab: DEPLOYMENT_TABS.find((t) => t.id === activeTab) });
   }
@@ -783,38 +806,12 @@ function HourlyActivityChart({ hourly, filter, location }) {
   );
 }
 
-function StatisticsTab({ deployment, location, onPatch }) {
+function GeneralStatisticsTab({ deployment, location }) {
   const stats = useMemo(() => Stats.computeAllStats(deployment, location, ALL_SPECIES_NAMES), [deployment, location]);
-  const { effort, activity, species, speciesQaAdjusted, nightly, timing, reliability, reliabilityByProbabilityBand, reliabilityBySpecies, confusionBreakdown, totalDetectionEvents, totalSpeciesRecords } = stats;
+  const { effort, activity, species, speciesQaAdjusted, timing, reliability, reliabilityByProbabilityBand, reliabilityBySpecies, confusionBreakdown, totalDetectionEvents, totalSpeciesRecords } = stats;
   const [expandedSpecies, setExpandedSpecies] = useState(() => new Set());
   const [speciesView, setSpeciesView] = useState('raw'); // 'raw' | 'qa-adjusted'
   const confusionBySpecies = useMemo(() => new Map((confusionBreakdown || []).map((c) => [c.species, c])), [confusionBreakdown]);
-  const [hourlyFilterType, setHourlyFilterType] = useState('all'); // 'all' | 'species' | 'group'
-  const [hourlyFilterValue, setHourlyFilterValue] = useState(null);
-  const [hourlyView, setHourlyView] = useState('raw'); // 'raw' | 'qa-adjusted'
-  const speciesNames = useMemo(() => (species.composition || []).map((s) => s.species).sort(), [species]);
-  const groupNames = useMemo(() => Array.from(new Set(speciesNames.map((s) => SpeciesData.genusOf(s)).filter(Boolean))).sort(), [speciesNames]);
-  const hourly = useMemo(
-    () => hourlyView === 'qa-adjusted'
-      ? Stats.computeHourlyActivityQaAdjusted(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, confusionBreakdown)
-      : Stats.computeHourlyActivity(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }),
-    [stats.dataset, location, hourlyFilterType, hourlyFilterValue, hourlyView, confusionBreakdown]
-  );
-
-  // Export selections: each ticked chart/table view is remembered as {key, label} on the
-  // deployment itself (not local state) so it survives navigating away and persists to storage -
-  // this is the "mark this specific view for the PDF" mechanism Clara asked for. The full-dump
-  // Excel/CSV export is unrelated to this list and always includes everything (Stage 8 work, not
-  // built yet) - this is just the selection bookkeeping the PDF step will read from later.
-  const exportSelections = deployment.exportSelections || [];
-  const hourlyExportKey = `hourly-activity:${hourlyFilterType}:${hourlyFilterValue || 'all'}`;
-  const hourlyExportLabel = `Hourly activity - ${hourlyFilterType === 'all' ? 'All bats' : hourlyFilterType === 'species' ? hourlyFilterValue : `${hourlyFilterValue} (genus)`}`;
-  const isHourlySelected = exportSelections.some((s) => s.key === hourlyExportKey);
-  function toggleExportSelection(key, label) {
-    const exists = exportSelections.some((s) => s.key === key);
-    const next = exists ? exportSelections.filter((s) => s.key !== key) : [...exportSelections, { key, label, addedAt: new Date().toISOString() }];
-    onPatch({ exportSelections: next });
-  }
 
   function toggleExpanded(sp) {
     setExpandedSpecies((prev) => {
@@ -948,6 +945,129 @@ function StatisticsTab({ deployment, location, onPatch }) {
       h(StatBox, { label: 'Nightly CV', value: fmtNum(activity.nightlyCv, 2) })
     ),
 
+    h('div', { className: 'section-title', style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
+      h('span', null, 'Species'),
+      h('div', { style: { display: 'flex', gap: 4 } },
+        h('button', {
+          className: 'btn btn-small ' + (speciesView === 'raw' ? 'btn-primary' : 'btn-secondary'),
+          onClick: () => setSpeciesView('raw'),
+        }, 'Raw'),
+        h('button', {
+          className: 'btn btn-small ' + (speciesView === 'qa-adjusted' ? 'btn-primary' : 'btn-secondary'),
+          onClick: () => setSpeciesView('qa-adjusted'),
+        }, 'QA-adjusted')
+      )
+    ),
+    speciesView === 'qa-adjusted' && h('div', { className: 'card-sub', style: { marginBottom: 8 } },
+      "Still-unreviewed calls are redistributed using the confusion pattern from reviewed calls of the same BTO primary (e.g. if reviewed \"Leisler's Bat\" calls turned out mostly Serotine, unreviewed Leisler's calls are counted mostly toward Serotine here instead). Species without at least 10 reviewed calls of their own are left as raw counts - not enough evidence yet to trust a correction. First-cut estimate: assumes each species' reviewed sample generalises to its unreviewed calls in this deployment."),
+    (() => {
+      const activeSpecies = speciesView === 'qa-adjusted' ? speciesQaAdjusted : species;
+      const rows = activeSpecies.composition;
+      const valueLabel = speciesView === 'qa-adjusted' ? 'Est. count' : 'Count';
+      return h(React.Fragment, null,
+        h('div', { className: 'stat-grid' },
+          h(StatBox, { label: 'Richness', value: activeSpecies.richness }),
+          h(StatBox, { label: 'Dominant species', value: activeSpecies.dominantSpecies ? activeSpecies.dominantSpecies.species : '-' }),
+          h(StatBox, { label: 'Dominant %', value: activeSpecies.dominantSpecies ? fmtNum(activeSpecies.dominantSpecies.pct) + '%' : '-' })
+        ),
+        rows.length > 0 && h('div', { className: 'card', style: { marginTop: 12, padding: 0, overflow: 'hidden' } },
+          h('div', { style: { overflowX: 'auto' } },
+            h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
+              h('thead', null, h('tr', null,
+                ['Species', valueLabel, '% of total', 'Active nights', 'Detection freq.'].map((c) => h('th', {
+                  key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
+                }, c))
+              )),
+              h('tbody', null, rows.map((s) => h('tr', { key: s.species },
+                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } },
+                  s.species,
+                  speciesView === 'qa-adjusted' && s.ownCallsReassigned
+                    ? h('span', { style: { color: 'var(--text-faint)', fontSize: 10, marginLeft: 6 }, title: 'Unreviewed calls with this BTO primary were mostly reassigned to other species' }, '(reassigned away)')
+                    : null,
+                  speciesView === 'qa-adjusted' && s.receivedReassignedCalls
+                    ? h('span', { style: { color: 'var(--text-faint)', fontSize: 10, marginLeft: 6 }, title: 'Includes calls reassigned here from a different BTO primary' }, '(gained calls)')
+                    : null),
+                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, speciesView === 'qa-adjusted' ? fmtNum(s.weight, 1) : s.count),
+                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(s.pct) + '%'),
+                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.activeNights),
+                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.detectionFrequencyPct != null ? fmtNum(s.detectionFrequencyPct) + '%' : '-')
+              )))
+            )
+          )
+        )
+      );
+    })(),
+
+    h('div', { className: 'section-title' }, 'Timing'),
+    h('div', { className: 'card-sub', style: { marginBottom: 8 } },
+      timing.sunsetRelative
+        ? "Times below are hours relative to sunset (negative = before sunset) - uses this Location's coordinates."
+        : "Times below are raw clock time - set this Location's Latitude/Longitude (on its Details tab) to switch to sunset-relative timing."),
+    h('div', { className: 'stat-grid' },
+      h(StatBox, { label: 'First detection', value: fmtDateTime(timing.firstDetection) }),
+      h(StatBox, { label: 'Last detection', value: fmtDateTime(timing.lastDetection) }),
+      h(StatBox, { label: timing.sunsetRelative ? 'Median (rel. sunset)' : 'Median hour', value: timing.sunsetRelative ? fmtHour(timing.medianHour) : fmtNum(timing.medianHour) }),
+      h(StatBox, {
+        label: 'Peak 30-min window',
+        value: timing.peakHalfHour ? `${timing.sunsetRelative ? fmtHour(timing.peakHalfHour.startHour) : fmtNum(timing.peakHalfHour.startHour)} (${timing.peakHalfHour.count})` : '-',
+      }),
+      h(StatBox, {
+        label: 'Peak rolling hour',
+        value: timing.peakRollingHour ? `${timing.sunsetRelative ? fmtHour(timing.peakRollingHour.startHour) : fmtNum(timing.peakRollingHour.startHour)} (${timing.peakRollingHour.count})` : '-',
+      })
+    ),
+    Object.keys(timing.percentiles || {}).length > 0 && h('div', { style: { marginTop: 12 } },
+      h('div', { className: 'card-sub', style: { marginBottom: 6 } }, 'Cumulative activity percentiles:'),
+      h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '6px 18px', fontSize: 12, fontFamily: 'var(--font-mono)' } },
+        [10, 25, 50, 75, 90].map((p) => h('span', { key: p }, `${p}%: ${timing.sunsetRelative ? fmtHour(timing.percentiles[p]) : fmtNum(timing.percentiles[p])}`))
+      )
+    )
+  );
+}
+
+// Night-to-night and hour-by-hour patterns within this deployment - split out from General
+// Statistics so the two questions ("how good/how much overall" vs "when, and does it vary night to
+// night") each get their own place, per Clara's request.
+function NightActivityStatisticsTab({ deployment, location, onPatch }) {
+  const stats = useMemo(() => Stats.computeAllStats(deployment, location, ALL_SPECIES_NAMES), [deployment, location]);
+  const { species, nightly, confusionBreakdown, totalDetectionEvents } = stats;
+  const [hourlyFilterType, setHourlyFilterType] = useState('all'); // 'all' | 'species' | 'group'
+  const [hourlyFilterValue, setHourlyFilterValue] = useState(null);
+  const [hourlyView, setHourlyView] = useState('raw'); // 'raw' | 'qa-adjusted'
+  const speciesNames = useMemo(() => (species.composition || []).map((s) => s.species).sort(), [species]);
+  const groupNames = useMemo(() => Array.from(new Set(speciesNames.map((s) => SpeciesData.genusOf(s)).filter(Boolean))).sort(), [speciesNames]);
+  const hourly = useMemo(
+    () => hourlyView === 'qa-adjusted'
+      ? Stats.computeHourlyActivityQaAdjusted(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, confusionBreakdown)
+      : Stats.computeHourlyActivity(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }),
+    [stats.dataset, location, hourlyFilterType, hourlyFilterValue, hourlyView, confusionBreakdown]
+  );
+
+  // Export selections: each ticked chart/table view is remembered as {key, label} on the
+  // deployment itself (not local state) so it survives navigating away and persists to storage -
+  // this is the "mark this specific view for the PDF" mechanism Clara asked for. The full-dump
+  // Excel/CSV export is unrelated to this list and always includes everything (Stage 8 work, not
+  // built yet) - this is just the selection bookkeeping the PDF step will read from later.
+  const exportSelections = deployment.exportSelections || [];
+  const hourlyExportKey = `hourly-activity:${hourlyFilterType}:${hourlyFilterValue || 'all'}`;
+  const hourlyExportLabel = `Hourly activity - ${hourlyFilterType === 'all' ? 'All bats' : hourlyFilterType === 'species' ? hourlyFilterValue : `${hourlyFilterValue} (genus)`}`;
+  const isHourlySelected = exportSelections.some((s) => s.key === hourlyExportKey);
+  function toggleExportSelection(key, label) {
+    const exists = exportSelections.some((s) => s.key === key);
+    const next = exists ? exportSelections.filter((s) => s.key !== key) : [...exportSelections, { key, label, addedAt: new Date().toISOString() }];
+    onPatch({ exportSelections: next });
+  }
+
+  if (totalDetectionEvents === 0) {
+    return h('div', { className: 'content' },
+      h('div', { className: 'empty-state' },
+        h('div', { className: 'empty-title' }, 'No detections to analyse yet'),
+        h('div', { className: 'empty-text' }, 'Import a BTO CSV on the Detections tab first.')
+      )
+    );
+  }
+
+  return h('div', { className: 'content' },
     h('div', { className: 'section-title' }, 'Nightly variation (within this deployment)'),
     nightly.outlierNights.length > 0 && h('div', { className: 'card-sub', style: { marginBottom: 8 } },
       `${nightly.outlierNights.length} night(s) stand out statistically from the rest of this deployment (marked below) - worth checking against weather, detector faults, or anything else that night that might explain it.`),
@@ -1040,106 +1160,30 @@ function StatisticsTab({ deployment, location, onPatch }) {
     hourly.rows.length > 0 && h('label', { style: { display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, fontSize: 12, color: 'var(--text-muted)', cursor: 'pointer' } },
       h('input', { type: 'checkbox', checked: isHourlySelected, onChange: () => toggleExportSelection(hourlyExportKey, hourlyExportLabel) }),
       'Include this view in the PDF export'
-    ),
-
-    h('div', { className: 'section-title', style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
-      h('span', null, 'Species'),
-      h('div', { style: { display: 'flex', gap: 4 } },
-        h('button', {
-          className: 'btn btn-small ' + (speciesView === 'raw' ? 'btn-primary' : 'btn-secondary'),
-          onClick: () => setSpeciesView('raw'),
-        }, 'Raw'),
-        h('button', {
-          className: 'btn btn-small ' + (speciesView === 'qa-adjusted' ? 'btn-primary' : 'btn-secondary'),
-          onClick: () => setSpeciesView('qa-adjusted'),
-        }, 'QA-adjusted')
-      )
-    ),
-    speciesView === 'qa-adjusted' && h('div', { className: 'card-sub', style: { marginBottom: 8 } },
-      "Still-unreviewed calls are redistributed using the confusion pattern from reviewed calls of the same BTO primary (e.g. if reviewed \"Leisler's Bat\" calls turned out mostly Serotine, unreviewed Leisler's calls are counted mostly toward Serotine here instead). Species without at least 10 reviewed calls of their own are left as raw counts - not enough evidence yet to trust a correction. First-cut estimate: assumes each species' reviewed sample generalises to its unreviewed calls in this deployment."),
-    (() => {
-      const activeSpecies = speciesView === 'qa-adjusted' ? speciesQaAdjusted : species;
-      const rows = activeSpecies.composition;
-      const valueLabel = speciesView === 'qa-adjusted' ? 'Est. count' : 'Count';
-      return h(React.Fragment, null,
-        h('div', { className: 'stat-grid' },
-          h(StatBox, { label: 'Richness', value: activeSpecies.richness }),
-          h(StatBox, { label: 'Dominant species', value: activeSpecies.dominantSpecies ? activeSpecies.dominantSpecies.species : '-' }),
-          h(StatBox, { label: 'Dominant %', value: activeSpecies.dominantSpecies ? fmtNum(activeSpecies.dominantSpecies.pct) + '%' : '-' })
-        ),
-        rows.length > 0 && h('div', { className: 'card', style: { marginTop: 12, padding: 0, overflow: 'hidden' } },
-          h('div', { style: { overflowX: 'auto' } },
-            h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
-              h('thead', null, h('tr', null,
-                ['Species', valueLabel, '% of total', 'Active nights', 'Detection freq.'].map((c) => h('th', {
-                  key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
-                }, c))
-              )),
-              h('tbody', null, rows.map((s) => h('tr', { key: s.species },
-                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } },
-                  s.species,
-                  speciesView === 'qa-adjusted' && s.ownCallsReassigned
-                    ? h('span', { style: { color: 'var(--text-faint)', fontSize: 10, marginLeft: 6 }, title: 'Unreviewed calls with this BTO primary were mostly reassigned to other species' }, '(reassigned away)')
-                    : null,
-                  speciesView === 'qa-adjusted' && s.receivedReassignedCalls
-                    ? h('span', { style: { color: 'var(--text-faint)', fontSize: 10, marginLeft: 6 }, title: 'Includes calls reassigned here from a different BTO primary' }, '(gained calls)')
-                    : null),
-                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, speciesView === 'qa-adjusted' ? fmtNum(s.weight, 1) : s.count),
-                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(s.pct) + '%'),
-                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.activeNights),
-                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.detectionFrequencyPct != null ? fmtNum(s.detectionFrequencyPct) + '%' : '-')
-              )))
-            )
-          )
-        )
-      );
-    })(),
-
-    h('div', { className: 'section-title' }, 'Timing'),
-    h('div', { className: 'card-sub', style: { marginBottom: 8 } },
-      timing.sunsetRelative
-        ? "Times below are hours relative to sunset (negative = before sunset) - uses this Location's coordinates."
-        : "Times below are raw clock time - set this Location's Latitude/Longitude (on its Details tab) to switch to sunset-relative timing."),
-    h('div', { className: 'stat-grid' },
-      h(StatBox, { label: 'First detection', value: fmtDateTime(timing.firstDetection) }),
-      h(StatBox, { label: 'Last detection', value: fmtDateTime(timing.lastDetection) }),
-      h(StatBox, { label: timing.sunsetRelative ? 'Median (rel. sunset)' : 'Median hour', value: timing.sunsetRelative ? fmtHour(timing.medianHour) : fmtNum(timing.medianHour) }),
-      h(StatBox, {
-        label: 'Peak 30-min window',
-        value: timing.peakHalfHour ? `${timing.sunsetRelative ? fmtHour(timing.peakHalfHour.startHour) : fmtNum(timing.peakHalfHour.startHour)} (${timing.peakHalfHour.count})` : '-',
-      }),
-      h(StatBox, {
-        label: 'Peak rolling hour',
-        value: timing.peakRollingHour ? `${timing.sunsetRelative ? fmtHour(timing.peakRollingHour.startHour) : fmtNum(timing.peakRollingHour.startHour)} (${timing.peakRollingHour.count})` : '-',
-      })
-    ),
-    Object.keys(timing.percentiles || {}).length > 0 && h('div', { style: { marginTop: 12 } },
-      h('div', { className: 'card-sub', style: { marginBottom: 6 } }, 'Cumulative activity percentiles:'),
-      h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '6px 18px', fontSize: 12, fontFamily: 'var(--font-mono)' } },
-        [10, 25, 50, 75, 90].map((p) => h('span', { key: p }, `${p}%: ${timing.sunsetRelative ? fmtHour(timing.percentiles[p]) : fmtNum(timing.percentiles[p])}`))
-      )
     )
   );
 }
 
 // Stage 6 (Level 1B): how this Location's deployments compare through the year - one row per
-// deployment, in chronological order, with the current deployment highlighted so it's easy to spot
-// where "now" sits in the sequence.
-function ComparisonsTab({ location, deployment }) {
+// deployment, in chronological order. Lives on the Location page (not a per-deployment tab) since
+// "how does activity vary across the year at this site" is a question about the Location as a
+// whole, not about any one deployment - per Clara's own framing of the three-tier navigation
+// (deployment: what happened; location: how it varies through the year; site: how locations
+// compare to each other). `currentDeploymentId` is optional - when given (opened from within a
+// deployment, if ever wired up that way again) that row is highlighted; the Location-page usage
+// below doesn't pass one, so no row is highlighted there.
+function LocationTimeComparison({ location, currentDeploymentId }) {
   const comparison = useMemo(() => Stats.computeLocationComparison(location), [location]);
   const rows = comparison.deployments;
 
   if (rows.length < 2) {
-    return h('div', { className: 'content' },
-      h('div', { className: 'empty-state' },
-        h('div', { className: 'empty-title' }, 'Need at least two deployments to compare'),
-        h('div', { className: 'empty-text' }, `${location.name} has ${rows.length} deployment${rows.length === 1 ? '' : 's'} so far - add another to see activity, richness and species turnover through the year.`)
-      )
+    return h('div', { className: 'empty-state' },
+      h('div', { className: 'empty-title' }, 'Need at least two deployments to compare'),
+      h('div', { className: 'empty-text' }, `${location.name} has ${rows.length} deployment${rows.length === 1 ? '' : 's'} so far - add another to see activity, richness and species turnover through the year.`)
     );
   }
 
-  return h('div', { className: 'content' },
-    h('div', { className: 'section-title' }, `Through the year at ${location.name}`),
+  return h('div', null,
     h('div', { className: 'card-sub', style: { marginBottom: 8 } },
       "Species gained/lost are against the immediately preceding deployment only (a simple presence/absence difference) - not a similarity index."),
     h('div', { className: 'card', style: { padding: 0, overflow: 'hidden' } },
@@ -1152,7 +1196,7 @@ function ComparisonsTab({ location, deployment }) {
           )),
           h('tbody', null, rows.map((r) => h('tr', {
             key: r.deploymentId,
-            style: r.deploymentId === deployment.id ? { background: 'rgba(255,150,50,0.08)' } : null,
+            style: r.deploymentId === currentDeploymentId ? { background: 'rgba(255,150,50,0.08)' } : null,
           },
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, r.deploymentName || '(untitled)'),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, `${r.startDate || '?'} → ${r.endDate || '?'}`),
@@ -1166,6 +1210,61 @@ function ComparisonsTab({ location, deployment }) {
         )
       )
     )
+  );
+}
+
+// Stage 7 (Level 2): the Project/Site-level page - how do this site's Locations compare to each
+// other, with each Location's own deployments merged into one combined profile first. Raw/QA-
+// adjusted toggle matches every other stats view in the app.
+function SiteComparisonPage({ project }) {
+  const [view, setView] = useState('raw'); // 'raw' | 'qa-adjusted'
+  const comparison = useMemo(() => Stats.computeSiteComparison(project), [project]);
+  const rows = comparison.locations;
+
+  return h('div', { className: 'content' },
+    h('div', { className: 'main-header', style: { padding: 0, border: 'none', marginBottom: 16 } },
+      h('div', null,
+        h('div', { className: 'main-title' }, 'Compare Locations'),
+        h('div', { className: 'main-subtitle' }, `${project.projectName || 'Project'} · ${rows.length} location(s)`)
+      ),
+      h('div', { style: { display: 'flex', gap: 4 } },
+        h('button', { className: 'btn btn-small ' + (view === 'raw' ? 'btn-primary' : 'btn-secondary'), onClick: () => setView('raw') }, 'Raw'),
+        h('button', { className: 'btn btn-small ' + (view === 'qa-adjusted' ? 'btn-primary' : 'btn-secondary'), onClick: () => setView('qa-adjusted') }, 'QA-adjusted')
+      )
+    ),
+    rows.length < 2
+      ? h('div', { className: 'empty-state' },
+          h('div', { className: 'empty-title' }, 'Need at least two locations to compare'),
+          h('div', { className: 'empty-text' }, `${project.projectName || 'This project'} has ${rows.length} location(s) so far - add another to see how activity/richness compares across the site.`)
+        )
+      : h(React.Fragment, null,
+          view === 'qa-adjusted' && h('div', { className: 'card-sub', style: { marginBottom: 8 } },
+            "Each Location's still-unreviewed calls are redistributed using that Location's own confusion breakdown (built from whatever's been reviewed across all its deployments combined), same as every other QA-adjusted view in the app."),
+          h('div', { className: 'card', style: { padding: 0, overflow: 'hidden' } },
+            h('div', { style: { overflowX: 'auto' } },
+              h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
+                h('thead', null, h('tr', null,
+                  ['Location', 'Deployments', 'Nights', 'Detections/night', 'Richness', 'Dominant species'].map((c) => h('th', {
+                    key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
+                  }, c))
+                )),
+                h('tbody', null, rows.map((r) => {
+                  const richness = view === 'qa-adjusted' ? r.richnessQaAdjusted : r.richness;
+                  const dominantSpecies = view === 'qa-adjusted' ? r.dominantSpeciesQaAdjusted : r.dominantSpecies;
+                  const dominantPct = view === 'qa-adjusted' ? r.dominantPctQaAdjusted : r.dominantPct;
+                  return h('tr', { key: r.locationId },
+                    h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, r.locationName || '(untitled)'),
+                    h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, r.deploymentCount),
+                    h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, r.nights),
+                    h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(r.detectionsPerNight)),
+                    h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, richness),
+                    h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, dominantSpecies ? `${dominantSpecies} (${fmtNum(dominantPct)}%)` : '-')
+                  );
+                }))
+              )
+            )
+          )
+        )
   );
 }
 
