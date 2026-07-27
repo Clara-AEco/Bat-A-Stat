@@ -73,6 +73,38 @@ window.BatID = window.BatID || {};
     return rows;
   }
 
+  // The canonical set of nights every nightly statistic should use as its denominator: the
+  // deployment's own Survey Nights (backfilled/generated on the fly via Models.ensureSurveyNights
+  // if not already persisted - this is a pure read, nothing here writes back to storage) filtered
+  // to 'valid' and 'partial' status. 'failed'/'excluded'/'unknown-effort' nights are excluded
+  // entirely rather than contributing a fabricated zero - there is no real observation for them to
+  // report. Falls back to "distinct survey dates seen in the data" only when the deployment has no
+  // date range set yet (Survey Nights can't be generated at all), so a brand-new deployment still
+  // shows something rather than nothing.
+  function validSurveyNights(deployment, location) {
+    const nights = M.ensureSurveyNights(deployment, location || null);
+    return nights
+      .filter((n) => n.status === 'valid' || n.status === 'partial')
+      .slice()
+      .sort((a, b) => compareSurveyDates(a.surveyDate, b.surveyDate));
+  }
+
+  // Collapses a genus-level record (e.g. "Myotis sp" - Clara's own practice for a sonogram too
+  // degraded to call to species) into an already-present species-level record of the same genus,
+  // per the corrective brief's minimum-taxon rule: "Myotis sp" alongside "Daubenton's Bat" should
+  // read as richness 1 (some Myotis, one of which is confirmed Daubenton's), not 2 - the genus-
+  // level record isn't evidence of an ADDITIONAL taxon beyond what's already confirmed present. A
+  // genus-level record only adds a unit when NO species-level record of that genus exists at all.
+  function computeMinimumTaxonRichness(speciesNames) {
+    const SpeciesData = ns.SpeciesData;
+    const genusLevelNames = speciesNames.filter((n) => ns.QaProfiles && ns.QaProfiles.isGenusLevelLabel(n));
+    const speciesLevelNames = speciesNames.filter((n) => !(ns.QaProfiles && ns.QaProfiles.isGenusLevelLabel(n)));
+    const speciesLevelGenera = new Set(speciesLevelNames.map((n) => SpeciesData && SpeciesData.genusOf(n)).filter(Boolean));
+    const genusLevelGenera = new Set(genusLevelNames.map((n) => SpeciesData && SpeciesData.genusOf(n)).filter(Boolean));
+    const extraFromGenusLevel = Array.from(genusLevelGenera).filter((g) => !speciesLevelGenera.has(g)).length;
+    return speciesLevelNames.length + extraFromGenusLevel;
+  }
+
   function mean(values) {
     if (!values.length) return null;
     return values.reduce((s, v) => s + v, 0) / values.length;
@@ -119,17 +151,23 @@ window.BatID = window.BatID || {};
   // nights/dates banners). QA completion % is the one exception - it's fully derivable from the
   // QA profile and detection events with no judgement call involved, so it's always computed
   // directly rather than relying on a manual field nobody remembers to keep updated.
-  function computeEffortStats(deployment, dataset) {
+  function computeEffortStats(deployment, dataset, surveyNights) {
     const effort = deployment.surveyEffort || {};
-    const surveyNights = new Set(dataset.map((d) => d.surveyDate).filter(Boolean));
     const qaSummary = ns.QaProfiles.computeQaSummary(deployment.detectionEvents || [], deployment.qaProfile || {});
+    // nightsInData now means "valid/partial Survey Nights" when that entity is available, not
+    // "distinct survey dates that happen to appear in detections" - a deployment can have real
+    // nights with zero bat activity at all, which the old data-derived count could never see.
+    const nightsInData = surveyNights
+      ? surveyNights.length
+      : new Set(dataset.map((d) => d.surveyDate).filter(Boolean)).size;
     return {
       nights: effort.nights,
       validRecordingHours: effort.validRecordingHours,
       qaCompletionPct: qaSummary.queued > 0 ? (qaSummary.queuedReviewed / qaSummary.queued) * 100 : 100,
       detectorFailures: effort.detectorFailures,
       excludedPeriods: effort.excludedPeriods,
-      nightsInData: surveyNights.size,
+      nightsInData,
+      surveyNights: surveyNights || [],
     };
   }
 
@@ -163,23 +201,36 @@ window.BatID = window.BatID || {};
 
   // Total activity, nightly breakdown, and the summary statistics of that nightly breakdown -
   // both raw and effort-standardised (per-night, per-hour where valid recording hours are set).
-  // Counts everything except confirmed noise and other-taxon identifications - an unreviewed BTO
-  // "No ID" still counts here (it may well be a real, just-unidentifiable bat pass), per the
-  // project's founding rule that nothing is silently excluded from the Analysis Dataset.
+  // Counts confirmed bat identifications only - an unreviewed BTO "No ID" (category
+  // 'unidentified') no longer counts toward activity (corrective brief section 1.5: unreviewed No
+  // ID is excluded from all bat analyses, not just species-level ones; previously it inflated
+  // totals here even though it was already excluded from species stats, which was inconsistent).
+  // A reviewed call resolved to an actual bat species (including "Bat (unidentified)") still
+  // counts, via category 'bat' - only a genuinely still-unclassified, unreviewed call is dropped.
   function computeActivityStats(dataset, effort) {
-    const activityRows = dataset.filter((d) => d.category === 'bat' || d.category === 'unidentified');
+    const activityRows = dataset.filter((d) => d.category === 'bat');
     const byNight = new Map();
     for (const d of activityRows) {
       if (!d.surveyDate) continue;
       byNight.set(d.surveyDate, (byNight.get(d.surveyDate) || 0) + 1);
     }
-    const nightlyCounts = Array.from(byNight.values());
+    // The nightly breakdown's own night list comes from the deployment's valid/partial Survey
+    // Nights when available, not just nights that happen to appear in byNight above - so a night
+    // with truly zero bat activity still gets a real 0 instead of being silently absent from
+    // means/medians/min/max (falls back to "nights seen in the data" only if Survey Nights haven't
+    // been generated yet, e.g. no Start/End date set).
+    const nightDates = (effort.surveyNights && effort.surveyNights.length)
+      ? effort.surveyNights.map((n) => n.surveyDate)
+      : Array.from(byNight.keys());
+    const nightlyCounts = nightDates.map((d) => byNight.get(d) || 0);
     const totalDetections = activityRows.length;
     const nights = effort.nights != null ? effort.nights : effort.nightsInData;
     const avg = mean(nightlyCounts);
     return {
       totalDetections,
-      nightlyBreakdown: Array.from(byNight.entries()).map(([surveyDate, count]) => ({ surveyDate, count })).sort((a, b) => compareSurveyDates(a.surveyDate, b.surveyDate)),
+      nightlyBreakdown: nightDates
+        .map((surveyDate) => ({ surveyDate, count: byNight.get(surveyDate) || 0 }))
+        .sort((a, b) => compareSurveyDates(a.surveyDate, b.surveyDate)),
       detectionsPerNight: nights ? totalDetections / nights : null,
       detectionsPerHour: effort.validRecordingHours ? totalDetections / effort.validRecordingHours : null,
       nightlyMean: avg,
@@ -187,6 +238,8 @@ window.BatID = window.BatID || {};
       nightlyMin: nightlyCounts.length ? Math.min(...nightlyCounts) : null,
       nightlyMax: nightlyCounts.length ? Math.max(...nightlyCounts) : null,
       nightlySd: stdDev(nightlyCounts, avg),
+      // Falsy-zero-safe: avg === 0 already takes the null branch here, so CV reads as "not
+      // applicable" rather than Infinity when a deployment's nights averaged zero activity.
       nightlyCv: avg ? stdDev(nightlyCounts, avg) / avg : null,
     };
   }
@@ -194,7 +247,12 @@ window.BatID = window.BatID || {};
   // Richness, composition, dominance, per-species active-nights/detection-frequency, and a species
   // accumulation curve. Scoped to category === 'bat' only - "other-taxon" and "unidentified" rows
   // can't be attributed to a species so they're excluded here (though still counted in Activity).
-  function computeSpeciesStats(dataset) {
+  // `surveyNights` (optional - the deployment's valid/partial Survey Nights) fixes Detection
+  // Frequency's denominator (corrective brief section 8): it must be every valid survey night in
+  // scope, not just nights that happened to have SOME bat detection - e.g. 6 of 10 valid nights
+  // reads as 60%, not 6/8 = 75% because two other nights only had a different species. Falls back
+  // to "nights with a bat detection" only if Survey Nights aren't available yet.
+  function computeSpeciesStats(dataset, surveyNights) {
     const batRows = dataset.filter((d) => d.category === 'bat');
     const counts = {};
     const nightsBySpecies = {};
@@ -205,7 +263,9 @@ window.BatID = window.BatID || {};
         nightsBySpecies[d.finalId].add(d.surveyDate);
       }
     }
-    const totalNightsInData = new Set(batRows.map((d) => d.surveyDate).filter(Boolean)).size;
+    const totalNightsInData = (surveyNights && surveyNights.length)
+      ? surveyNights.length
+      : new Set(batRows.map((d) => d.surveyDate).filter(Boolean)).size;
     const total = batRows.length;
     const composition = Object.entries(counts)
       .map(([species, count]) => ({
@@ -227,7 +287,13 @@ window.BatID = window.BatID || {};
     });
 
     return {
+      // Raw distinct-label count - kept for anything (e.g. drill-down tables) that genuinely wants
+      // "how many distinct Final ID strings", including a genus-level label as its own entry.
       richness: composition.length,
+      // "Observed richness" per the corrective brief (section 9): collapses a genus-level label
+      // (e.g. "Myotis sp") into an already-present species-level record of that genus rather than
+      // counting both as separate taxa - see computeMinimumTaxonRichness.
+      richnessMinimumTaxa: computeMinimumTaxonRichness(composition.map((c) => c.species)),
       totalBatDetections: total,
       composition,
       dominantSpecies: composition[0] || null,
@@ -237,34 +303,36 @@ window.BatID = window.BatID || {};
 
   // Stage 5 (Level 1A): nightly variation within a single deployment - a richer per-night view than
   // Activity's plain nightly counts (above), pairing each night's activity total with its own
-  // richness and dominant species, and flagging nights whose total activity is a statistical
-  // outlier against the rest of the deployment.
+  // richness and dominant species, plus descriptive "influential night" metrics.
   //
-  // Outlier detection uses the median/MAD-based modified z-score (Iglewicz & Hoaglin 1993:
-  // 0.6745 * (x - median) / MAD, flagged at |M| > 3.5) rather than mean/SD - deliberately, not the
-  // more familiar choice. A single extreme night pulls the mean and SD toward itself, which masks
-  // exactly the outlier it should be flagging, and that masking gets worse the fewer nights there
-  // are. Bat surveys are usually short (3 nights minimum by convention, 5 typical for a consultancy
-  // deployment) - too few for mean/SD to stay stable once an outlier is folded in. The median and
-  // MAD barely move when one value is extreme, so this stays sensitive even at n=4-5.
+  // Per the corrective brief (section 12): this deliberately no longer frames a night as a
+  // statistical outlier/anomaly (the earlier median/MAD-based modified z-score implied a formal
+  // significance test this was never rigorous enough to claim). Instead each night gets plain
+  // descriptive measures - its share of the deployment's total activity, its difference and fold-
+  // difference from the deployment's median night, and its rank - and a purely descriptive
+  // "high-contribution" flag (at least double the median night) that is NOT a statistical claim,
+  // just a prompt to take a look (weather, detector fault, or a genuine peak night).
   //
-  // MAD can come out exactly 0 (more than half the nights had identical activity) - a plain
-  // division would blow up, so that case is handled directly instead: with every "normal" night
-  // literally equal to the median, any night that differs at all is unambiguously the outlier.
-  function computeNightlyStats(dataset) {
-    const activityRows = dataset.filter((d) => d.category === 'bat' || d.category === 'unidentified');
+  // `surveyNights` (optional) fixes the same zero-activity-night blind spot as computeActivityStats
+  // - a night with truly zero bat activity still appears here with total 0, rather than being
+  // silently absent because it produced no BTO rows at all. Falls back to "nights seen in the
+  // data" only if Survey Nights aren't available yet (e.g. no Start/End date set).
+  function computeNightlyStats(dataset, surveyNights) {
     const batRows = dataset.filter((d) => d.category === 'bat');
-    const nights = Array.from(new Set(dataset.map((d) => d.surveyDate).filter(Boolean))).sort(compareSurveyDates);
+    const nights = (surveyNights && surveyNights.length)
+      ? surveyNights.map((n) => n.surveyDate)
+      : Array.from(new Set(dataset.map((d) => d.surveyDate).filter(Boolean))).sort(compareSurveyDates);
 
     const perNight = nights.map((night) => {
-      const nightActivity = activityRows.filter((d) => d.surveyDate === night);
       const nightBat = batRows.filter((d) => d.surveyDate === night);
       const counts = {};
       for (const d of nightBat) counts[d.finalId] = (counts[d.finalId] || 0) + 1;
       const composition = Object.entries(counts).map(([species, count]) => ({ species, count })).sort((a, b) => b.count - a.count);
       return {
         surveyDate: night,
-        totalDetections: nightActivity.length,
+        // Bat activity only now (corrective brief section 1.5) - an unreviewed No ID no longer
+        // inflates this the way it briefly did when it still counted toward computeActivityStats.
+        totalDetections: nightBat.length,
         batDetections: nightBat.length,
         richness: composition.length,
         dominantSpecies: composition[0] ? composition[0].species : null,
@@ -273,23 +341,22 @@ window.BatID = window.BatID || {};
     });
 
     const totals = perNight.map((n) => n.totalDetections);
+    const totalAcrossNights = totals.reduce((a, b) => a + b, 0);
     const nightlyMedian = median(totals);
-    const mad = median(totals.map((v) => Math.abs(v - nightlyMedian)));
+    const ranked = [...perNight].sort((a, b) => b.totalDetections - a.totalDetections);
+    const rankByDate = new Map(ranked.map((n, i) => [n.surveyDate, i + 1]));
     for (const n of perNight) {
-      if (mad > 0) {
-        n.modifiedZScore = (0.6745 * (n.totalDetections - nightlyMedian)) / mad;
-        n.isOutlier = Math.abs(n.modifiedZScore) > 3.5;
-      } else {
-        n.modifiedZScore = n.totalDetections === nightlyMedian ? 0 : null;
-        n.isOutlier = n.totalDetections !== nightlyMedian;
-      }
+      n.contributionPct = totalAcrossNights ? (n.totalDetections / totalAcrossNights) * 100 : 0;
+      n.diffFromMedian = nightlyMedian != null ? n.totalDetections - nightlyMedian : null;
+      n.foldFromMedian = nightlyMedian ? n.totalDetections / nightlyMedian : null;
+      n.rank = rankByDate.get(n.surveyDate);
+      n.isHighContribution = nightlyMedian > 0 && n.totalDetections >= nightlyMedian * 2;
     }
 
     return {
       perNight,
       nightlyMedian,
-      mad,
-      outlierNights: perNight.filter((n) => n.isOutlier),
+      highContributionNights: perNight.filter((n) => n.isHighContribution),
     };
   }
 
@@ -336,12 +403,17 @@ window.BatID = window.BatID || {};
     };
   }
 
-  // Shared groundwork for both hourly-activity functions below: which bins/nights to show (always
-  // derived from EVERY bat/unidentified detection in the deployment, unfiltered, so a filtered or
-  // QA-adjusted view still shows a 0 for a bin/night where only something else was active -
-  // absence within the deployment's own recording activity is real data, not something to hide by
-  // omitting the row/column), plus the hour-value/bin-start helpers and the bin ordering.
-  function hourlyActivityFrame(dataset, location, binSizeHours) {
+  // Shared groundwork for both hourly-activity functions below: which bins/nights to show (bins
+  // derived from EVERY bat detection in the deployment, unfiltered, so a filtered or QA-adjusted
+  // view still shows a 0 for a bin where only something else was active - absence within the
+  // deployment's own recording activity is real data, not something to hide by omitting the
+  // column), plus the hour-value/bin-start helpers and the bin ordering. `surveyNights` (optional -
+  // the deployment's valid/partial Survey Nights) fixes the same zero-activity-night blind spot as
+  // computeActivityStats/computeNightlyStats: a night with truly zero bat activity still gets its
+  // own row, and a night with no reliable recording effort at all (failed/excluded/unknown-effort)
+  // is left out entirely rather than shown as a fabricated all-zero row. Falls back to "nights seen
+  // in the data" only if Survey Nights aren't available yet.
+  function hourlyActivityFrame(dataset, location, binSizeHours, surveyNights) {
     const bin = binSizeHours || 1;
     const hasLocation = location && location.latitude != null && location.longitude != null;
 
@@ -356,10 +428,14 @@ window.BatID = window.BatID || {};
       return Math.floor(hourValue / bin) * bin;
     }
 
-    const allActivityRows = dataset.filter((d) => (d.category === 'bat' || d.category === 'unidentified') && d.dateTime);
+    // Bat activity only now (corrective brief section 1.5) - an unreviewed No ID no longer counts
+    // as "activity" here either, consistent with computeActivityStats/computeNightlyStats.
+    const allActivityRows = dataset.filter((d) => d.category === 'bat' && d.dateTime);
     const binsSeen = new Set();
     for (const d of allActivityRows) binsSeen.add(binStartOf(hourValueOf(d)));
-    const nights = Array.from(new Set(allActivityRows.map((d) => d.surveyDate).filter(Boolean))).sort(compareSurveyDates);
+    const nights = (surveyNights && surveyNights.length)
+      ? surveyNights.map((n) => n.surveyDate)
+      : Array.from(new Set(allActivityRows.map((d) => d.surveyDate).filter(Boolean))).sort(compareSurveyDates);
 
     // Order bins as one continuous overnight sequence. Sunset-relative bins are already continuous
     // (negative = before sunset, positive = after) so a plain ascending sort is correct. Clock-hour
@@ -383,9 +459,9 @@ window.BatID = window.BatID || {};
   // all bats combined. Sunset-relative hours when the Location has coordinates (same convention as
   // computeTimingStats), clock hours otherwise. binSizeHours defaults to 1 (an "hourly" pattern,
   // per the name) but is a parameter since a finer/coarser bin may turn out more useful in practice.
-  function computeHourlyActivity(dataset, location, filter, binSizeHours) {
+  function computeHourlyActivity(dataset, location, filter, binSizeHours, surveyNights) {
     filter = filter || { type: 'all', value: null };
-    const { hasLocation, bin, hourValueOf, binStartOf, bins, nights } = hourlyActivityFrame(dataset, location, binSizeHours);
+    const { hasLocation, bin, hourValueOf, binStartOf, bins, nights } = hourlyActivityFrame(dataset, location, binSizeHours, surveyNights);
 
     const filteredRows = dataset.filter((d) => d.category === 'bat' && d.dateTime).filter((d) => {
       if (filter.type === 'species') return d.finalId === filter.value;
@@ -421,10 +497,10 @@ window.BatID = window.BatID || {};
   // shows the 10% that stayed Leisler's, not the 90% that moved elsewhere (that 90% shows up
   // instead when filtering to Serotine). Species with fewer than minSample reviewed calls are left
   // as raw counts, same low-frequency-species handling as computeSpeciesStatsQaAdjusted.
-  function computeHourlyActivityQaAdjusted(dataset, location, filter, confusionBreakdown, minSample, binSizeHours) {
+  function computeHourlyActivityQaAdjusted(dataset, location, filter, confusionBreakdown, minSample, binSizeHours, surveyNights) {
     filter = filter || { type: 'all', value: null };
     minSample = minSample || MIN_RELIABLE_SAMPLE;
-    const { hasLocation, bin, hourValueOf, binStartOf, bins, nights } = hourlyActivityFrame(dataset, location, binSizeHours);
+    const { hasLocation, bin, hourValueOf, binStartOf, bins, nights } = hourlyActivityFrame(dataset, location, binSizeHours, surveyNights);
     const confusionBySpecies = new Map((confusionBreakdown || []).map((c) => [c.species, c]));
 
     function matchesFilter(species) {
@@ -467,20 +543,64 @@ window.BatID = window.BatID || {};
     return { sunsetRelative: hasLocation, binSizeHours: bin, bins, rows, binMeans };
   }
 
+  const DEFAULT_ANALYTICAL_CONFIDENCE_THRESHOLD = 50;
+
+  // Corrective brief section 6.1's "Original BTO dataset": what the numbers say from BTO's own
+  // automated classification alone, with a configurable probability floor applied and NO manual
+  // review consulted at all. Deliberately independent of buildAnalysisDataset (the "resolved
+  // observed dataset", section 6.2, which every other statistic in this file reads from) - that
+  // dataset keeps the project's original, separately-confirmed rule that an unreviewed BTO primary
+  // always counts toward analysis regardless of its probability, never silently excluded. This is
+  // a distinct, clearly-labeled "before any human review" baseline shown ALONGSIDE the resolved
+  // figure, not a replacement for it - the two are expected to differ, and that difference is part
+  // of the point (how much of the working total is riding on sub-threshold automated calls).
+  // No ID rows (no primary at all) are excluded entirely, since there's no automated ID to grade.
+  function buildOriginalBtoDataset(events, threshold) {
+    threshold = threshold == null ? DEFAULT_ANALYTICAL_CONFIDENCE_THRESHOLD : threshold;
+    const rows = [];
+    for (const ev of events || []) {
+      const primary = ev.primaryBtoId;
+      if (!primary) continue;
+      const label = primary.englishName || primary.species;
+      const isBat = (primary.group || 'bat').toLowerCase() === 'bat';
+      const probabilityPct = primary.probability != null ? primary.probability * 100 : null;
+      if (isBat && probabilityPct != null && probabilityPct < threshold) continue;
+      rows.push({ eventId: ev.id, finalId: label, category: isBat ? 'bat' : 'other-taxon', dateTime: eventDateTime(ev), surveyDate: ev.surveyDate || ev.actualDate || null });
+    }
+    return rows;
+  }
+
+  function computeOriginalBtoStats(events, threshold) {
+    threshold = threshold == null ? DEFAULT_ANALYTICAL_CONFIDENCE_THRESHOLD : threshold;
+    const dataset = buildOriginalBtoDataset(events, threshold);
+    const batRows = dataset.filter((d) => d.category === 'bat');
+    const byNight = new Map();
+    for (const d of batRows) { if (d.surveyDate) byNight.set(d.surveyDate, (byNight.get(d.surveyDate) || 0) + 1); }
+    return {
+      threshold,
+      totalActivity: batRows.length,
+      richness: new Set(batRows.map((d) => d.finalId)).size,
+      nightlyBreakdown: Array.from(byNight.entries()).map(([surveyDate, count]) => ({ surveyDate, count })).sort((a, b) => compareSurveyDates(a.surveyDate, b.surveyDate)),
+    };
+  }
+
   function computeAllStats(deployment, location, knownBatSpeciesNames) {
     const dataset = buildAnalysisDataset(deployment.detectionEvents || []);
-    const effort = computeEffortStats(deployment, dataset);
+    const surveyNights = validSurveyNights(deployment, location);
+    const effort = computeEffortStats(deployment, dataset, surveyNights);
     const events = deployment.detectionEvents || [];
     const confusionBreakdown = computeConfusionBreakdown(events);
     return {
       dataset,
+      surveyNights,
       totalDetectionEvents: events.length,
       totalSpeciesRecords: dataset.length,
       effort,
       activity: computeActivityStats(dataset, effort),
-      species: computeSpeciesStats(dataset),
-      speciesQaAdjusted: computeSpeciesStatsQaAdjusted(dataset, confusionBreakdown),
-      nightly: computeNightlyStats(dataset),
+      originalBto: computeOriginalBtoStats(events, deployment.analyticalConfidenceThreshold),
+      species: computeSpeciesStats(dataset, surveyNights),
+      speciesQaAdjusted: computeSpeciesStatsQaAdjusted(dataset, confusionBreakdown, undefined, surveyNights),
+      nightly: computeNightlyStats(dataset, surveyNights),
       timing: computeTimingStats(dataset, location),
       reliability: computeReliabilityStats(events, knownBatSpeciesNames),
       reliabilityByProbabilityBand: computeReliabilityByProbabilityBand(events, knownBatSpeciesNames),
@@ -505,9 +625,10 @@ window.BatID = window.BatID || {};
     let previousSpeciesSet = null;
     const rows = deployments.map((dep) => {
       const dataset = buildAnalysisDataset(dep.detectionEvents || []);
-      const effort = computeEffortStats(dep, dataset);
+      const surveyNights = validSurveyNights(dep, location);
+      const effort = computeEffortStats(dep, dataset, surveyNights);
       const activity = computeActivityStats(dataset, effort);
-      const species = computeSpeciesStats(dataset);
+      const species = computeSpeciesStats(dataset, surveyNights);
       const speciesSet = new Set(species.composition.map((s) => s.species));
       const speciesGained = previousSpeciesSet ? Array.from(speciesSet).filter((s) => !previousSpeciesSet.has(s)) : [];
       const speciesLost = previousSpeciesSet ? Array.from(previousSpeciesSet).filter((s) => !speciesSet.has(s)) : [];
@@ -520,7 +641,9 @@ window.BatID = window.BatID || {};
         nights: effort.nightsInData,
         totalDetections: activity.totalDetections,
         detectionsPerNight: activity.detectionsPerNight,
-        richness: species.richness,
+        // Minimum-taxon richness (brief section 9.2) - a genus-level record (e.g. "Myotis sp")
+        // doesn't add a unit when a species-level record of that same genus is already present.
+        richness: species.richnessMinimumTaxa,
         dominantSpecies: species.dominantSpecies ? species.dominantSpecies.species : null,
         dominantPct: species.dominantSpecies ? species.dominantSpecies.pct : null,
         speciesGained,
@@ -545,11 +668,14 @@ window.BatID = window.BatID || {};
     const locations = (project.locations || []).map((loc) => {
       const allEvents = (loc.deployments || []).flatMap((d) => d.detectionEvents || []);
       const dataset = buildAnalysisDataset(allEvents);
-      const nightsInData = new Set(dataset.map((d) => d.surveyDate).filter(Boolean)).size;
-      const activity = computeActivityStats(dataset, { nights: nightsInData, validRecordingHours: null });
-      const species = computeSpeciesStats(dataset);
+      // Union of every deployment's own valid/partial Survey Nights at this Location - same basis
+      // as everywhere else, just merged across however many deployments this Location has had.
+      const surveyNights = (loc.deployments || []).flatMap((d) => validSurveyNights(d, loc));
+      const nightsInData = surveyNights.length;
+      const activity = computeActivityStats(dataset, { nights: nightsInData, validRecordingHours: null, surveyNights });
+      const species = computeSpeciesStats(dataset, surveyNights);
       const confusionBreakdown = computeConfusionBreakdown(allEvents);
-      const speciesQaAdjusted = computeSpeciesStatsQaAdjusted(dataset, confusionBreakdown, minSample);
+      const speciesQaAdjusted = computeSpeciesStatsQaAdjusted(dataset, confusionBreakdown, minSample, surveyNights);
       return {
         locationId: loc.id,
         locationName: loc.name,
@@ -557,11 +683,11 @@ window.BatID = window.BatID || {};
         nights: nightsInData,
         totalDetections: activity.totalDetections,
         detectionsPerNight: activity.detectionsPerNight,
-        richness: species.richness,
+        richness: species.richnessMinimumTaxa,
         dominantSpecies: species.dominantSpecies ? species.dominantSpecies.species : null,
         dominantPct: species.dominantSpecies ? species.dominantSpecies.pct : null,
         composition: species.composition,
-        richnessQaAdjusted: speciesQaAdjusted.richness,
+        richnessQaAdjusted: speciesQaAdjusted.richnessMinimumTaxa,
         dominantSpeciesQaAdjusted: speciesQaAdjusted.dominantSpecies ? speciesQaAdjusted.dominantSpecies.species : null,
         dominantPctQaAdjusted: speciesQaAdjusted.dominantSpecies ? speciesQaAdjusted.dominantSpecies.pct : null,
         compositionQaAdjusted: speciesQaAdjusted.composition,
@@ -799,7 +925,7 @@ window.BatID = window.BatID || {};
   // samples more heavily at low BTO confidence, that assumption is weakest exactly where the
   // correction matters most - cross-check the by-probability-band reliability before trusting a
   // QA-adjusted figure for a species whose reviewed sample skews toward one confidence band.
-  function computeSpeciesStatsQaAdjusted(dataset, confusionBreakdown, minSample) {
+  function computeSpeciesStatsQaAdjusted(dataset, confusionBreakdown, minSample, surveyNights) {
     minSample = minSample || MIN_RELIABLE_SAMPLE;
     const confusionBySpecies = new Map((confusionBreakdown || []).map((c) => [c.species, c]));
     const weights = {};
@@ -843,7 +969,11 @@ window.BatID = window.BatID || {};
       }
     }
 
-    const totalNightsInData = new Set(dataset.filter((d) => d.category === 'bat').map((d) => d.surveyDate).filter(Boolean)).size;
+    // Same Detection Frequency denominator fix as computeSpeciesStats: every valid/partial Survey
+    // Night in scope, not just nights that had SOME bat detection.
+    const totalNightsInData = (surveyNights && surveyNights.length)
+      ? surveyNights.length
+      : new Set(dataset.filter((d) => d.category === 'bat').map((d) => d.surveyDate).filter(Boolean)).size;
     const totalWeight = Object.values(weights).reduce((a, b) => a + b, 0);
     const composition = Object.entries(weights)
       .map(([species, weight]) => ({
@@ -858,6 +988,7 @@ window.BatID = window.BatID || {};
 
     return {
       richness: composition.length,
+      richnessMinimumTaxa: computeMinimumTaxonRichness(composition.map((c) => c.species)),
       totalWeight,
       composition,
       dominantSpecies: composition[0] || null,
@@ -867,6 +998,10 @@ window.BatID = window.BatID || {};
 
   ns.Stats = {
     buildAnalysisDataset,
+    validSurveyNights,
+    computeMinimumTaxonRichness,
+    buildOriginalBtoDataset,
+    computeOriginalBtoStats,
     computeEffortStats,
     suggestValidRecordingHours,
     computeActivityStats,

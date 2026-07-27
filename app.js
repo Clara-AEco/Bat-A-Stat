@@ -974,15 +974,18 @@ function GeneralStatisticsTab({ deployment, location }) {
       `Note: ${effort.nightsInData} distinct survey night(s) appear in the data, vs ${effort.nights} entered on the Overview tab - detections-per-night below uses the entered figure.`),
 
     h('div', { className: 'section-title' }, 'Activity'),
+    h('div', { className: 'card-sub', style: { marginBottom: 8 } },
+      `Resolved observed activity (below) applies manual review where it exists and otherwise trusts BTO's primary identification regardless of its confidence - this is the deployment's working analysis figure. Original BTO activity is a separate, stricter baseline: ${stats.originalBto.totalActivity} bat detections from automated IDs alone, at ≥${stats.originalBto.threshold}% confidence, before any manual review is applied - the two are expected to differ.`),
     h('div', { className: 'stat-grid' },
-      h(StatBox, { label: 'Total detections', value: activity.totalDetections }),
+      h(StatBox, { label: 'Total detections (resolved observed)', value: activity.totalDetections }),
+      h(StatBox, { label: `Original BTO activity (≥${stats.originalBto.threshold}%)`, value: stats.originalBto.totalActivity }),
       h(StatBox, { label: 'Per night', value: fmtNum(activity.detectionsPerNight) }),
-      h(StatBox, { label: 'Per hour', value: fmtNum(activity.detectionsPerHour) }),
+      h(StatBox, { label: 'Per hour', value: effort.validRecordingHours ? fmtNum(activity.detectionsPerHour) : 'Effort unavailable' }),
       h(StatBox, { label: 'Nightly mean', value: fmtNum(activity.nightlyMean) }),
       h(StatBox, { label: 'Nightly median', value: fmtNum(activity.nightlyMedian) }),
       h(StatBox, { label: 'Nightly min/max', value: activity.nightlyMin != null ? `${activity.nightlyMin} / ${activity.nightlyMax}` : '-' }),
       h(StatBox, { label: 'Nightly SD', value: fmtNum(activity.nightlySd) }),
-      h(StatBox, { label: 'Nightly CV', value: fmtNum(activity.nightlyCv, 2) })
+      h(StatBox, { label: 'Nightly CV', value: activity.nightlyCv != null ? fmtNum(activity.nightlyCv, 2) : 'N/A' })
     ),
 
     h('div', { className: 'section-title', style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
@@ -1006,7 +1009,7 @@ function GeneralStatisticsTab({ deployment, location }) {
       const valueLabel = speciesView === 'qa-adjusted' ? 'Est. count' : 'Count';
       return h(React.Fragment, null,
         h('div', { className: 'stat-grid' },
-          h(StatBox, { label: 'Richness', value: activeSpecies.richness }),
+          h(StatBox, { label: 'Richness', value: activeSpecies.richnessMinimumTaxa, sub: activeSpecies.richnessMinimumTaxa !== activeSpecies.richness ? `${activeSpecies.richness} distinct labels; a genus-level label collapses into an already-present species of that genus` : null }),
           h(StatBox, { label: 'Dominant species', value: activeSpecies.dominantSpecies ? activeSpecies.dominantSpecies.species : '-' }),
           h(StatBox, { label: 'Dominant %', value: activeSpecies.dominantSpecies ? fmtNum(activeSpecies.dominantSpecies.pct) + '%' : '-' })
         ),
@@ -1078,18 +1081,18 @@ function NightActivityStatisticsTab({ deployment, location, onPatch }) {
   const groupNames = useMemo(() => Array.from(new Set(speciesNames.map((s) => SpeciesData.genusOf(s)).filter(Boolean))).sort(), [speciesNames]);
   const hourly = useMemo(
     () => hourlyView === 'qa-adjusted'
-      ? Stats.computeHourlyActivityQaAdjusted(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, confusionBreakdown)
-      : Stats.computeHourlyActivity(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }),
-    [stats.dataset, location, hourlyFilterType, hourlyFilterValue, hourlyView, confusionBreakdown]
+      ? Stats.computeHourlyActivityQaAdjusted(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, confusionBreakdown, undefined, undefined, stats.surveyNights)
+      : Stats.computeHourlyActivity(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, undefined, stats.surveyNights),
+    [stats.dataset, stats.surveyNights, location, hourlyFilterType, hourlyFilterValue, hourlyView, confusionBreakdown]
   );
   // The chart uses a finer 15-minute bin than the table's 1-hour columns, so a peak's actual shape
   // shows instead of being flattened into one hourly total - table stays hourly since a 4x-wider
   // table would be unreadable, but a chart line can happily pass through more points.
   const hourlyChart = useMemo(
     () => hourlyView === 'qa-adjusted'
-      ? Stats.computeHourlyActivityQaAdjusted(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, confusionBreakdown, undefined, 0.25)
-      : Stats.computeHourlyActivity(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, 0.25),
-    [stats.dataset, location, hourlyFilterType, hourlyFilterValue, hourlyView, confusionBreakdown]
+      ? Stats.computeHourlyActivityQaAdjusted(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, confusionBreakdown, undefined, 0.25, stats.surveyNights)
+      : Stats.computeHourlyActivity(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, 0.25, stats.surveyNights),
+    [stats.dataset, stats.surveyNights, location, hourlyFilterType, hourlyFilterValue, hourlyView, confusionBreakdown]
   );
   const allNightDates = useMemo(() => new Set(hourlyChart.rows.map((r) => r.surveyDate)), [hourlyChart]);
   // null = "all nights" (the default) rather than an actual Set, so switching deployments/filters
@@ -1132,26 +1135,27 @@ function NightActivityStatisticsTab({ deployment, location, onPatch }) {
 
   return h('div', { className: 'content' },
     h('div', { className: 'section-title' }, 'Nightly variation (within this deployment)'),
-    nightly.outlierNights.length > 0 && h('div', { className: 'card-sub', style: { marginBottom: 8 } },
-      `${nightly.outlierNights.length} night(s) stand out statistically from the rest of this deployment (marked below) - worth checking against weather, detector faults, or anything else that night that might explain it.`),
+    nightly.highContributionNights.length > 0 && h('div', { className: 'card-sub', style: { marginBottom: 8 } },
+      `${nightly.highContributionNights.length} night(s) contributed at least double the deployment's median night's activity (marked below) - not a statistical test, just worth a look against weather, detector faults, or a genuine peak night.`),
     nightly.perNight.length > 0 && h('div', { className: 'card', style: { padding: 0, overflow: 'hidden' } },
       h('div', { style: { overflowX: 'auto' } },
         h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
           h('thead', null, h('tr', null,
-            ['Night', 'Total detections', 'Bat detections', 'Richness', 'Dominant species', 'Modified z (MAD)'].map((c) => h('th', {
+            ['Night', 'Total detections', 'Bat detections', 'Richness', 'Dominant species', '% of total activity', 'Rank'].map((c) => h('th', {
               key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
             }, c))
           )),
           h('tbody', null, nightly.perNight.map((n) => h('tr', {
             key: n.surveyDate,
-            style: n.isOutlier ? { background: 'rgba(230,120,50,0.08)' } : null,
+            style: n.isHighContribution ? { background: 'rgba(230,120,50,0.08)' } : null,
           },
-            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, n.surveyDate, n.isOutlier ? ' ⚠' : ''),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, n.surveyDate, n.isHighContribution ? ' ⚠' : ''),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, n.totalDetections),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, n.batDetections),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, n.richness),
             h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, n.dominantSpecies || '-'),
-            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, n.modifiedZScore != null ? fmtNum(n.modifiedZScore, 2) : '-')
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(n.contributionPct, 1) + '%'),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, n.rank)
           )))
         )
       )

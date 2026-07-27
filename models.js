@@ -85,6 +85,12 @@ window.BatID = window.BatID || {};
         speciesRequiring100Percent: [],
         alwaysReviewNoId: true,
       },
+      // Probability floor (%) for the separate "Original BTO" baseline statistic only (Stats.
+      // computeOriginalBtoStats) - NOT applied to the resolved-observed dataset every other
+      // statistic reads from, which keeps the existing rule that an unreviewed BTO primary always
+      // counts toward analysis regardless of its probability. This is a distinct, clearly-labeled
+      // "what would the numbers say from automated IDs alone, before any human review" baseline.
+      analyticalConfidenceThreshold: 50,
       btoImports: [], // [{ id, fileName, importedAt, rowCount, eventIds: [...] }]
       detectionEvents: [],
       // One entry per calendar night the deployment ran, generated from Start/End date (see

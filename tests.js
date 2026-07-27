@@ -152,6 +152,103 @@ window.BatID = window.BatID || {};
     assertEqual(extended[2].surveyDate, '18/06/2026', 'new night added at the end');
   });
 
+  // ---- Phase 2: observed analyses ----
+
+  test('Detection Frequency denominator is total valid Survey Nights, not nights-with-any-bat-detection', () => {
+    const dep = M.createDeployment({ startDate: '2026-06-16', endDate: '2026-06-25' });
+    const dates = ['16/06/2026', '17/06/2026', '18/06/2026', '19/06/2026', '20/06/2026', '21/06/2026', '22/06/2026', '23/06/2026', '24/06/2026', '25/06/2026'];
+    const commonPipDates = dates.slice(0, 6);
+    const sopranoOnlyDates = dates.slice(6, 8);
+    // 24/06 and 25/06 deliberately have zero bat detections at all.
+    const rows = [];
+    commonPipDates.forEach((d, i) => rows.push(makeRow({ originalFileName: `cp${i}.wav`, originalFilePart: '1', species: 'PIPPIP', englishName: 'Common Pipistrelle', actualDate: d, surveyDate: d })));
+    sopranoOnlyDates.forEach((d, i) => rows.push(makeRow({ originalFileName: `sp${i}.wav`, originalFilePart: '1', species: 'PIPPYG', englishName: 'Soprano Pipistrelle', actualDate: d, surveyDate: d })));
+    const { events } = Bto.groupIntoDetectionEvents(rows, 'imp1');
+    dep.detectionEvents = events;
+    dep.surveyNights = M.generateSurveyNights(dep, null);
+
+    const dataset = window.BatID.Stats.buildAnalysisDataset(dep.detectionEvents);
+    const surveyNights = window.BatID.Stats.validSurveyNights(dep, null);
+    assertEqual(surveyNights.length, 10, 'ten valid survey nights in range');
+    const species = window.BatID.Stats.computeSpeciesStats(dataset, surveyNights);
+    const pip = species.composition.find((c) => c.species === 'Common Pipistrelle');
+    assertEqual(Math.round(pip.detectionFrequencyPct), 60, 'Common Pipistrelle detection frequency is 6/10 = 60%, not 6/8 = 75%');
+  });
+
+  test('zero-activity valid nights are included in nightly mean/median and nightlyBreakdown', () => {
+    const dep = M.createDeployment({ startDate: '2026-06-16', endDate: '2026-06-18' });
+    const rows = [makeRow({ originalFileName: 'z1.wav', originalFilePart: '1', species: 'PIPPIP', englishName: 'Common Pipistrelle', actualDate: '16/06/2026', surveyDate: '16/06/2026' })];
+    const { events } = Bto.groupIntoDetectionEvents(rows, 'imp1');
+    dep.detectionEvents = events;
+    dep.surveyNights = M.generateSurveyNights(dep, null); // 16/06 has activity; 17/06 and 18/06 do not
+    const dataset = window.BatID.Stats.buildAnalysisDataset(dep.detectionEvents);
+    const surveyNights = window.BatID.Stats.validSurveyNights(dep, null);
+    const effort = window.BatID.Stats.computeEffortStats(dep, dataset, surveyNights);
+    const activity = window.BatID.Stats.computeActivityStats(dataset, effort);
+    assertEqual(activity.nightlyBreakdown.length, 3, 'all three nights appear, including two with zero activity');
+    assertEqual(activity.nightlyBreakdown.find((n) => n.surveyDate === '17/06/2026').count, 0, '17/06 shows a real zero, not a missing row');
+    assertEqual(activity.nightlyMean, 1 / 3, 'mean divides by all three nights, not just the one with activity');
+    assertEqual(activity.nightlyMedian, 0, 'median across [1,0,0] is 0');
+  });
+
+  test('nightly CV is null (not Infinity) when mean nightly activity is zero', () => {
+    const dep = M.createDeployment({ startDate: '2026-06-16', endDate: '2026-06-17' });
+    dep.detectionEvents = [];
+    dep.surveyNights = M.generateSurveyNights(dep, null);
+    const dataset = window.BatID.Stats.buildAnalysisDataset(dep.detectionEvents);
+    const surveyNights = window.BatID.Stats.validSurveyNights(dep, null);
+    const effort = window.BatID.Stats.computeEffortStats(dep, dataset, surveyNights);
+    const activity = window.BatID.Stats.computeActivityStats(dataset, effort);
+    assertEqual(activity.nightlyMean, 0, 'mean is zero with no detections');
+    assertEqual(activity.nightlyCv, null, 'CV is null, not Infinity, when the mean is zero');
+  });
+
+  test('a failed-status night does not contribute to the valid Survey Night denominator', () => {
+    const dep = M.createDeployment({ startDate: '2026-06-16', endDate: '2026-06-18' });
+    dep.detectionEvents = [];
+    dep.surveyNights = M.generateSurveyNights(dep, null);
+    dep.surveyNights[2].status = 'failed'; // 18/06/2026
+    const valid = window.BatID.Stats.validSurveyNights(dep, null);
+    assertEqual(valid.length, 2, 'the failed night is excluded from the valid/partial count');
+    assert(!valid.some((n) => n.surveyDate === '18/06/2026'), 'the failed night itself is not in the list');
+  });
+
+  test('unreviewed No ID is excluded from activity totals, not just species stats', () => {
+    const rows = [makeRow({ species: 'No ID', englishName: '', group: '', probability: null })];
+    const { events } = Bto.groupIntoDetectionEvents(rows, 'imp1');
+    const dataset = window.BatID.Stats.buildAnalysisDataset(events);
+    const effort = window.BatID.Stats.computeEffortStats({ surveyEffort: {}, detectionEvents: events, qaProfile: {} }, dataset, null);
+    const activity = window.BatID.Stats.computeActivityStats(dataset, effort);
+    assertEqual(activity.totalDetections, 0, 'an unreviewed No ID call contributes zero to activity');
+  });
+
+  test('minimum-taxon richness collapses a genus-level label into an already-present species of that genus', () => {
+    const withGenusAndSpecies = window.BatID.Stats.computeMinimumTaxonRichness(["Daubenton's Bat", 'Myotis sp', 'Common Pipistrelle']);
+    assertEqual(withGenusAndSpecies, 2, "Myotis sp adds nothing new once Daubenton's Bat (a Myotis) is already present");
+    const genusOnly = window.BatID.Stats.computeMinimumTaxonRichness(['Myotis sp', 'Common Pipistrelle']);
+    assertEqual(genusOnly, 2, 'Myotis sp counts as its own taxon when no specific Myotis species is present');
+  });
+
+  test('buildOriginalBtoDataset excludes bat primaries below the analytical confidence threshold', () => {
+    const rows = [
+      makeRow({ originalFileName: 'a.wav', species: 'PIPPIP', englishName: 'Common Pipistrelle', probability: 0.8 }),
+      makeRow({ originalFileName: 'b.wav', species: 'MYOBEC', englishName: "Bechstein's Bat", probability: 0.33 }),
+    ];
+    const { events } = Bto.groupIntoDetectionEvents(rows, 'imp1');
+    const dataset = window.BatID.Stats.buildOriginalBtoDataset(events, 50);
+    assertEqual(dataset.length, 1, 'only the >=50% confidence call is included');
+    assertEqual(dataset[0].finalId, 'Common Pipistrelle');
+  });
+
+  test('buildOriginalBtoDataset ignores manual review entirely', () => {
+    const rows = [makeRow({ species: 'MYOBEC', englishName: "Bechstein's Bat", probability: 0.2 })];
+    const { events } = Bto.groupIntoDetectionEvents(rows, 'imp1');
+    events[0].manualReview.reviewed = true;
+    events[0].manualReview.finalId = 'Common Pipistrelle'; // a human overrode it
+    const dataset = window.BatID.Stats.buildOriginalBtoDataset(events, 50);
+    assertEqual(dataset.length, 0, 'still excluded below threshold - manual review is not consulted for this dataset');
+  });
+
   // ---- Runner ----
 
   function runTests() {
