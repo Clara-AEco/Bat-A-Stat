@@ -495,11 +495,10 @@ window.BatID = window.BatID || {};
   // and only the fraction that lands on a species/genus matching the current filter is kept - e.g.
   // filtering to "Leisler's Bat" after finding 90% of its reviewed calls were actually Serotine
   // shows the 10% that stayed Leisler's, not the 90% that moved elsewhere (that 90% shows up
-  // instead when filtering to Serotine). Species with fewer than minSample reviewed calls are left
-  // as raw counts, same low-frequency-species handling as computeSpeciesStatsQaAdjusted.
-  function computeHourlyActivityQaAdjusted(dataset, location, filter, confusionBreakdown, minSample, binSizeHours, surveyNights) {
+  // instead when filtering to Serotine). Species without a precise enough reviewed sample (same
+  // isPrecisionSufficient test as computeSpeciesStatsQaAdjusted) are left as raw counts.
+  function computeHourlyActivityQaAdjusted(dataset, location, filter, confusionBreakdown, maxMarginPct, binSizeHours, surveyNights) {
     filter = filter || { type: 'all', value: null };
-    minSample = minSample || MIN_RELIABLE_SAMPLE;
     const { hasLocation, bin, hourValueOf, binStartOf, bins, nights } = hourlyActivityFrame(dataset, location, binSizeHours, surveyNights);
     const confusionBySpecies = new Map((confusionBreakdown || []).map((c) => [c.species, c]));
 
@@ -524,7 +523,7 @@ window.BatID = window.BatID || {};
         continue;
       }
       const confusion = confusionBySpecies.get(row.finalId);
-      if (!confusion || confusion.reviewedSampleSize < minSample) {
+      if (!confusion || !isPrecisionSufficient(confusion.retainedCount, confusion.reviewedSampleSize, maxMarginPct)) {
         if (matchesFilter(row.finalId)) addWeight(row.surveyDate, b, 1);
         continue;
       }
@@ -584,6 +583,123 @@ window.BatID = window.BatID || {};
     };
   }
 
+  // Corrective brief section 15.6: acceptance/modification/rejection rates computed and reported
+  // separately, rather than compressed into a single unexplained reliability figure. Uses each
+  // reviewed event's most recent accept/modify/reject decision from manualReview.history (added
+  // Phase 1); falls back to deriving it the same way ReviewTab's setFinalId does, for reviewed
+  // events saved before the history model existed (history is append-only going forward, but
+  // older saved projects won't have it).
+  function computeReviewStateSummary(events) {
+    const reviewed = (events || []).filter((ev) => ev.manualReview && ev.manualReview.reviewed);
+    let accepted = 0, modified = 0, rejected = 0;
+    for (const ev of reviewed) {
+      const decisions = (ev.manualReview.history || []).filter((h) => h.action === 'accept' || h.action === 'modify' || h.action === 'reject');
+      let action = decisions.length ? decisions[decisions.length - 1].action : null;
+      if (!action) {
+        const primaryLabel = ev.primaryBtoId ? (ev.primaryBtoId.englishName || ev.primaryBtoId.species) : null;
+        action = ev.manualReview.finalId === 'Noise / No ID' ? 'reject' : (ev.manualReview.finalId === primaryLabel ? 'accept' : 'modify');
+      }
+      if (action === 'accept') accepted++;
+      else if (action === 'reject') rejected++;
+      else modified++;
+    }
+    const n = reviewed.length;
+    const acceptedCi = wilsonInterval(accepted, n);
+    const modifiedCi = wilsonInterval(modified, n);
+    const rejectedCi = wilsonInterval(rejected, n);
+    return {
+      reviewedCount: n,
+      accepted, modified, rejected,
+      acceptanceRatePct: n ? (accepted / n) * 100 : null,
+      acceptanceRateCiLowerPct: acceptedCi ? acceptedCi.lowerPct : null,
+      acceptanceRateCiUpperPct: acceptedCi ? acceptedCi.upperPct : null,
+      modificationRatePct: n ? (modified / n) * 100 : null,
+      modificationRateCiLowerPct: modifiedCi ? modifiedCi.lowerPct : null,
+      modificationRateCiUpperPct: modifiedCi ? modifiedCi.upperPct : null,
+      rejectionRatePct: n ? (rejected / n) * 100 : null,
+      rejectionRateCiLowerPct: rejectedCi ? rejectedCi.lowerPct : null,
+      rejectionRateCiUpperPct: rejectedCi ? rejectedCi.upperPct : null,
+    };
+  }
+
+  // Corrective brief section 16 ("a single overall percentage reviewed is insufficient") / Phase 3
+  // item 2: breaks QA completion down by species, genus, BTO confidence band, and survey night, so
+  // a real gap (e.g. no reviewed calls yet for a rare species) is visible rather than hidden inside
+  // one blended number. "Reviewed" here means manualReview.reviewed regardless of the outcome -
+  // this is about how much review EFFORT has covered each stratum, not accuracy (see
+  // computeReviewStateSummary/computeReliability* for accuracy). Recording-condition stratification
+  // (brief 15.11/16) is NOT included - recording conditions are recorded once per deployment, not
+  // per detection, so there is nothing to stratify BY within a single deployment's own events.
+  function computeQaCoverage(events, bands) {
+    bands = bands || DEFAULT_CONFIDENCE_BANDS;
+    const all = events || [];
+    const withPrimary = all.filter((ev) => ev.primaryBtoId);
+    const noId = all.filter((ev) => !ev.primaryBtoId);
+
+    function summarize(evs) {
+      const total = evs.length;
+      const reviewed = evs.filter((ev) => ev.manualReview && ev.manualReview.reviewed).length;
+      return { total, reviewed, reviewedPct: total ? (reviewed / total) * 100 : null };
+    }
+
+    const bySpeciesMap = new Map();
+    for (const ev of withPrimary) {
+      const label = ev.primaryBtoId.englishName || ev.primaryBtoId.species;
+      if (!bySpeciesMap.has(label)) bySpeciesMap.set(label, []);
+      bySpeciesMap.get(label).push(ev);
+    }
+    const bySpecies = Array.from(bySpeciesMap.entries())
+      .map(([species, evs]) => ({ species, ...summarize(evs) }))
+      .sort((a, b) => b.total - a.total);
+
+    const SpeciesData = ns.SpeciesData;
+    const byGenusMap = new Map();
+    for (const ev of withPrimary) {
+      const label = ev.primaryBtoId.englishName || ev.primaryBtoId.species;
+      const genus = (SpeciesData && SpeciesData.genusOf(label)) || 'Unknown genus';
+      if (!byGenusMap.has(genus)) byGenusMap.set(genus, []);
+      byGenusMap.get(genus).push(ev);
+    }
+    const byGenus = Array.from(byGenusMap.entries())
+      .map(([genus, evs]) => ({ genus, ...summarize(evs) }))
+      .sort((a, b) => b.total - a.total);
+
+    const byConfidenceBand = bands.map((band) => {
+      const inBand = withPrimary.filter((ev) => {
+        const p = ev.primaryBtoId.probability != null ? ev.primaryBtoId.probability * 100 : null;
+        return p != null && p >= band.min && p < band.max;
+      });
+      return { label: band.label, ...summarize(inBand) };
+    });
+    // Below the lowest configured band (e.g. <50%) isn't otherwise represented - most QA profiles
+    // review this in full, so it deserves its own row rather than folding into the lowest band.
+    const lowestMin = Math.min(...bands.map((b) => b.min));
+    const belowBands = withPrimary.filter((ev) => {
+      const p = ev.primaryBtoId.probability != null ? ev.primaryBtoId.probability * 100 : null;
+      return p != null && p < lowestMin;
+    });
+    if (belowBands.length) byConfidenceBand.unshift({ label: `<${lowestMin}%`, ...summarize(belowBands) });
+
+    const byNightMap = new Map();
+    for (const ev of all) {
+      if (!ev.surveyDate) continue;
+      if (!byNightMap.has(ev.surveyDate)) byNightMap.set(ev.surveyDate, []);
+      byNightMap.get(ev.surveyDate).push(ev);
+    }
+    const byNight = Array.from(byNightMap.entries())
+      .map(([surveyDate, evs]) => ({ surveyDate, ...summarize(evs) }))
+      .sort((a, b) => compareSurveyDates(a.surveyDate, b.surveyDate));
+
+    return {
+      overall: summarize(all),
+      noIdCoverage: summarize(noId),
+      bySpecies,
+      byGenus,
+      byConfidenceBand,
+      byNight,
+    };
+  }
+
   function computeAllStats(deployment, location, knownBatSpeciesNames) {
     const dataset = buildAnalysisDataset(deployment.detectionEvents || []);
     const surveyNights = validSurveyNights(deployment, location);
@@ -605,6 +721,8 @@ window.BatID = window.BatID || {};
       reliability: computeReliabilityStats(events, knownBatSpeciesNames),
       reliabilityByProbabilityBand: computeReliabilityByProbabilityBand(events, knownBatSpeciesNames),
       reliabilityBySpecies: computeReliabilityBySpecies(events, knownBatSpeciesNames),
+      reviewStateSummary: computeReviewStateSummary(events),
+      qaCoverage: computeQaCoverage(events),
       confusionBreakdown,
     };
   }
@@ -699,9 +817,37 @@ window.BatID = window.BatID || {};
   // Below this many judged calls, a reliability percentage swings too wildly on one or two more
   // reviews to stand on its own - Stage 3's fallback hierarchy (computeReliabilityBySpecies, below)
   // and Stage 4's QA-adjusted redistribution (computeSpeciesStatsQaAdjusted) both use this as the
-  // point where they stop trusting a level's own number and borrow a coarser one instead. Raised
-  // from 10 to 50 per Clara's call - 10 wasn't a large enough sample to trust a correction against.
-  const MIN_RELIABLE_SAMPLE = 50;
+  // point where they stop trusting a level's own number and borrow a coarser one instead.
+  //
+  // This used to be a flat sample-size count (raised from 10 to 50 per Clara's earlier call, since
+  // 10 wasn't enough to trust a correction against) - replaced per her later, more precise
+  // direction: the bar should be genuine statistical significance, not a chosen round number. A
+  // flat count treats every proportion the same regardless of how clear-cut it actually is; the
+  // Wilson interval already in use everywhere else in this file naturally answers "is this sample
+  // big enough" on its own - a tiny sample produces a wide interval no matter how consistent it
+  // looks by chance, and a large sample at a lopsided (near-0% or near-100%) proportion needs FEWER
+  // calls to be trustworthy than a large sample at an ambiguous ~50% proportion does. So the actual
+  // rule is: trust a level's own estimate only if its 95% Wilson interval is narrow enough to draw
+  // a conclusion from - a maximum acceptable margin of error, not a minimum sample count.
+  //
+  // ±10 percentage points is the default working bar (a conventional margin-of-error threshold for
+  // decision-relevant survey estimates) - tighten it for a report that needs more precision,
+  // loosen it if a deployment's realistic reviewed sample sizes can't support 10pp at the
+  // proportions actually being estimated. This one constant governs every "is this trustworthy yet"
+  // check in the file.
+  const MAX_RELIABLE_MARGIN_PCT = 10;
+
+  // Is a proportion's own 95% Wilson interval narrow enough to draw a conclusion from? Returns
+  // false (never trust it) when there's no sample at all. `successes`/`n` describe any binary
+  // reliability proportion - "was BTO's primary kept", "was this species' primary retained on
+  // review", etc - the same test applies uniformly wherever a sample-size judgement call is made.
+  function isPrecisionSufficient(successes, n, maxMarginPct) {
+    maxMarginPct = maxMarginPct == null ? MAX_RELIABLE_MARGIN_PCT : maxMarginPct;
+    if (!n) return false;
+    const ci = wilsonInterval(successes, n);
+    if (!ci) return false;
+    return (ci.upperPct - ci.lowerPct) / 2 <= maxMarginPct;
+  }
 
   // First cut at "how good is BTO's own primary identification, given what manual review actually
   // found" - the three headline measures from Clara's QA-reliability spec. Only counts reviewed
@@ -728,7 +874,7 @@ window.BatID = window.BatID || {};
   function computeReliabilityStats(events, knownBatSpeciesNames) {
     const reviewed = (events || []).filter((ev) => ev.manualReview && ev.manualReview.reviewed && ev.primaryBtoId);
     const n = reviewed.length;
-    let primaryCorrect = 0, primaryJudged = 0, complete = 0, withAdditional = 0, genusLevel = 0;
+    let primaryCorrect = 0, primaryJudged = 0, complete = 0, withAdditional = 0, genusLevel = 0, additionalRecordCount = 0;
     const byOutcome = {};
     for (const ev of reviewed) {
       const outcome = ns.QaProfiles.computeQaOutcome(ev, knownBatSpeciesNames);
@@ -740,7 +886,9 @@ window.BatID = window.BatID || {};
         if (outcome.primaryIdCorrect) primaryCorrect++;
       }
       if (outcome.eventComplete) complete++;
-      if ((ev.manualReview.additionalTaxa || []).length > 0) withAdditional++;
+      const additionalCount = (ev.manualReview.additionalTaxa || []).length;
+      if (additionalCount > 0) withAdditional++;
+      additionalRecordCount += additionalCount;
     }
     const primaryCi = wilsonInterval(primaryCorrect, primaryJudged);
     const completeCi = wilsonInterval(complete, n);
@@ -754,9 +902,14 @@ window.BatID = window.BatID || {};
       completeEventReliabilityPct: n > 0 ? (complete / n) * 100 : null,
       completeEventReliabilityCiLowerPct: completeCi ? completeCi.lowerPct : null,
       completeEventReliabilityCiUpperPct: completeCi ? completeCi.upperPct : null,
+      // Brief section 15.8 ("additional-species yield"), modelled independently of primary-ID
+      // reliability above: additionalSpeciesRatePct is the event-level yield (what fraction of
+      // reviewed events turned up at least one extra species); additionalSpeciesRecordCount is the
+      // raw count of those extra Species Detection Records (an event can yield more than one).
       additionalSpeciesRatePct: n > 0 ? (withAdditional / n) * 100 : null,
       additionalSpeciesRateCiLowerPct: additionalCi ? additionalCi.lowerPct : null,
       additionalSpeciesRateCiUpperPct: additionalCi ? additionalCi.upperPct : null,
+      additionalSpeciesRecordCount: additionalRecordCount,
       genusLevelRatePct: n > 0 ? (genusLevel / n) * 100 : null,
       byOutcome,
     };
@@ -764,19 +917,19 @@ window.BatID = window.BatID || {};
 
   // BTO's own reported probability is a natural stratifier for reliability - it directly answers
   // "does a higher-confidence primary actually turn out right more often", which is what the QA
-  // profile's probability threshold is a bet on in the first place. Bands match the shape of a
-  // typical QA profile (a below-threshold band that gets reviewed in full, then broadening bands
-  // of increasing BTO confidence) rather than being evenly spaced.
-  const PROBABILITY_BANDS = [
-    { label: '<50%', min: 0, max: 50 },
-    { label: '50-70%', min: 50, max: 70 },
-    { label: '70-90%', min: 70, max: 90 },
+  // profile's probability threshold is a bet on in the first place. Centrally defined and passable
+  // as a parameter (corrective brief section 15.2 - "do not hard-code these throughout the
+  // codebase") rather than fixed forever; this default matches the brief's own suggested bands.
+  const DEFAULT_CONFIDENCE_BANDS = [
+    { label: '50-69%', min: 50, max: 70 },
+    { label: '70-89%', min: 70, max: 90 },
     { label: '90-100%', min: 90, max: 100.001 },
   ];
 
-  function computeReliabilityByProbabilityBand(events, knownBatSpeciesNames) {
+  function computeReliabilityByProbabilityBand(events, knownBatSpeciesNames, bands) {
+    bands = bands || DEFAULT_CONFIDENCE_BANDS;
     const reviewed = (events || []).filter((ev) => ev.manualReview && ev.manualReview.reviewed && ev.primaryBtoId);
-    return PROBABILITY_BANDS.map((band) => {
+    return bands.map((band) => {
       const inBand = reviewed.filter((ev) => {
         const p = ev.primaryBtoId.probability != null ? ev.primaryBtoId.probability * 100 : null;
         return p != null && p >= band.min && p < band.max;
@@ -800,17 +953,29 @@ window.BatID = window.BatID || {};
         primaryIdReliabilityCiLowerPct: ci ? ci.lowerPct : null,
         primaryIdReliabilityCiUpperPct: ci ? ci.upperPct : null,
         genusLevelRatePct: inBand.length > 0 ? (genusLevel / inBand.length) * 100 : null,
-        insufficientSample: primaryJudged < MIN_RELIABLE_SAMPLE,
+        // Margin of error actually achieved at this sample size, alongside the pass/fail flag - a
+        // lightweight calibration diagnostic (brief section 15.9's "every component must be
+        // inspectable" spirit) rather than a bare yes/no.
+        marginOfErrorPct: ci ? (ci.upperPct - ci.lowerPct) / 2 : null,
+        insufficientPrecision: !isPrecisionSufficient(primaryCorrect, primaryJudged),
       };
     });
   }
 
-  // Per-species reliability with a fallback hierarchy for when a species doesn't have enough
-  // reviewed calls of its own to trust: species -> genus -> whole deployment. Below
-  // MIN_RELIABLE_SAMPLE judged calls at a level, the estimate shown is borrowed from the next
-  // coarser level instead (and flagged as such via fallbackLevel/fallbackNote) rather than
-  // presenting a shaky species-specific number as if it were solid.
-  function computeReliabilityBySpecies(events, knownBatSpeciesNames) {
+  // Per-species reliability with a fallback hierarchy for when a species doesn't have a precise
+  // enough estimate of its own to trust: species -> genus -> no adjustment. A level's own estimate
+  // is used only when its 95% Wilson interval is narrow enough to draw a conclusion from
+  // (isPrecisionSufficient); otherwise the next coarser level is tried the same way.
+  //
+  // Per corrective brief section 15.3 ("do not silently fall back to whole-deployment reliability
+  // - a whole-deployment fallback may only exist as an explicit advanced option, disabled by
+  // default"), there is no automatic whole-deployment fallback below genus: when neither a
+  // species' own sample nor its genus's sample is precise enough, the result is reported as
+  // insufficient data rather than quietly borrowing one blended deployment-wide number that could
+  // mask real per-species differences. `allowDeploymentWideFallback` (default false) is the
+  // explicit opt-in the brief allows for - off unless a caller deliberately turns it on.
+  function computeReliabilityBySpecies(events, knownBatSpeciesNames, options) {
+    const allowDeploymentWideFallback = !!(options && options.allowDeploymentWideFallback);
     const SpeciesData = ns.SpeciesData;
     const reviewed = (events || []).filter((ev) => ev.manualReview && ev.manualReview.reviewed && ev.primaryBtoId);
 
@@ -839,7 +1004,7 @@ window.BatID = window.BatID || {};
 
     return Array.from(bySpecies.entries()).map(([species, evs]) => {
       const own = judgeAll(evs);
-      if (own.primaryJudged >= MIN_RELIABLE_SAMPLE) {
+      if (isPrecisionSufficient(own.primaryCorrect, own.primaryJudged)) {
         const ci = wilsonInterval(own.primaryCorrect, own.primaryJudged);
         return {
           species,
@@ -857,7 +1022,7 @@ window.BatID = window.BatID || {};
         ? reviewed.filter((ev) => SpeciesData.genusOf(ev.primaryBtoId.englishName || ev.primaryBtoId.species) === genus)
         : [];
       const genusJudged = genus ? judgeAll(genusEvs) : { primaryCorrect: 0, primaryJudged: 0 };
-      if (genus && genusJudged.primaryJudged >= MIN_RELIABLE_SAMPLE) {
+      if (genus && isPrecisionSufficient(genusJudged.primaryCorrect, genusJudged.primaryJudged)) {
         const ci = wilsonInterval(genusJudged.primaryCorrect, genusJudged.primaryJudged);
         return {
           species,
@@ -867,18 +1032,34 @@ window.BatID = window.BatID || {};
           primaryIdReliabilityCiLowerPct: ci ? ci.lowerPct : null,
           primaryIdReliabilityCiUpperPct: ci ? ci.upperPct : null,
           fallbackLevel: 'genus',
-          fallbackNote: `Only ${own.primaryJudged} judged call(s) for ${species} - showing ${genus} genus-level reliability (n=${genusJudged.primaryJudged}) instead.`,
+          fallbackNote: `${species}'s own reviewed sample (n=${own.primaryJudged}) isn't precise enough yet - showing ${genus} genus-level reliability (n=${genusJudged.primaryJudged}) instead.`,
         };
       }
+      if (allowDeploymentWideFallback) {
+        return {
+          species,
+          reviewedSampleSize: evs.length,
+          primaryIdJudgedSampleSize: own.primaryJudged,
+          primaryIdReliabilityPct: deploymentWide.primaryJudged > 0 ? (deploymentWide.primaryCorrect / deploymentWide.primaryJudged) * 100 : null,
+          primaryIdReliabilityCiLowerPct: deploymentCi ? deploymentCi.lowerPct : null,
+          primaryIdReliabilityCiUpperPct: deploymentCi ? deploymentCi.upperPct : null,
+          fallbackLevel: 'deployment',
+          fallbackNote: `Neither ${species} (n=${own.primaryJudged})${genus ? ` nor the whole ${genus} genus (n=${genusJudged.primaryJudged})` : ''} has a precise enough sample - showing whole-deployment reliability (n=${deploymentWide.primaryJudged}) instead. Whole-deployment borrowing is an explicit opt-in, off by default.`,
+        };
+      }
+      // No adjustment (brief section 15.3's default): neither this species nor its genus has a
+      // precise enough sample, and whole-deployment borrowing isn't enabled - report honestly that
+      // there isn't enough evidence yet, rather than presenting a blended number that could hide a
+      // real per-species difference.
       return {
         species,
         reviewedSampleSize: evs.length,
         primaryIdJudgedSampleSize: own.primaryJudged,
-        primaryIdReliabilityPct: deploymentWide.primaryJudged > 0 ? (deploymentWide.primaryCorrect / deploymentWide.primaryJudged) * 100 : null,
-        primaryIdReliabilityCiLowerPct: deploymentCi ? deploymentCi.lowerPct : null,
-        primaryIdReliabilityCiUpperPct: deploymentCi ? deploymentCi.upperPct : null,
-        fallbackLevel: 'deployment',
-        fallbackNote: `Only ${own.primaryJudged} judged call(s) for ${species}${genus ? ` (and too few across the whole ${genus} genus)` : ''} - showing whole-deployment reliability (n=${deploymentWide.primaryJudged}) instead.`,
+        primaryIdReliabilityPct: null,
+        primaryIdReliabilityCiLowerPct: null,
+        primaryIdReliabilityCiUpperPct: null,
+        fallbackLevel: 'insufficient-data',
+        fallbackNote: `Only ${own.primaryJudged} judged call(s) for ${species}${genus ? ` (and ${genusJudged.primaryJudged} across the whole ${genus} genus)` : ''} - not enough reviewed data yet for a reliable estimate at any level.`,
       };
     }).sort((a, b) => b.reviewedSampleSize - a.reviewedSampleSize);
   }
@@ -905,28 +1086,38 @@ window.BatID = window.BatID || {};
       const breakdown = Array.from(targets.entries())
         .map(([finalId, count]) => ({ finalId, count, pct: (count / total) * 100, isPrimaryRetained: finalId === species }))
         .sort((a, b) => b.count - a.count);
-      return { species, reviewedSampleSize: total, breakdown };
+      const retained = breakdown.find((t) => t.isPrimaryRetained);
+      return {
+        species,
+        reviewedSampleSize: total,
+        breakdown,
+        // Convenience for the precision check below: how many of this species' reviewed calls
+        // stayed that species, out of the reviewed total - the binary proportion whose Wilson
+        // interval decides whether the whole breakdown is precise enough to redistribute by.
+        retainedCount: retained ? retained.count : 0,
+      };
     }).sort((a, b) => b.reviewedSampleSize - a.reviewedSampleSize);
   }
 
   // Stage 4: Raw vs QA-adjusted species composition. Raw (computeSpeciesStats, above - what's used
   // everywhere else in the app) takes every still-unreviewed event's BTO primary at face value.
-  // QA-adjusted goes a step further for species with enough reviewed calls to trust a correction:
-  // each unreviewed event's single count is redistributed across computeConfusionBreakdown's
-  // targets in the same proportions reviewed calls with that primary actually turned out to be -
-  // e.g. if 96% of reviewed "Leisler's Bat" calls were actually Serotine, an unreviewed Leisler's
-  // call contributes 0.96 to Serotine and 0.04 to Leisler's, rather than 1 full count to Leisler's.
-  // Species/primaries with fewer than minSample reviewed calls are left entirely as raw ("low-
-  // frequency species handling") - there isn't enough evidence yet to trust a correction, and
-  // guessing one would just swap one kind of error for another.
+  // QA-adjusted goes a step further for species with a precise enough reviewed sample to trust a
+  // correction: each unreviewed event's single count is redistributed across
+  // computeConfusionBreakdown's targets in the same proportions reviewed calls with that primary
+  // actually turned out to be - e.g. if 96% of reviewed "Leisler's Bat" calls were actually
+  // Serotine, an unreviewed Leisler's call contributes 0.96 to Serotine and 0.04 to Leisler's,
+  // rather than 1 full count to Leisler's. A species/primary whose reviewed sample isn't precise
+  // enough yet (per isPrecisionSufficient, applied to its own retained-vs-reassigned proportion) is
+  // left entirely as raw ("low-frequency species handling") - there isn't enough evidence to trust
+  // a correction, and guessing one would just swap one kind of error for another. `maxMarginPct`
+  // (optional) overrides the default ±10pp precision bar for this call.
   //
   // Caveat (documented, not hidden): this assumes a species' reviewed-call confusion pattern
   // generalises to that species' still-unreviewed calls in this deployment. Because the QA profile
   // samples more heavily at low BTO confidence, that assumption is weakest exactly where the
   // correction matters most - cross-check the by-probability-band reliability before trusting a
   // QA-adjusted figure for a species whose reviewed sample skews toward one confidence band.
-  function computeSpeciesStatsQaAdjusted(dataset, confusionBreakdown, minSample, surveyNights) {
-    minSample = minSample || MIN_RELIABLE_SAMPLE;
+  function computeSpeciesStatsQaAdjusted(dataset, confusionBreakdown, maxMarginPct, surveyNights) {
     const confusionBySpecies = new Map((confusionBreakdown || []).map((c) => [c.species, c]));
     const weights = {};
     const nightsBySpecies = {};
@@ -955,7 +1146,7 @@ window.BatID = window.BatID || {};
         continue;
       }
       const confusion = confusionBySpecies.get(row.finalId);
-      if (!confusion || confusion.reviewedSampleSize < minSample) {
+      if (!confusion || !isPrecisionSufficient(confusion.retainedCount, confusion.reviewedSampleSize, maxMarginPct)) {
         unadjustedLowSampleSpeciesNames.add(row.finalId);
         addWeight(row.finalId, 1, row.surveyDate);
         continue;
@@ -1014,10 +1205,13 @@ window.BatID = window.BatID || {};
     computeReliabilityStats,
     computeReliabilityByProbabilityBand,
     computeReliabilityBySpecies,
+    computeReviewStateSummary,
+    computeQaCoverage,
     computeConfusionBreakdown,
     computeAllStats,
     computeLocationComparison,
     computeSiteComparison,
+    isPrecisionSufficient,
     mean, median, stdDev, percentile, wilsonInterval, compareSurveyDates,
   };
 })(window.BatID);

@@ -249,6 +249,94 @@ window.BatID = window.BatID || {};
     assertEqual(dataset.length, 0, 'still excluded below threshold - manual review is not consulted for this dataset');
   });
 
+  // ---- Phase 3: QA calibration ----
+
+  function reviewedEvent(label, isCorrect, opts) {
+    opts = opts || {};
+    const rows = [makeRow({
+      originalFileName: `ev-${Math.random()}.wav`, originalFilePart: '1',
+      species: label, englishName: label, group: 'Bat',
+      probability: opts.probability != null ? opts.probability : 0.8,
+    })];
+    const { events } = Bto.groupIntoDetectionEvents(rows, 'imp');
+    const ev = events[0];
+    ev.manualReview.reviewed = true;
+    ev.manualReview.finalId = isCorrect ? label : (opts.wrongLabel || 'Something Else');
+    return ev;
+  }
+
+  test('isPrecisionSufficient rejects a tiny sample even at 100%, accepts a large precise sample', () => {
+    assert(!window.BatID.Stats.isPrecisionSufficient(3, 3), 'n=3 at 100% is still too imprecise for the default +-10pp bar');
+    assert(window.BatID.Stats.isPrecisionSufficient(950, 1000), 'n=1000 at 95% is precise enough');
+  });
+
+  test('computeReliabilityBySpecies reports insufficient data by default, not a whole-deployment fallback', () => {
+    const events = [
+      reviewedEvent('Rare Bat', true),
+      reviewedEvent('Rare Bat', true),
+      reviewedEvent('Rare Bat', false, { wrongLabel: 'Noise / No ID' }),
+      reviewedEvent('Rare Bat', false, { wrongLabel: 'Noise / No ID' }),
+    ];
+    const bySpecies = window.BatID.Stats.computeReliabilityBySpecies(events);
+    const rare = bySpecies.find((s) => s.species === 'Rare Bat');
+    assertEqual(rare.fallbackLevel, 'insufficient-data', 'no whole-deployment borrowing by default (brief section 15.3)');
+    assertEqual(rare.primaryIdReliabilityPct, null, 'no reliability figure shown without a precise estimate');
+  });
+
+  test('computeReliabilityBySpecies only borrows whole-deployment reliability when explicitly opted in', () => {
+    const events = [reviewedEvent('Rare Bat', true), reviewedEvent('Rare Bat', true)];
+    const optedIn = window.BatID.Stats.computeReliabilityBySpecies(events, null, { allowDeploymentWideFallback: true });
+    const rare = optedIn.find((s) => s.species === 'Rare Bat');
+    assertEqual(rare.fallbackLevel, 'deployment', 'opted-in fallback reaches whole-deployment level');
+  });
+
+  test('computeReviewStateSummary counts accept/modify/reject separately', () => {
+    const events = [
+      reviewedEvent('Common Pipistrelle', true),
+      reviewedEvent('Common Pipistrelle', true),
+      reviewedEvent('Common Pipistrelle', false, { wrongLabel: 'Soprano Pipistrelle' }),
+      reviewedEvent('Common Pipistrelle', false, { wrongLabel: 'Noise / No ID' }),
+    ];
+    const summary = window.BatID.Stats.computeReviewStateSummary(events);
+    assertEqual(summary.reviewedCount, 4);
+    assertEqual(summary.accepted, 2);
+    assertEqual(summary.modified, 1);
+    assertEqual(summary.rejected, 1);
+  });
+
+  test('computeQaCoverage reports total vs reviewed per species', () => {
+    const { events: unreviewed } = Bto.groupIntoDetectionEvents([makeRow({ originalFileName: 'unreviewed.wav', species: 'PIPPIP', englishName: 'Common Pipistrelle' })], 'imp');
+    const events = [reviewedEvent('Common Pipistrelle', true), ...unreviewed];
+    const coverage = window.BatID.Stats.computeQaCoverage(events);
+    const pip = coverage.bySpecies.find((s) => s.species === 'Common Pipistrelle');
+    assertEqual(pip.total, 2);
+    assertEqual(pip.reviewed, 1);
+    assertEqual(pip.reviewedPct, 50);
+  });
+
+  test('computeReliabilityByProbabilityBand accepts custom confidence bands', () => {
+    const events = [reviewedEvent('Common Pipistrelle', true, { probability: 0.55 })];
+    const customBands = [{ label: 'custom', min: 50, max: 60 }];
+    const bands = window.BatID.Stats.computeReliabilityByProbabilityBand(events, null, customBands);
+    assertEqual(bands.length, 1);
+    assertEqual(bands[0].label, 'custom');
+    assertEqual(bands[0].reviewedSampleSize, 1);
+  });
+
+  test('QA-adjusted redistribution trusts a precise reviewed sample rather than requiring a flat count', () => {
+    // 20 reviewed calls all confirming the same species (100% retained) gives a Wilson interval
+    // narrow enough to trust (~8pp margin) - the old flat n>=50 rule would have left this
+    // unadjusted despite the evidence already being precise.
+    const reviewed = [];
+    for (let i = 0; i < 20; i++) reviewed.push(reviewedEvent('Common Pipistrelle', true));
+    const { events: unreviewed } = Bto.groupIntoDetectionEvents([makeRow({ originalFileName: 'unreviewed2.wav', species: 'PIPPIP', englishName: 'Common Pipistrelle' })], 'imp2');
+    const allEvents = [...reviewed, ...unreviewed];
+    const dataset = window.BatID.Stats.buildAnalysisDataset(allEvents);
+    const confusion = window.BatID.Stats.computeConfusionBreakdown(allEvents);
+    const adjusted = window.BatID.Stats.computeSpeciesStatsQaAdjusted(dataset, confusion);
+    assert(!adjusted.unadjustedLowSampleSpeciesNames.includes('Common Pipistrelle'), 'n=20 at 100% retained is precise enough to trust');
+  });
+
   // ---- Runner ----
 
   function runTests() {

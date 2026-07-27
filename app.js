@@ -883,7 +883,7 @@ function GeneralStatisticsTab({ deployment, location }) {
           h('div', { className: 'stat-grid' },
             h(StatBox, { label: 'Primary-ID reliability', value: fmtNum(reliability.primaryIdReliabilityPct) + '%', sub: fmtCi(reliability.primaryIdReliabilityCiLowerPct, reliability.primaryIdReliabilityCiUpperPct) }),
             h(StatBox, { label: 'Complete-event reliability', value: fmtNum(reliability.completeEventReliabilityPct) + '%', sub: fmtCi(reliability.completeEventReliabilityCiLowerPct, reliability.completeEventReliabilityCiUpperPct) }),
-            h(StatBox, { label: 'Additional-species rate', value: fmtNum(reliability.additionalSpeciesRatePct) + '%', sub: fmtCi(reliability.additionalSpeciesRateCiLowerPct, reliability.additionalSpeciesRateCiUpperPct) }),
+            h(StatBox, { label: 'Additional-species yield', value: fmtNum(reliability.additionalSpeciesRatePct) + '%', sub: (fmtCi(reliability.additionalSpeciesRateCiLowerPct, reliability.additionalSpeciesRateCiUpperPct) || '') + ` · ${reliability.additionalSpeciesRecordCount} extra record(s)` }),
             h(StatBox, { label: 'Genus-level downgrade rate', value: fmtNum(reliability.genusLevelRatePct) + '%' }),
             h(StatBox, { label: 'Primary-ID judged sample (n)', value: reliability.primaryIdJudgedSampleSize }),
             h(StatBox, { label: 'Reviewed sample (n)', value: reliability.reviewedSampleSize })
@@ -907,7 +907,10 @@ function GeneralStatisticsTab({ deployment, location }) {
                   h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, b.label),
                   h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(b.primaryIdReliabilityPct) + '%'),
                   h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtCi(b.primaryIdReliabilityCiLowerPct, b.primaryIdReliabilityCiUpperPct) || '-'),
-                  h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, b.insufficientSample ? `${b.primaryIdJudgedSampleSize} (small sample)` : b.primaryIdJudgedSampleSize),
+                  h('td', {
+                    style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' },
+                    title: b.marginOfErrorPct != null ? `95% CI margin of error: ±${fmtNum(b.marginOfErrorPct)}pp` : '',
+                  }, b.insufficientPrecision ? `${b.primaryIdJudgedSampleSize} (imprecise)` : b.primaryIdJudgedSampleSize),
                   h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(b.genusLevelRatePct) + '%')
                 )))
               )
@@ -934,9 +937,13 @@ function GeneralStatisticsTab({ deployment, location }) {
                     },
                       h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', width: 16 } }, confusion ? (isExpanded ? '▾' : '▸') : ''),
                       h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, s.species),
-                      h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(s.primaryIdReliabilityPct) + '%'),
+                      h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.primaryIdReliabilityPct != null ? fmtNum(s.primaryIdReliabilityPct) + '%' : '-'),
                       h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtCi(s.primaryIdReliabilityCiLowerPct, s.primaryIdReliabilityCiUpperPct) || '-'),
-                      h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, s.fallbackLevel === 'species' ? 'Species' : s.fallbackLevel === 'genus' ? 'Genus (fallback)' : 'Deployment (fallback)'),
+                      h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } },
+                        s.fallbackLevel === 'species' ? 'Species'
+                          : s.fallbackLevel === 'genus' ? 'Genus (fallback)'
+                          : s.fallbackLevel === 'deployment' ? 'Deployment (fallback)'
+                          : 'Insufficient data'),
                       h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.reviewedSampleSize)
                     ),
                   ];
@@ -960,7 +967,7 @@ function GeneralStatisticsTab({ deployment, location }) {
             )
           ),
           h('div', { className: 'card-sub', style: { marginTop: 4 } },
-            'Species with fewer than 10 judged calls of their own borrow a coarser estimate (genus, then whole deployment) rather than showing an unstable species-specific number - hover a row for the reason. Click a row with an arrow to see what its reviewed calls actually resolved to.')
+            "A species' own estimate is shown only when its 95% confidence interval is narrow enough to draw a conclusion from (±10 percentage points by default) - otherwise a genus-level estimate is tried the same way, and if neither is precise enough yet, it's reported as insufficient data rather than a shaky number. Hover a row for the reason. Click a row with an arrow to see what its reviewed calls actually resolved to.")
         ),
 
     h('div', { className: 'section-title' }, 'Survey effort'),
@@ -1002,7 +1009,7 @@ function GeneralStatisticsTab({ deployment, location }) {
       )
     ),
     speciesView === 'qa-adjusted' && h('div', { className: 'card-sub', style: { marginBottom: 8 } },
-      "Still-unreviewed calls are redistributed using the confusion pattern from reviewed calls of the same BTO primary (e.g. if reviewed \"Leisler's Bat\" calls turned out mostly Serotine, unreviewed Leisler's calls are counted mostly toward Serotine here instead). Species without at least 10 reviewed calls of their own are left as raw counts - not enough evidence yet to trust a correction. First-cut estimate: assumes each species' reviewed sample generalises to its unreviewed calls in this deployment."),
+      "Still-unreviewed calls are redistributed using the confusion pattern from reviewed calls of the same BTO primary (e.g. if reviewed \"Leisler's Bat\" calls turned out mostly Serotine, unreviewed Leisler's calls are counted mostly toward Serotine here instead). A species is only adjusted once its reviewed sample's 95% confidence interval is narrow enough to draw a conclusion from (±10 percentage points by default) - otherwise it's left as raw counts, not enough evidence yet to trust a correction. First-cut estimate: assumes each species' reviewed sample generalises to its unreviewed calls in this deployment."),
     (() => {
       const activeSpecies = speciesView === 'qa-adjusted' ? speciesQaAdjusted : species;
       const rows = activeSpecies.composition;
@@ -1595,6 +1602,8 @@ function QaTab({ deployment, onPatch, wavFileMap, setWavFileMap, onGoToReview })
   }
 
   const summary = useMemo(() => QaProfiles.computeQaSummary(events, profile), [events, profile]);
+  const reviewStateSummary = useMemo(() => Stats.computeReviewStateSummary(events), [events]);
+  const qaCoverage = useMemo(() => Stats.computeQaCoverage(events), [events]);
   const speciesList = useMemo(() => {
     const counts = computeSpeciesCounts(events);
     return Object.keys(counts).filter((s) => s !== 'Noise / No ID').sort();
@@ -1743,6 +1752,62 @@ function QaTab({ deployment, onPatch, wavFileMap, setWavFileMap, onGoToReview })
               `⚠ ${summary.queuedRemaining} of ${summary.queued} queued calls still need review - statistics won't reflect a complete QA pass until this reaches zero.`))
         : h('div', { className: 'card', style: { marginTop: 16, borderColor: 'var(--teal)' } },
             h('div', { style: { color: 'var(--teal)', fontWeight: 600 } }, `✓ QA complete - all ${summary.queued} queued calls have been reviewed.`))
+    ),
+
+    h('div', { className: 'section-title' }, 'Review outcomes'),
+    reviewStateSummary.reviewedCount === 0
+      ? h('div', { className: 'card-sub' }, 'No calls reviewed yet - accept/modify/reject rates will appear here once some QA has been done.')
+      : h(React.Fragment, null,
+          h('div', { className: 'card-sub', style: { marginBottom: 8 } },
+            'Computed separately per corrective-brief guidance - a single reliability figure hides whether a reviewer mostly confirmed BTO, corrected it to a different species, or rejected the call outright.'),
+          h('div', { className: 'stat-grid' },
+            h(StatBox, { label: 'Accepted', value: `${fmtNum(reviewStateSummary.acceptanceRatePct)}%`, sub: fmtCi(reviewStateSummary.acceptanceRateCiLowerPct, reviewStateSummary.acceptanceRateCiUpperPct) }),
+            h(StatBox, { label: 'Modified', value: `${fmtNum(reviewStateSummary.modificationRatePct)}%`, sub: fmtCi(reviewStateSummary.modificationRateCiLowerPct, reviewStateSummary.modificationRateCiUpperPct) }),
+            h(StatBox, { label: 'Rejected', value: `${fmtNum(reviewStateSummary.rejectionRatePct)}%`, sub: fmtCi(reviewStateSummary.rejectionRateCiLowerPct, reviewStateSummary.rejectionRateCiUpperPct) }),
+            h(StatBox, { label: 'Reviewed (n)', value: reviewStateSummary.reviewedCount })
+          )
+        ),
+
+    h('div', { className: 'section-title' }, 'QA coverage by species'),
+    h('div', { className: 'card-sub', style: { marginBottom: 8 } },
+      "A single overall \"% reviewed\" hides where review effort actually went - this breaks it down so a gap (e.g. no reviewed calls yet for a rare species) is visible."),
+    qaCoverage.bySpecies.length === 0
+      ? h('div', { className: 'card-sub' }, 'Import a BTO CSV first to see species coverage here.')
+      : h('div', { className: 'card', style: { padding: 0, overflow: 'hidden', marginBottom: 16 } },
+          h('div', { style: { overflowX: 'auto', maxHeight: 280, overflowY: 'auto' } },
+            h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
+              h('thead', null, h('tr', null,
+                ['Species', 'Total', 'Reviewed', '% reviewed'].map((c) => h('th', {
+                  key: c, style: { position: 'sticky', top: 0, background: 'var(--bg-elevated)', textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
+                }, c))
+              )),
+              h('tbody', null, qaCoverage.bySpecies.map((s) => h('tr', { key: s.species },
+                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, s.species),
+                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.total),
+                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.reviewed),
+                h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(s.reviewedPct) + '%')
+              )))
+            )
+          )
+        ),
+
+    h('div', { className: 'section-title' }, 'QA coverage by BTO confidence band'),
+    h('div', { className: 'card', style: { padding: 0, overflow: 'hidden' } },
+      h('div', { style: { overflowX: 'auto' } },
+        h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
+          h('thead', null, h('tr', null,
+            ['Band', 'Total', 'Reviewed', '% reviewed'].map((c) => h('th', {
+              key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
+            }, c))
+          )),
+          h('tbody', null, qaCoverage.byConfidenceBand.map((b) => h('tr', { key: b.label },
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, b.label),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, b.total),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, b.reviewed),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(b.reviewedPct) + '%')
+          )))
+        )
+      )
     ),
 
     h('div', { style: { display: 'flex', gap: 10, marginTop: 16 } },
