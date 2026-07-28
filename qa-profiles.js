@@ -2,6 +2,28 @@
 window.BatID = window.BatID || {};
 
 (function (ns) {
+  // The one canonical default QA profile shape - used as the fallback everywhere a deployment
+  // might not have its own qaProfile object yet (older deployments predating this field, or a
+  // partially-constructed one). Previously app.js and stats.js each had their OWN independently
+  // written "default" fallback (app.js's DEFAULT_QA_PROFILE literal vs stats.js's bare `{}`), which
+  // had silently drifted apart - a deployment missing qaProfile showed the correct queue counts on
+  // the QA tab (which used its own real default) but a wrong, always-100% QA completion % on
+  // General Statistics (computeEffortStats's `{}` fallback made every probability/sample check
+  // silently pass, so nothing was ever queued from that function's point of view). Single source
+  // of truth from here on.
+  const DEFAULT_PROFILE = {
+    samplePercent: 10,
+    probabilityThreshold: 50,
+    speciesThresholds: [
+      { species: 'Common Pipistrelle', threshold: 60 },
+      { species: 'Soprano Pipistrelle', threshold: 60 },
+    ],
+    speciesRequiring100Percent: [],
+    alwaysReviewNoId: true,
+    confidenceBands: null,
+    maxMarginPct: null,
+  };
+
   // Deterministic hash of a string to [0, 1). Same event ID always maps to the same value,
   // so raising the sample % only ever ADDS calls to the queue - it never reshuffles or drops
   // ones already selected (and already reviewed).
@@ -122,6 +144,7 @@ window.BatID = window.BatID || {};
   }
 
   ns.QaProfiles = {
+    DEFAULT_PROFILE,
     stableHash01, effectiveThreshold, computeQaInclusion, computeQaSummary,
     computeAnalysisStatus, computeQaOutcome, isGenusLevelLabel,
   };

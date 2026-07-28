@@ -94,6 +94,7 @@ window.BatID = window.BatID || {};
 
   async function saveProject(project) {
     ns.Models.touch(project);
+    ns.Models.stampVersionMetadata(project);
     const db = await openDb();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE, 'readwrite');

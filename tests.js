@@ -398,6 +398,107 @@ window.BatID = window.BatID || {};
     assertEqual(window.BatID.Stats.computeComparisonWarnings(matched, matched).join(','), '', 'identical descriptors raise no warnings');
   });
 
+  // ---- Phase 5: versioning, exports, report/QA correctness ----
+
+  test('computeEffortStats QA completion % uses the same default profile as the QA queue itself', () => {
+    const dep = M.createDeployment({ startDate: '2026-06-16', endDate: '2026-06-16' });
+    delete dep.qaProfile; // simulates a deployment that predates this field (Clara's real live data)
+    const rows = [makeRow({ probability: 0.2 })]; // below the 50% default threshold - should be queued
+    const { events } = Bto.groupIntoDetectionEvents(rows, 'imp');
+    dep.detectionEvents = events;
+    const dataset = window.BatID.Stats.buildAnalysisDataset(events);
+    const surveyNights = window.BatID.Stats.validSurveyNights(dep, null);
+    const effort = window.BatID.Stats.computeEffortStats(dep, dataset, surveyNights);
+    assertEqual(effort.qaCompletionPct, 0, 'QA completion reflects the real queue, not a silently-empty fallback profile');
+  });
+
+  test('createDeployment clones qaProfile arrays so editing one deployment cannot mutate another', () => {
+    const depA = M.createDeployment({});
+    const depB = M.createDeployment({});
+    depA.qaProfile.speciesThresholds.push({ species: 'Test Species', threshold: 99 });
+    assertEqual(depB.qaProfile.speciesThresholds.length, 2, "depB's own thresholds are untouched by depA's edit");
+  });
+
+  test('stampVersionMetadata records schema/app version', () => {
+    const p = M.createProject({});
+    p.schemaVersion = 0; p.lastSavedWithAppVersion = 'old';
+    M.stampVersionMetadata(p);
+    assertEqual(p.schemaVersion, M.SCHEMA_VERSION);
+    assertEqual(p.lastSavedWithAppVersion, M.APP_VERSION);
+  });
+
+  test('Exports.surveyNightsToCsv includes every Survey Night, including zero-activity ones', () => {
+    const dep = M.createDeployment({ startDate: '2026-06-16', endDate: '2026-06-18' });
+    dep.detectionEvents = [];
+    dep.surveyNights = M.generateSurveyNights(dep, null);
+    const csv = window.BatID.Exports.surveyNightsToCsv(dep);
+    const lines = csv.trim().split('\n');
+    assertEqual(lines.length, 4, 'header + 3 nights, even though none have any activity');
+  });
+
+  test('Exports keeps Observed and Estimated activity as separate tables, never merged', () => {
+    const rows = [makeRow()];
+    const { events } = Bto.groupIntoDetectionEvents(rows, 'imp');
+    const dataset = window.BatID.Stats.buildAnalysisDataset(events);
+    const stats = {
+      species: window.BatID.Stats.computeSpeciesStats(dataset, null),
+      speciesQaAdjusted: window.BatID.Stats.computeSpeciesStatsQaAdjusted(dataset, [], undefined, null),
+    };
+    const observedCsv = window.BatID.Exports.resolvedObservedStatsToCsv(stats);
+    const estimatedCsv = window.BatID.Exports.qaAdjustedEstimatesToCsv(stats);
+    assert(observedCsv.split('\n')[0].includes('Count') && !observedCsv.split('\n')[0].includes('Estimated'), 'observed header has no "Estimated" wording');
+    assert(estimatedCsv.split('\n')[0].includes('Estimated'), 'estimated header explicitly says Estimated');
+  });
+
+  test("exported observed activity totals match the deployment's own activity.totalDetections", () => {
+    const dep = M.createDeployment({ startDate: '2026-06-16', endDate: '2026-06-16' });
+    const rows = [
+      makeRow({ species: 'PIPPIP', englishName: 'Common Pipistrelle' }),
+      makeRow({ originalFileName: 'f2.wav', species: 'PIPPYG', englishName: 'Soprano Pipistrelle' }),
+    ];
+    const { events } = Bto.groupIntoDetectionEvents(rows, 'imp');
+    dep.detectionEvents = events;
+    const stats = window.BatID.Stats.computeAllStats(dep, null, []);
+    const csv = window.BatID.Exports.resolvedObservedStatsToCsv(stats);
+    const dataLines = csv.trim().split('\n').slice(1);
+    const summed = dataLines.reduce((sum, line) => sum + Number(line.split(',')[1]), 0);
+    assertEqual(summed, stats.activity.totalDetections, 'CSV export sums to exactly the same total the UI would show');
+  });
+
+  test('Exports.buildWorkbookXml produces one Worksheet per sheet, names deduplicated', () => {
+    const longName = 'A Very Long Sheet Name That Exceeds Thirty One Characters';
+    const sheets = [
+      { name: longName, header: ['X'], rows: [['1']] },
+      { name: longName, header: ['X'], rows: [['2']] },
+    ];
+    const xml = window.BatID.Exports.buildWorkbookXml(sheets);
+    const matches = xml.match(/<Worksheet /g);
+    assertEqual(matches.length, 2, 'one worksheet per input sheet');
+    const nameMatches = [...xml.matchAll(/ss:Name="([^"]+)"/g)].map((m) => m[1]);
+    assertEqual(new Set(nameMatches).size, 2, 'duplicate/too-long names are disambiguated, not collided');
+  });
+
+  test('QA-adjusted composition never introduces a species beyond what has actually been reviewed present', () => {
+    const reviewed = [];
+    for (let i = 0; i < 20; i++) {
+      const rows = [makeRow({ originalFileName: `r${i}.wav`, species: 'PIPLEI', englishName: "Leisler's Bat", probability: 0.8 })];
+      const { events } = Bto.groupIntoDetectionEvents(rows, `imp${i}`);
+      events[0].manualReview.reviewed = true;
+      events[0].manualReview.finalId = 'Serotine'; // every reviewed call of this primary turned out to be Serotine
+      reviewed.push(events[0]);
+    }
+    const { events: unreviewed } = Bto.groupIntoDetectionEvents([makeRow({ originalFileName: 'u.wav', species: 'PIPLEI', englishName: "Leisler's Bat", probability: 0.8 })], 'impU');
+    const allEvents = [...reviewed, ...unreviewed];
+    const dataset = window.BatID.Stats.buildAnalysisDataset(allEvents);
+    const confusion = window.BatID.Stats.computeConfusionBreakdown(allEvents);
+    const observedSpecies = new Set(window.BatID.Stats.computeSpeciesStats(dataset, null).composition.map((c) => c.species));
+    const adjusted = window.BatID.Stats.computeSpeciesStatsQaAdjusted(dataset, confusion);
+    const adjustedSpecies = new Set(adjusted.composition.map((c) => c.species));
+    for (const sp of adjustedSpecies) {
+      assert(observedSpecies.has(sp), `QA-adjusted composition introduced "${sp}", a species never actually confirmed present by any review`);
+    }
+  });
+
   // ---- Runner ----
 
   function runTests() {

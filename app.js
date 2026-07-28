@@ -10,6 +10,7 @@ const EmergenceData = window.BatID.EmergenceData;
 const QaProfiles = window.BatID.QaProfiles;
 const Sun = window.BatID.Sun;
 const Stats = window.BatID.Stats;
+const Exports = window.BatID.Exports;
 
 const QA_OUTCOME_LABELS = {
   correct: 'Correct',
@@ -386,6 +387,7 @@ function Workspace({ project, onChange, onBackToProjects, onExport }) {
     });
   } else {
     mainContent = h(DeploymentPanel, {
+      project,
       location: selectedLocation,
       deployment: selectedDeployment,
       activeTab,
@@ -534,7 +536,7 @@ function LocationOverview({ location, onPatch, onDelete, onAddDeployment }) {
   );
 }
 
-function DeploymentPanel({ location, deployment, activeTab, setActiveTab, onPatch, onDelete, onImportBto, onPatchEvent, customLabels, onAddCustomLabel }) {
+function DeploymentPanel({ project, location, deployment, activeTab, setActiveTab, onPatch, onDelete, onImportBto, onPatchEvent, customLabels, onAddCustomLabel }) {
   const [wavFileMap, setWavFileMap] = useState(new Map());
   let tabContent;
   if (activeTab === 'overview') {
@@ -551,6 +553,8 @@ function DeploymentPanel({ location, deployment, activeTab, setActiveTab, onPatc
     tabContent = h(NightActivityStatisticsTab, { deployment, location, onPatch });
   } else if (activeTab === 'figures') {
     tabContent = h(FigureWorkspaceTab, { deployment, location, onPatch });
+  } else if (activeTab === 'reports') {
+    tabContent = h(ReportsTab, { project, deployment, location });
   } else {
     tabContent = h(ComingSoonTab, { tab: DEPLOYMENT_TABS.find((t) => t.id === activeTab) });
   }
@@ -1121,20 +1125,24 @@ function NightActivityStatisticsTab({ deployment, location, onPatch }) {
   const [hourlyView, setHourlyView] = useState('raw'); // 'raw' | 'qa-adjusted'
   const speciesNames = useMemo(() => (species.composition || []).map((s) => s.species).sort(), [species]);
   const groupNames = useMemo(() => Array.from(new Set(speciesNames.map((s) => SpeciesData.genusOf(s)).filter(Boolean))).sort(), [speciesNames]);
+  // Corrective brief section 22: a deployment that has locked in its own precision bar (see
+  // models.js's qaProfile.maxMarginPct) keeps using it here too, same as computeAllStats does
+  // internally for reliability/QA-adjusted composition.
+  const maxMarginPct = deployment.qaProfile && deployment.qaProfile.maxMarginPct != null ? deployment.qaProfile.maxMarginPct : undefined;
   const hourly = useMemo(
     () => hourlyView === 'qa-adjusted'
-      ? Stats.computeHourlyActivityQaAdjusted(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, confusionBreakdown, undefined, undefined, stats.surveyNights)
+      ? Stats.computeHourlyActivityQaAdjusted(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, confusionBreakdown, maxMarginPct, undefined, stats.surveyNights)
       : Stats.computeHourlyActivity(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, undefined, stats.surveyNights),
-    [stats.dataset, stats.surveyNights, location, hourlyFilterType, hourlyFilterValue, hourlyView, confusionBreakdown]
+    [stats.dataset, stats.surveyNights, location, hourlyFilterType, hourlyFilterValue, hourlyView, confusionBreakdown, maxMarginPct]
   );
   // The chart uses a finer 15-minute bin than the table's 1-hour columns, so a peak's actual shape
   // shows instead of being flattened into one hourly total - table stays hourly since a 4x-wider
   // table would be unreadable, but a chart line can happily pass through more points.
   const hourlyChart = useMemo(
     () => hourlyView === 'qa-adjusted'
-      ? Stats.computeHourlyActivityQaAdjusted(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, confusionBreakdown, undefined, 0.25, stats.surveyNights)
+      ? Stats.computeHourlyActivityQaAdjusted(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, confusionBreakdown, maxMarginPct, 0.25, stats.surveyNights)
       : Stats.computeHourlyActivity(stats.dataset, location, { type: hourlyFilterType, value: hourlyFilterValue }, 0.25, stats.surveyNights),
-    [stats.dataset, stats.surveyNights, location, hourlyFilterType, hourlyFilterValue, hourlyView, confusionBreakdown]
+    [stats.dataset, stats.surveyNights, location, hourlyFilterType, hourlyFilterValue, hourlyView, confusionBreakdown, maxMarginPct]
   );
   const allNightDates = useMemo(() => new Set(hourlyChart.rows.map((r) => r.surveyDate)), [hourlyChart]);
   // null = "all nights" (the default) rather than an actual Set, so switching deployments/filters
@@ -1320,6 +1328,50 @@ function FigurePreview({ stats, location, parsed }) {
   return h(ActivityLineChart, { hourly: hourlyChart, filter: parsed, location });
 }
 
+// One figure-workspace entry: title/caption fields, reorder/remove, live preview, and PNG/SVG
+// export (brief section 21.3) - reads the actual rendered <svg> node via its own ref, so the
+// exported image is pixel-for-pixel what's on screen, not a second render pass.
+function FigureCard({ sel, index, total, stats, location, updateSelection, removeSelection, moveSelection }) {
+  const containerRef = useRef(null);
+  const parsed = parseHourlyActivityExportKey(sel.key);
+  const fileStem = (sel.title || sel.label || 'figure').replace(/[^A-Za-z0-9_-]+/g, '_');
+
+  function findSvg() {
+    return containerRef.current ? containerRef.current.querySelector('svg') : null;
+  }
+  function exportPng() {
+    const svg = findSvg();
+    if (svg) Exports.downloadSvgAsPng(svg, `${fileStem}.png`);
+  }
+  function exportSvg() {
+    const svg = findSvg();
+    if (svg) Exports.downloadSvgAsSvgFile(svg, `${fileStem}.svg`);
+  }
+
+  return h('div', { className: 'card' },
+    h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10, marginBottom: 10 } },
+      h('div', { style: { flex: 1 } },
+        h(Field, { label: 'Title' }, h('input', { value: sel.title ?? sel.label, onChange: (e) => updateSelection(sel.key, { title: e.target.value }) })),
+        h(Field, { label: 'Caption (optional)' }, h('textarea', { rows: 2, value: sel.caption || '', onChange: (e) => updateSelection(sel.key, { caption: e.target.value }), placeholder: 'e.g. survey context, what to notice' }))
+      ),
+      h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+        h('button', { className: 'btn btn-secondary btn-small', disabled: index === 0, onClick: () => moveSelection(sel.key, -1) }, '↑'),
+        h('button', { className: 'btn btn-secondary btn-small', disabled: index === total - 1, onClick: () => moveSelection(sel.key, 1) }, '↓'),
+        h('button', { className: 'btn btn-danger btn-small', onClick: () => removeSelection(sel.key) }, 'Remove')
+      )
+    ),
+    parsed
+      ? h(React.Fragment, null,
+          h('div', { ref: containerRef }, h(FigurePreview, { stats, location, parsed })),
+          h('div', { style: { display: 'flex', gap: 8, marginTop: 8 } },
+            h('button', { className: 'btn btn-secondary btn-small', onClick: exportPng }, 'Export PNG'),
+            h('button', { className: 'btn btn-secondary btn-small', onClick: exportSvg }, 'Export SVG')
+          )
+        )
+      : h('div', { className: 'card-sub' }, `${sel.label} (no live preview available for this figure type yet)`)
+  );
+}
+
 // Corrective brief section 19 / Phase 4 item 9: a real Figure Workspace rather than a placeholder
 // - lets the analyst curate which already-built views feed the eventual report/export (Stage 8/
 // Phase 5 work still builds the actual PDF/PNG export itself), with an editable title/caption and
@@ -1359,25 +1411,178 @@ function FigureWorkspaceTab({ deployment, location, onPatch }) {
     h('div', { className: 'card-sub', style: { marginBottom: 12 } },
       "Figures selected for the eventual report/export, in this order. Add a title/caption for each and reorder with the arrows - the preview below always comes straight from the same statistics the rest of the app shows, so it can never disagree with its source tab."),
     h('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
-      selections.map((sel, i) => {
-        const parsed = parseHourlyActivityExportKey(sel.key);
-        return h('div', { key: sel.key, className: 'card' },
-          h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10, marginBottom: 10 } },
-            h('div', { style: { flex: 1 } },
-              h(Field, { label: 'Title' }, h('input', { value: sel.title ?? sel.label, onChange: (e) => updateSelection(sel.key, { title: e.target.value }) })),
-              h(Field, { label: 'Caption (optional)' }, h('textarea', { rows: 2, value: sel.caption || '', onChange: (e) => updateSelection(sel.key, { caption: e.target.value }), placeholder: 'e.g. survey context, what to notice' }))
-            ),
-            h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
-              h('button', { className: 'btn btn-secondary btn-small', disabled: i === 0, onClick: () => moveSelection(sel.key, -1) }, '↑'),
-              h('button', { className: 'btn btn-secondary btn-small', disabled: i === selections.length - 1, onClick: () => moveSelection(sel.key, 1) }, '↓'),
-              h('button', { className: 'btn btn-danger btn-small', onClick: () => removeSelection(sel.key) }, 'Remove')
-            )
+      selections.map((sel, i) => h(FigureCard, {
+        key: sel.key, sel, index: i, total: selections.length, stats, location,
+        updateSelection, removeSelection, moveSelection,
+      }))
+    )
+  );
+}
+
+// Corrective brief section 20: a structured report builder covering the specified sections,
+// reading exclusively from Stats.computeAllStats (never a separate calculation) so a number here
+// can never disagree with its source tab. PDF: no bundled library - the "Print / Save as PDF"
+// button uses the browser's own native print-to-PDF against the .report-printable print
+// stylesheet in index.html, which is a complete, real PDF path without vendoring anything.
+function ReportsTab({ project, deployment, location }) {
+  const stats = useMemo(() => Stats.computeAllStats(deployment, location, ALL_SPECIES_NAMES), [deployment, location]);
+  const { effort, activity, species, speciesQaAdjusted, timing, reliability, nightly, reviewStateSummary, qaCoverage } = stats;
+  const profile = deployment.qaProfile || DEFAULT_QA_PROFILE;
+  const hasEstimates = species.composition.length !== speciesQaAdjusted.composition.length
+    || species.composition.some((s) => {
+      const est = speciesQaAdjusted.composition.find((e) => e.species === s.species);
+      return est && Math.abs(est.weight - s.count) > 0.01;
+    });
+
+  function exportCsv(name, csv) {
+    ns_downloadTextFile(`${deploymentFileStem(deployment)}_${name}.csv`, csv, 'text/csv');
+  }
+  function ns_downloadTextFile(filename, text, mime) { Exports.downloadTextFile(filename, text, mime); }
+  function deploymentFileStem(dep) { return (dep.name || 'deployment').replace(/[^A-Za-z0-9_-]+/g, '_'); }
+
+  function exportWorkbook() {
+    const sheets = Exports.deploymentWorkbookSheets(deployment, stats);
+    Exports.downloadWorkbook(`${deploymentFileStem(deployment)}_BatAStat.xls`, sheets);
+  }
+
+  if (stats.totalDetectionEvents === 0) {
+    return h('div', { className: 'content' },
+      h('div', { className: 'empty-state' },
+        h('div', { className: 'empty-title' }, 'No detections to report yet'),
+        h('div', { className: 'empty-text' }, 'Import a BTO CSV on the Detections tab first.')
+      )
+    );
+  }
+
+  return h('div', { className: 'content' },
+    h('div', { className: 'no-print', style: { display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' } },
+      h('button', { className: 'btn btn-primary btn-small', onClick: () => window.print() }, '🖨 Print / Save as PDF'),
+      h('button', { className: 'btn btn-secondary btn-small', onClick: exportWorkbook }, 'Download Excel workbook (all tables)'),
+      h('button', { className: 'btn btn-secondary btn-small', onClick: () => exportCsv('survey_nights', Exports.surveyNightsToCsv(deployment)) }, 'CSV: Survey Nights'),
+      h('button', { className: 'btn btn-secondary btn-small', onClick: () => exportCsv('species_records', Exports.speciesDetectionRecordsToCsv(stats)) }, 'CSV: Species Records'),
+      h('button', { className: 'btn btn-secondary btn-small', onClick: () => exportCsv('review_history', Exports.reviewHistoryToCsv(deployment)) }, 'CSV: Review History'),
+      h('button', { className: 'btn btn-secondary btn-small', onClick: () => exportCsv('observed_activity', Exports.resolvedObservedStatsToCsv(stats)) }, 'CSV: Observed Activity'),
+      h('button', { className: 'btn btn-secondary btn-small', onClick: () => exportCsv('estimated_activity', Exports.qaAdjustedEstimatesToCsv(stats)) }, 'CSV: Estimated Activity'),
+      h('button', { className: 'btn btn-secondary btn-small', onClick: () => exportCsv('nightly_activity', Exports.nightlyActivityToCsv(stats)) }, 'CSV: Nightly Activity'),
+      h('button', { className: 'btn btn-secondary btn-small', onClick: () => exportCsv('qa_calibration', Exports.qaCalibrationToCsv(stats)) }, 'CSV: QA Calibration')
+    ),
+
+    h('div', { className: 'report-printable' },
+      h('div', { className: 'section-title' }, 'Project information'),
+      h('div', { className: 'card-sub' },
+        `Client: ${project.client || '-'} · Project: ${project.projectName || '-'} · Site: ${project.siteName || '-'}`),
+
+      h('div', { className: 'section-title' }, 'Survey design'),
+      h('div', { className: 'card-sub' },
+        `Location: ${location.name || '(untitled)'}${location.latitude != null ? ` (${location.latitude}, ${location.longitude})` : ' (no coordinates set - clock-time only)'}. Deployment: ${deployment.name || '(untitled)'}, ${deployment.startDate || '?'} → ${deployment.endDate || '?'}. Detector: ${deployment.detectorInfo || 'not recorded'}. Weather: ${deployment.weather || 'not recorded'}.`),
+
+      h('div', { className: 'section-title' }, 'Effort'),
+      h('div', { className: 'stat-grid' },
+        h(StatBox, { label: 'Valid Survey Nights', value: effort.nightsInData }),
+        h(StatBox, { label: 'Zero-activity nights', value: activity.nightlyBreakdown.filter((n) => n.count === 0).length }),
+        h(StatBox, { label: 'Valid recording hours', value: effort.validRecordingHours ?? 'Not recorded' }),
+        h(StatBox, { label: 'QA completion %', value: fmtNum(effort.qaCompletionPct) + '%' })
+      ),
+
+      h('div', { className: 'section-title' }, 'Recording conditions'),
+      (() => {
+        const mic = deployment.microphonePlacement || {};
+        const ac = deployment.acousticConditions || {};
+        const highNoiseFlags = Object.entries(ac).filter(([k, v]) => k !== 'notes' && v === 'high').map(([k]) => k);
+        return h('div', { className: 'card-sub' },
+          `Placement: ${mic.placementQuality ? PLACEMENT_QUALITY_LABELS[mic.placementQuality] : 'Not yet assessed'}.`,
+          highNoiseFlags.length > 0 ? ` High noise flagged: ${highNoiseFlags.join(', ')}.` : '');
+      })(),
+
+      h('div', { className: 'section-title' }, 'Observed activity'),
+      h('div', { className: 'card-sub', style: { marginBottom: 8 } },
+        `Original BTO activity (automated IDs alone, ≥${stats.originalBto.threshold}% confidence, no manual review applied): ${stats.originalBto.totalActivity}. Resolved observed activity (this report's working figure - manual review applied where it exists, otherwise BTO's primary regardless of confidence): ${activity.totalDetections}.`),
+      h('div', { className: 'stat-grid' },
+        h(StatBox, { label: 'Resolved observed activity', value: activity.totalDetections }),
+        h(StatBox, { label: `Original BTO activity (≥${stats.originalBto.threshold}%)`, value: stats.originalBto.totalActivity })
+      ),
+
+      h('div', { className: 'section-title' }, 'Effort-standardised activity'),
+      h('div', { className: 'stat-grid' },
+        h(StatBox, { label: 'Per night', value: fmtNum(activity.detectionsPerNight) }),
+        h(StatBox, { label: 'Per hour', value: effort.validRecordingHours ? fmtNum(activity.detectionsPerHour) : 'Effort unavailable' }),
+        h(StatBox, { label: 'Nightly mean', value: fmtNum(activity.nightlyMean) }),
+        h(StatBox, { label: 'Nightly median', value: fmtNum(activity.nightlyMedian) }),
+        h(StatBox, { label: 'Nightly CV', value: activity.nightlyCv != null ? fmtNum(activity.nightlyCv, 2) : 'N/A' })
+      ),
+
+      h('div', { className: 'section-title' }, 'Observed species composition'),
+      h('div', { className: 'stat-grid' },
+        h(StatBox, { label: 'Observed richness', value: species.richnessMinimumTaxa }),
+        h(StatBox, { label: 'Dominant species', value: species.dominantSpecies ? `${species.dominantSpecies.species} (${fmtNum(species.dominantSpecies.pct)}%)` : '-' })
+      ),
+      h('div', { className: 'card', style: { marginTop: 10, padding: 0, overflow: 'hidden' } },
+        h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
+          h('thead', null, h('tr', null, ['Species', 'Count', '% of total', 'Detection freq.'].map((c) => h('th', {
+            key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
+          }, c)))),
+          h('tbody', null, species.composition.map((s) => h('tr', { key: s.species },
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, s.species),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.count),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(s.pct) + '%'),
+            h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, s.detectionFrequencyPct != null ? fmtNum(s.detectionFrequencyPct) + '%' : '-')
+          )))
+        )
+      ),
+
+      h('div', { className: 'section-title' }, 'Temporal activity'),
+      h('div', { className: 'card-sub' },
+        timing.sunsetRelative
+          ? `First detection ${fmtDateTime(timing.firstDetection)}, last ${fmtDateTime(timing.lastDetection)}. Median activity time ${fmtHour(timing.medianHour)} relative to sunset. Peak 30-minute window ${fmtHour(timing.peakHalfHour ? timing.peakHalfHour.startHour : null)} (${timing.peakHalfHour ? timing.peakHalfHour.count : 0} detections).`
+          : `First detection ${fmtDateTime(timing.firstDetection)}, last ${fmtDateTime(timing.lastDetection)}. Set this Location's coordinates for sunset-relative timing.`),
+
+      h('div', { className: 'section-title' }, 'QA methods'),
+      h('div', { className: 'card-sub' },
+        `Random sample: ${profile.samplePercent}%. Probability threshold reviewed in full: below ${profile.probabilityThreshold}%. Always-review-No-ID: ${profile.alwaysReviewNoId ? 'yes' : 'no'}. QA-adjustment precision bar: ±${(profile.maxMarginPct != null ? profile.maxMarginPct : Stats.MAX_RELIABLE_MARGIN_PCT ?? 10)} percentage points (95% Wilson interval).`),
+
+      h('div', { className: 'section-title' }, 'QA results'),
+      reliability.reviewedSampleSize === 0
+        ? h('div', { className: 'card-sub' }, 'No reviewed calls with a BTO primary result yet.')
+        : h('div', { className: 'stat-grid' },
+            h(StatBox, { label: 'Primary-ID reliability', value: fmtNum(reliability.primaryIdReliabilityPct) + '%', sub: fmtCi(reliability.primaryIdReliabilityCiLowerPct, reliability.primaryIdReliabilityCiUpperPct) }),
+            h(StatBox, { label: 'Accepted / Modified / Rejected', value: `${reviewStateSummary.accepted} / ${reviewStateSummary.modified} / ${reviewStateSummary.rejected}` }),
+            h(StatBox, { label: 'QA coverage (overall)', value: fmtNum(qaCoverage.overall.reviewedPct) + '%' }),
+            h(StatBox, { label: 'Reviewed sample (n)', value: reliability.reviewedSampleSize })
           ),
-          parsed
-            ? h(FigurePreview, { stats, location, parsed })
-            : h('div', { className: 'card-sub' }, `${sel.label} (no live preview available for this figure type yet)`)
-        );
-      })
+
+      hasEstimates && h(React.Fragment, null,
+        h('div', { className: 'section-title' }, 'QA-adjusted estimates'),
+        h('div', { className: 'card', style: { padding: 0, overflow: 'hidden' } },
+          h('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 12 } },
+            h('thead', null, h('tr', null, ['Species', 'Estimated count', '% of total (estimated)'].map((c) => h('th', {
+              key: c, style: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid var(--border)', color: 'var(--text-faint)', fontSize: 10, textTransform: 'uppercase' },
+            }, c)))),
+            h('tbody', null, speciesQaAdjusted.composition.map((s) => h('tr', { key: s.species },
+              h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)' } }, s.species),
+              h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(s.weight, 1)),
+              h('td', { style: { padding: '5px 10px', borderBottom: '1px solid var(--border)', fontFamily: 'var(--font-mono)' } }, fmtNum(s.pct) + '%')
+            )))
+          )
+        )
+      ),
+
+      h('div', { className: 'section-title' }, 'Caveats'),
+      h('div', { className: 'card', style: { fontSize: 12, lineHeight: 1.6 } },
+        h('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'Acoustic activity does not represent bat abundance or population size.'),
+        hasEstimates && h('div', { style: { fontWeight: 600, marginBottom: 4 } }, 'QA-adjusted outputs are estimates based on reviewed records and associated calibration uncertainty.'),
+        h('div', null, 'Detection Frequency and richness reflect what this detector recorded at this Location under its own recording conditions, not a general survey of the wider area. Reliability and QA-adjusted figures are based on manually reviewed calls only and carry the sample sizes and confidence intervals shown above - treat a figure without enough reviewed evidence as insufficient data, not as a fallback average.')
+      ),
+
+      h('div', { className: 'section-title' }, 'Appendices'),
+      h('div', { className: 'card-sub' },
+        // "Species Detection Records" means retained bat taxa specifically (brief section 1.2) -
+        // stats.totalSpeciesRecords counts every resolved row regardless of category (noise/
+        // other-taxon/unidentified included), which is a different, broader figure.
+        `${deployment.detectionEvents.length} Detection Events, ${stats.dataset.filter((d) => d.category === 'bat').length} Species Detection Records. Additional-species yield: ${fmtNum(reliability.additionalSpeciesRatePct)}% (${reliability.additionalSpeciesRecordCount} extra record(s)). Genus-level downgrade rate: ${fmtNum(reliability.genusLevelRatePct)}%.`),
+
+      h('div', { className: 'section-title' }, 'Report metadata'),
+      h('div', { className: 'card-sub' },
+        `Schema v${M.SCHEMA_VERSION} · Bat-A-Stat ${M.APP_VERSION} · Generated ${new Date().toLocaleString('en-GB')}.`)
     )
   );
 }
@@ -2721,11 +2926,10 @@ function WavFolderPicker({ wavFileMap, setWavFileMap }) {
   );
 }
 
-const DEFAULT_QA_PROFILE = {
-  samplePercent: 10, probabilityThreshold: 50,
-  speciesThresholds: [{ species: 'Common Pipistrelle', threshold: 60 }, { species: 'Soprano Pipistrelle', threshold: 60 }],
-  speciesRequiring100Percent: [], alwaysReviewNoId: true,
-};
+// The one canonical default QA profile (qa-profiles.js) - kept as a locally-named alias since it's
+// referenced all over this file, but no longer its own independent literal (that's what let this
+// drift out of sync with stats.js's own fallback - see qa-profiles.js's comment).
+const DEFAULT_QA_PROFILE = QaProfiles.DEFAULT_PROFILE;
 const QA_REASON_LABELS = {
   'no-id': 'Queued - No ID (always reviewed)',
   'below-threshold': 'Queued - below probability threshold',

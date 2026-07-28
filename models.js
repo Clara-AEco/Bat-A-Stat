@@ -12,6 +12,19 @@ window.BatID = window.BatID || {};
     return new Date().toISOString();
   }
 
+  // Corrective brief section 22 (persistence and versioning). SCHEMA_VERSION bumps when the
+  // persisted shape changes in a way a future migration might need to know about; APP_VERSION is
+  // this build's own label (no package.json/build step here to derive one from). Both are stamped
+  // onto a project at save time (see Storage.saveProject) - not enforced/migrated automatically
+  // (there's exactly one schema in production so far), just recorded for traceability.
+  const SCHEMA_VERSION = 2;
+  const APP_VERSION = '0.5.0'; // Phase 5 of the corrective implementation brief
+
+  function stampVersionMetadata(project) {
+    project.schemaVersion = SCHEMA_VERSION;
+    project.lastSavedWithAppVersion = APP_VERSION;
+  }
+
   function createProject({ client = '', projectName = '', siteName = '', notes = '' } = {}) {
     return {
       id: uid(),
@@ -24,6 +37,8 @@ window.BatID = window.BatID || {};
       // Species labels the analyst has typed in manually (e.g. "Myotis sp") that BTO never
       // flagged at all - once added here they show up as quick-label buttons project-wide.
       customLabels: [],
+      schemaVersion: SCHEMA_VERSION,
+      lastSavedWithAppVersion: APP_VERSION,
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };
@@ -73,18 +88,19 @@ window.BatID = window.BatID || {};
       // Drives the Manual Review queue: sample % for everything else, a probability floor
       // below which every call is queued regardless of species, species that always get
       // reviewed in full, and whether unidentified ("No ID") calls are always queued too.
-      qaProfile: {
-        samplePercent: 10,
-        probabilityThreshold: 50,
-        // Per-species overrides where the automated model is known to be reliable, so those
-        // species don't get pulled into "below threshold" review as readily as the rest.
-        speciesThresholds: [
-          { species: 'Common Pipistrelle', threshold: 60 },
-          { species: 'Soprano Pipistrelle', threshold: 60 },
-        ],
-        speciesRequiring100Percent: [],
-        alwaysReviewNoId: true,
-      },
+      // Cloned (not shared by reference) from QaProfiles.DEFAULT_PROFILE - the one canonical
+      // default shape, also used as the fallback anywhere a deployment might be missing this
+      // field entirely (see qa-profiles.js's own comment on why that matters: two independently
+      // written "default" fallbacks had silently drifted apart before this). Arrays are cloned
+      // per-deployment so editing one deployment's species thresholds can never mutate another's.
+      qaProfile: (() => {
+        const d = window.BatID.QaProfiles.DEFAULT_PROFILE;
+        return {
+          ...d,
+          speciesThresholds: d.speciesThresholds.map((t) => ({ ...t })),
+          speciesRequiring100Percent: [...d.speciesRequiring100Percent],
+        };
+      })(),
       // Probability floor (%) for the separate "Original BTO" baseline statistic only (Stats.
       // computeOriginalBtoStats) - NOT applied to the resolved-observed dataset every other
       // statistic reads from, which keeps the existing rule that an unreviewed BTO primary always
@@ -369,6 +385,9 @@ window.BatID = window.BatID || {};
 
   ns.Models = {
     uid,
+    SCHEMA_VERSION,
+    APP_VERSION,
+    stampVersionMetadata,
     createProject,
     createLocation,
     createDeployment,

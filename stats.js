@@ -153,7 +153,13 @@ window.BatID = window.BatID || {};
   // directly rather than relying on a manual field nobody remembers to keep updated.
   function computeEffortStats(deployment, dataset, surveyNights) {
     const effort = deployment.surveyEffort || {};
-    const qaSummary = ns.QaProfiles.computeQaSummary(deployment.detectionEvents || [], deployment.qaProfile || {});
+    // Falls back to the SAME canonical default the QA tab itself uses (QaProfiles.DEFAULT_PROFILE)
+    // when a deployment predates this field - previously this fell back to a bare `{}`, which
+    // silently made every probability/sample check pass (undefined thresholds compare false
+    // against anything), so QA completion % read 100% regardless of what the QA tab's own queue
+    // actually showed. Confirmed against Clara's real Victoria Pleasure Ground deployment, which
+    // predates qaProfile entirely.
+    const qaSummary = ns.QaProfiles.computeQaSummary(deployment.detectionEvents || [], deployment.qaProfile || ns.QaProfiles.DEFAULT_PROFILE);
     // nightsInData now means "valid/partial Survey Nights" when that entity is available, not
     // "distinct survey dates that happen to appear in detections" - a deployment can have real
     // nights with zero bat activity at all, which the old data-derived count could never see.
@@ -750,6 +756,13 @@ window.BatID = window.BatID || {};
     const effort = computeEffortStats(deployment, dataset, surveyNights);
     const events = deployment.detectionEvents || [];
     const confusionBreakdown = computeConfusionBreakdown(events);
+    // Corrective brief section 22: a deployment that has locked in its own confidence bands/
+    // precision bar (see models.js's qaProfile.confidenceBands/maxMarginPct) keeps using THOSE
+    // rather than whatever the app's current default happens to be - null (the common case, no
+    // settings UI sets these yet) falls through to each function's own current default.
+    const profile = deployment.qaProfile || {};
+    const confidenceBands = profile.confidenceBands || undefined;
+    const maxMarginPct = profile.maxMarginPct != null ? profile.maxMarginPct : undefined;
     return {
       dataset,
       surveyNights,
@@ -759,14 +772,14 @@ window.BatID = window.BatID || {};
       activity: computeActivityStats(dataset, effort),
       originalBto: computeOriginalBtoStats(events, deployment.analyticalConfidenceThreshold),
       species: computeSpeciesStats(dataset, surveyNights),
-      speciesQaAdjusted: computeSpeciesStatsQaAdjusted(dataset, confusionBreakdown, undefined, surveyNights),
+      speciesQaAdjusted: computeSpeciesStatsQaAdjusted(dataset, confusionBreakdown, maxMarginPct, surveyNights),
       nightly: computeNightlyStats(dataset, surveyNights),
       timing: computeTimingStats(dataset, location),
       reliability: computeReliabilityStats(events, knownBatSpeciesNames),
-      reliabilityByProbabilityBand: computeReliabilityByProbabilityBand(events, knownBatSpeciesNames),
-      reliabilityBySpecies: computeReliabilityBySpecies(events, knownBatSpeciesNames),
+      reliabilityByProbabilityBand: computeReliabilityByProbabilityBand(events, knownBatSpeciesNames, confidenceBands, maxMarginPct),
+      reliabilityBySpecies: computeReliabilityBySpecies(events, knownBatSpeciesNames, { maxMarginPct }),
       reviewStateSummary: computeReviewStateSummary(events),
-      qaCoverage: computeQaCoverage(events),
+      qaCoverage: computeQaCoverage(events, confidenceBands),
       confusionBreakdown,
     };
   }
@@ -1070,7 +1083,7 @@ window.BatID = window.BatID || {};
     { label: '90-100%', min: 90, max: 100.001 },
   ];
 
-  function computeReliabilityByProbabilityBand(events, knownBatSpeciesNames, bands) {
+  function computeReliabilityByProbabilityBand(events, knownBatSpeciesNames, bands, maxMarginPct) {
     bands = bands || DEFAULT_CONFIDENCE_BANDS;
     const reviewed = (events || []).filter((ev) => ev.manualReview && ev.manualReview.reviewed && ev.primaryBtoId);
     return bands.map((band) => {
@@ -1101,7 +1114,7 @@ window.BatID = window.BatID || {};
         // lightweight calibration diagnostic (brief section 15.9's "every component must be
         // inspectable" spirit) rather than a bare yes/no.
         marginOfErrorPct: ci ? (ci.upperPct - ci.lowerPct) / 2 : null,
-        insufficientPrecision: !isPrecisionSufficient(primaryCorrect, primaryJudged),
+        insufficientPrecision: !isPrecisionSufficient(primaryCorrect, primaryJudged, maxMarginPct),
       };
     });
   }
@@ -1120,6 +1133,7 @@ window.BatID = window.BatID || {};
   // explicit opt-in the brief allows for - off unless a caller deliberately turns it on.
   function computeReliabilityBySpecies(events, knownBatSpeciesNames, options) {
     const allowDeploymentWideFallback = !!(options && options.allowDeploymentWideFallback);
+    const maxMarginPct = options && options.maxMarginPct;
     const SpeciesData = ns.SpeciesData;
     const reviewed = (events || []).filter((ev) => ev.manualReview && ev.manualReview.reviewed && ev.primaryBtoId);
 
@@ -1148,7 +1162,7 @@ window.BatID = window.BatID || {};
 
     return Array.from(bySpecies.entries()).map(([species, evs]) => {
       const own = judgeAll(evs);
-      if (isPrecisionSufficient(own.primaryCorrect, own.primaryJudged)) {
+      if (isPrecisionSufficient(own.primaryCorrect, own.primaryJudged, maxMarginPct)) {
         const ci = wilsonInterval(own.primaryCorrect, own.primaryJudged);
         return {
           species,
@@ -1166,7 +1180,7 @@ window.BatID = window.BatID || {};
         ? reviewed.filter((ev) => SpeciesData.genusOf(ev.primaryBtoId.englishName || ev.primaryBtoId.species) === genus)
         : [];
       const genusJudged = genus ? judgeAll(genusEvs) : { primaryCorrect: 0, primaryJudged: 0 };
-      if (genus && isPrecisionSufficient(genusJudged.primaryCorrect, genusJudged.primaryJudged)) {
+      if (genus && isPrecisionSufficient(genusJudged.primaryCorrect, genusJudged.primaryJudged, maxMarginPct)) {
         const ci = wilsonInterval(genusJudged.primaryCorrect, genusJudged.primaryJudged);
         return {
           species,
@@ -1360,6 +1374,9 @@ window.BatID = window.BatID || {};
     computeBrayCurtisDissimilarity,
     computeComparisonWarnings,
     isPrecisionSufficient,
+    MAX_RELIABLE_MARGIN_PCT,
+    DEFAULT_CONFIDENCE_BANDS,
+    DEFAULT_ANALYTICAL_CONFIDENCE_THRESHOLD,
     mean, median, stdDev, percentile, wilsonInterval, compareSurveyDates,
   };
 })(window.BatID);
